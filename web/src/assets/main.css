@@ -1,0 +1,110 @@
+/* LightRemote 设计令牌 + 全局样式。Naive UI 负责组件,这里负责移动壳与整体节奏。 */
+
+:root {
+  /* 色彩(浅色主题基础) */
+  --lr-bg: #f5f6f8;
+  --lr-bg-elevated: #ffffff;
+  --lr-fg: #1c1f24;
+  --lr-fg-muted: #6b7280;
+  --lr-accent: #2563eb;
+  --lr-danger: #dc2626;
+
+  /* 布局 */
+  --lr-radius: 10px;
+  --lr-touch: 44px; /* 触控目标下限 */
+  --lr-sidebar: 168px; /* 桌面端左侧导航宽度,页面留白要减掉它 */
+
+  /* 断点 */
+  --lr-breakpoint-mobile: 768px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --lr-bg: #0f1115;
+    --lr-bg-elevated: #171a20;
+    --lr-fg: #e5e7eb;
+    --lr-fg-muted: #9ca3af;
+    --lr-accent: #3b82f6;
+    --lr-danger: #ef4444;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+html, body, #app { height: 100%; }
+
+body {
+  background: var(--lr-bg);
+  color: var(--lr-fg);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* 触控友好:让组件库按钮/输入框达到 44px 下限 */
+.n-button { min-height: var(--lr-touch); }
+.n-input { min-height: var(--lr-touch); }
+
+/* 导航条:移动端固定在底部,桌面端在下面的 @media 里竖成左侧栏 */
+.bottom-nav {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  display: flex;
+  background: var(--lr-bg-elevated);
+  border-top: 1px solid rgba(127,127,127,.2);
+  padding-bottom: env(safe-area-inset-bottom);
+  z-index: 100;
+}
+.bottom-nav .nav-item {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 56px;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 3px;
+  padding: 6px 2px;
+  color: var(--lr-fg-muted);
+  text-decoration: none;
+  font-size: 11px;
+  line-height: 1.1;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+}
+.bottom-nav .nav-item.active { color: var(--lr-accent); font-weight: 600; }
+/* 图标尺寸走 n-icon 的 font-size:直接改 svg 会溢出 1em 的外层盒子并压住文字 */
+.bottom-nav .nav-item .n-icon { font-size: 22px; line-height: 1; }
+.bottom-nav .nav-item svg { display: block; }
+
+/* 主内容区(给底部导航留空间) */
+.page-content {
+  padding: 12px;
+  padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  min-height: 100%;
+}
+
+@media (min-width: 768px) {
+  /* 桌面端把这条导航竖过来贴左边。之前是 display:none,PC 上就没有任何切页入口了。 */
+  .bottom-nav {
+    top: 0;
+    right: auto;
+    width: var(--lr-sidebar);
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 2px;
+    padding: 8px 0;
+    border-top: none;
+    border-right: 1px solid rgba(127,127,127,.2);
+  }
+  .bottom-nav .nav-item {
+    flex: none;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 10px;
+    min-height: 44px;
+    padding: 0 16px;
+    font-size: 14px;
+  }
+  .bottom-nav .nav-item.active { background: rgba(127,127,127,.12); }
+  .page-content { padding: 20px; padding-left: calc(var(--lr-sidebar) + 20px); }
+}

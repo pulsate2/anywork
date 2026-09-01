@@ -1,0 +1,34 @@
+# ---- Go 构建产物 ----
+/lightremote
+/lightremote.exe
+*.exe
+*.test
+*.out
+/vendor/
+
+# ---- 前端依赖与缓存 ----
+web/node_modules/
+web/.vite/
+*.tsbuildinfo
+
+# ---- 前端构建产物 ----
+# 由 `npm run build` 生成,再被 //go:embed all:dist 打进二进制。
+# 只忽略目录内容并保留 .gitkeep:目录本身若被忽略,embed 在全新克隆上会编译失败。
+cmd/server/dist/*
+!cmd/server/dist/.gitkeep
+
+# ---- 运行时数据与密钥 ----
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.key
+.env
+.env.local
+
+# ---- 编辑器 / 操作系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
