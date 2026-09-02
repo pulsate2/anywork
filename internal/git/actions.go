@@ -94,12 +94,27 @@ func (s *Service) Push(p, remote, branch string, setUpstream bool) (string, erro
 			args = append(args, branch)
 		}
 	}
-	return s.run(info.Root, nil, args...)
+	return s.remoteOpRun(info.Root, args...)
 }
 
 // Pull 拉取。
 func (s *Service) Pull(p string) (string, error) {
-	return s.Repo(p, "pull", "--ff-only")
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.Repo {
+		return "", ErrNotRepo
+	}
+	return s.remoteOpRun(info.Root, "pull", "--ff-only")
+}
+
+// remoteOpRun push/pull 执行 git;有 broker 时走交互式凭据(runWithCreds)。
+func (s *Service) remoteOpRun(root string, args ...string) (string, error) {
+	if s.broker != nil {
+		return s.runWithCreds(root, s.broker, args...)
+	}
+	return s.run(root, nil, args...)
 }
 
 // Branch 分支操作。op: create|delete|switch|track。track 用于远端分支

@@ -39,6 +39,13 @@ import (
 var webFS embed.FS
 
 func main() {
+	// git 需要凭据时,会用 GIT_ASKPASS 拉起本二进制进入"凭据代理"模式:
+	// 连回主进程拿用户经弹窗输入的答案,打印给 git。此时不做任何服务启动。
+	if gitsvc.InAskPassMode() {
+		gitsvc.RunAskPassProxy()
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("配置错误: %v", err)
@@ -85,12 +92,17 @@ func main() {
 		terminal:     terminal.NewManager(cfg.Root, cfg.ReadOnly),
 		fs:           fsvc.NewHandlers(fsService),
 		fsSvc:        fsService,
-		git:          gitsvc.NewHandlers(gitsvc.New(cfg.Root, fsService.Resolve)),
 		ai:           aiHandlers,
 		backupMgr:    backupsvc.New(database.DB, cfg.Root),
 		push:         pushHandlers,
 	}
 	app.backup = backupsvc.NewHandlers(app.backupMgr)
+	// 交互式 git 认证:broker 把"需要凭据"推给浏览器弹窗,answer 回填后放行 push/pull。
+	gitService := gitsvc.New(cfg.Root, fsService.Resolve)
+	credBroker := gitsvc.NewCredentialBroker()
+	gitService.SetCredentialBroker(credBroker)
+	app.git = gitsvc.NewHandlers(gitService)
+	app.authWS = gitsvc.NewAuthWSHandler(gitService)
 	// 新终端会话继承当前 AI 档案的 env(已运行进程不受影响)。
 	app.terminal.EnvProvider = func() []string {
 		return aiHandlers.SessionEnv(os.Environ())
@@ -152,6 +164,7 @@ type App struct {
 	fs           *fsvc.Handlers
 	fsSvc        *fsvc.Service
 	git          *gitsvc.Handlers
+	authWS       *gitsvc.AuthWSHandler
 	ai           *aiprofile.Handlers
 	backup       *backupsvc.Handlers
 	backupMgr    *backupsvc.Manager
@@ -206,6 +219,10 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/git/branch", a.git.Branch)
 		pr.Post("/api/git/stash", a.git.Stash)
 		pr.Post("/api/git/worktree", a.git.Worktree)
+
+		// 交互式 git 认证(推送/拉取需要账号密码时弹窗输入)。
+		pr.Get("/api/git/auth", a.authWS.Begin)
+		pr.Post("/api/git/auth/answer", a.authWS.Answer)
 
 		// AI 配置档案(里程碑 5)。
 		pr.Get("/api/ai/profiles", a.ai.List)

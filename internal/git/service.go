@@ -5,11 +5,13 @@ package git
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Service 持有文件根边界,提供 git 操作。
@@ -17,12 +19,20 @@ type Service struct {
 	root string
 	// resolve 把用户路径解析为受限绝对路径(注入 fs.Service.Resolve)。
 	resolve func(string) (string, error)
+	// broker 交互式凭据登记簿;非 nil 时 push/pull 会经它开启 GIT_ASKPASS。
+	broker *CredentialBroker
 }
 
 // New 构造 Git 服务。root 为文件根;resolve 复用 fs 的边界校验。
 func New(root string, resolve func(string) (string, error)) *Service {
 	return &Service{root: root, resolve: resolve}
 }
+
+// SetCredentialBroker 注入凭据登记簿(供 push/pull 交互式认证)。
+func (s *Service) SetCredentialBroker(b *CredentialBroker) { s.broker = b }
+
+// Broker 返回凭据登记簿(供 WS/handler 推送与 answer)。
+func (s *Service) Broker() *CredentialBroker { return s.broker }
 
 // ErrNotRepo 表示目录不是 git 仓库(或找不到 root 边界内的最近仓库)。
 var ErrNotRepo = errors.New("not a git repository")
@@ -102,6 +112,51 @@ func (s *Service) run(dir string, env []string, args ...string) (string, error) 
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(errb.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return strings.TrimRight(out.String(), "\n"), errors.New(msg)
+	}
+	return strings.TrimRight(out.String(), "\n"), nil
+}
+
+// runWithCreds 同 run,但为命令开启 GIT_ASKPASS 交互式凭据:git 需要账号密码时
+// 经 WS 找浏览器要,期间命令阻塞等用户输入。仅 push/pull 这类远端操作使用。
+// 超时对人工输入放宽到 10 分钟,但仍有兜底不会永久挂起。
+func (s *Service) runWithCreds(dir string, broker *CredentialBroker, args ...string) (string, error) {
+	if dir == "" {
+		return "", ErrNotRepo
+	}
+	const timeout = 10 * time.Minute
+
+	credServer, env, err := broker.newCredServer()
+	if err != nil {
+		return "", err
+	}
+	defer credServer.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	cmd.Env = mergedEnv(env)
+	var out, errb bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+
+	// 后台 serve askpass 连接(用户名/密码各一次);命令退出后随 close 收尾。
+	go func() {
+		served := 0
+		for served < 8 {
+			if err := credServer.serveOnce(timeout); err != nil {
+				return
+			}
+			served++
+		}
+	}()
+
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(errb.String())
 		if msg == "" {

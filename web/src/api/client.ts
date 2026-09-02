@@ -99,6 +99,9 @@ export const api = {
   gitPush: (path: string, opt?: { remote?: string; branch?: string; setUpstream?: boolean }) =>
     request<{ out: string }>('POST', '/api/git/push', { path, ...opt }),
   gitPull: (path: string) => request<{ out: string }>('POST', '/api/git/pull', { path }),
+  // 回填 git 交互认证的用户名/密码(连接已在 WS 中保持)。空值 = 取消。
+  gitAuthAnswer: (token: string, username?: string, password?: string) =>
+    request<{ ok: boolean }>('POST', '/api/git/auth/answer', { token, username, password }),
   gitBranch: (path: string, op: string, name?: string, start?: string) =>
     request<{ out: string }>('POST', '/api/git/branch', { path, op, name, start }),
   gitStash: (path: string, op: string, message?: string) =>

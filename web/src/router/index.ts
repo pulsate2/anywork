@@ -10,6 +10,7 @@ const router = createRouter({
     { path: '/terminal', name: 'terminal', component: () => import('@/views/TerminalView.vue') },
     { path: '/files', name: 'files', component: () => import('@/views/FilesView.vue') },
     { path: '/git', name: 'git', component: () => import('@/views/GitView.vue') },
+    { path: '/git/file', name: 'git-file', component: () => import('@/views/GitFileView.vue') },
     { path: '/ai', name: 'ai', component: () => import('@/views/AIView.vue') },
     { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
   ],

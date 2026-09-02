@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Git 视图:状态/暂存/分文件 diff/提交/分支切换/选远端推送/提交历史翻页。
 // 仓库路径 = 当前工作区。
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import {
   NButton, NIcon, NInput, NList, NListItem, NEmpty, NSpin, NModal,
   NSelect, NCheckbox, NForm, NFormItem, NTag, NTabs, NTabPane,
@@ -15,13 +15,17 @@ import {
   api, type GitStatus, type GitEntry, type GitCommit, type GitRepo,
   type GitBranch, type GitBranchList, type GitRemote,
 } from '@/api/client'
+import { GitAuthClient } from '@/api/gitAuth'
 import { useWorkspaceStore } from '@/stores/workspace'
+import { parseDiff, type DiffBlock } from '@/utils/diff'
+import { useRouter } from 'vue-router'
 
 // 每页提交数;翻页靠 skip 累加已加载条数。
 const LOG_PAGE = 30
 
 const message = useMessage()
 const dialog = useDialog()
+const router = useRouter()
 const store = useWorkspaceStore()
 const repo = ref<GitRepo | null>(null)
 const status = ref<GitStatus | null>(null)
@@ -31,15 +35,17 @@ const repoPath = ref('/')
 const logMore = ref(false)
 const logLoading = ref(false)
 
-// diff 按文件切块后渲染,每行标出类型用于着色。
-interface DiffLine { text: string; kind: 'add' | 'del' | 'hunk' | 'meta' | 'ctx' }
-interface DiffBlock { path: string; adds: number; dels: number; lines: DiffLine[]; open: boolean }
+// 一级列表:一次展示某 scope(worktree/staged/commit)的全部文件;点行进二级页。
 const showDiff = ref(false)
 const diffScope = ref('worktree')
-const diffFile = ref('')
 const diffFiles = ref<DiffBlock[]>([])
 // 当前在 diff 弹窗里展示的提交(非空 = 在查某个提交的改动,scope 走 commit)。
 const diffCommit = ref<GitCommit | null>(null)
+
+// 未跟踪文件没有 diff(git diff 不看它们),点开直接进二级页并默认切到"文件"视图。
+function openUntracked(e: GitEntry) {
+  goFile('untracked', e.path)
+}
 
 const commitMsg = ref('')
 const commitModal = ref(false)
@@ -59,6 +65,37 @@ const pushBranch = ref('')
 const pushUpstream = ref(false)
 const pushing = ref(false)
 const pulling = ref(false)
+
+// git 交互认证:远端要求账号密码时,WS 推 ask 事件 → 打开独立顶层弹窗 →
+// 用户填用户名/密码 → POST answer 回填,放行被阻塞的 push/pull。
+const askModal = ref(false)
+const askToken = ref('')
+const askPrompt = ref('')
+const askUsername = ref('')
+const askPassword = ref('')
+
+const askClient = new GitAuthClient((e) => {
+  if (e.type !== 'ask') return
+  const ask = e.ask
+  askToken.value = ask.token
+  askPrompt.value = ask.prompt
+  askUsername.value = ''
+  askPassword.value = ''
+  askModal.value = true
+})
+async function submitAsk() {
+  const token = askToken.value
+  askModal.value = false
+  try {
+    await api.gitAuthAnswer(token, askUsername.value, askPassword.value)
+  } catch { /* 服务端幂等,失败也不影响 git 最终报错 */ }
+}
+async function cancelAsk() {
+  askModal.value = false
+  try {
+    await api.gitAuthAnswer(askToken.value)
+  } catch { /* ignore */ }
+}
 async function load() {
   loading.value = true
   try {
@@ -110,27 +147,40 @@ async function stageFiles(entries: GitEntry[], reset = false) {
 }
 const diffTitle = computed(() => {
   if (diffCommit.value) return `${diffCommit.value.short} · ${diffCommit.value.subject}`
-  const scope = diffScope.value === 'staged' ? '已暂存' : '工作区'
-  return diffFile.value ? `${scope} · ${diffFile.value}` : `${scope}改动`
+  return diffScope.value === 'staged' ? '已暂存改动' : '工作区改动'
 })
 
-async function viewDiff(scope: string, file?: string) {
+// 跳二级页看某个文件的差异/全文。scope: worktree|staged|commit|untracked。
+function goFile(scope: string, file: string, ref?: string) {
+  showDiff.value = false
+  router.push({
+    path: '/git/file',
+    query: {
+      path: repoPath.value,
+      scope: scope,
+      file: file,
+      root: repo.value?.root || '',
+      ...(ref ? { ref } : {}),
+    },
+  })
+}
+
+// 一级:打开某 scope 的文件列表(仅列表,点某行再进二级页)。
+async function viewDiff(scope: string) {
   diffScope.value = scope
-  diffFile.value = file || ''
   diffCommit.value = null
   try {
-    diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, scope, file))
+    diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, scope))
     showDiff.value = true
   } catch (e: any) {
     message.error(e?.message || '读取 diff 失败')
   }
 }
 
-// 查看某个提交做了什么改动:复用同一个 diff 弹窗,scope 传 commit + 提交哈希。
+// 查看某个提交做了什么改动:复用同一个列表弹窗,scope 传 commit + 提交哈希。
 async function viewCommit(c: GitCommit) {
   diffCommit.value = c
   diffScope.value = 'commit'
-  diffFile.value = ''
   try {
     diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, 'commit', undefined, c.hash))
     showDiff.value = true
@@ -138,53 +188,6 @@ async function viewCommit(c: GitCommit) {
     diffCommit.value = null
     message.error(e?.message || '读取提交改动失败')
   }
-}
-
-// git 的文件头行。只在 hunk 之前匹配,所以不会误伤以 --- / +++ 开头的内容行。
-const diffHeaderRe = /^(index |--- |\+\+\+ |old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename |copy )/
-
-// 把 unified diff 拆成每文件一块,每行标出类型用于着色。
-function parseDiff(text: string): DiffBlock[] {
-  const files: DiffBlock[] = []
-  let cur: DiffBlock | null = null
-  let inHunk = false
-  for (const raw of text.split('\n')) {
-    const line = raw.replace(/\r$/, '')
-    if (line.startsWith('diff --git ')) {
-      cur = { path: headerPath(line), adds: 0, dels: 0, lines: [], open: true }
-      inHunk = false
-      files.push(cur)
-      continue
-    }
-    if (!cur) continue
-    if (line.startsWith('@@')) {
-      inHunk = true
-      cur.lines.push({ text: line, kind: 'hunk' })
-    } else if (!inHunk) {
-      // 文件头丢掉:路径和增删数已经在块标题里了。但不能把 hunk 之前的行一律丢掉——
-      // 二进制文件("Binary files ... differ")和子模块("Subproject commit ...")
-      // 整块只有这类说明行,丢了就成空 diff。
-      if (!diffHeaderRe.test(line) && line !== '') cur.lines.push({ text: line, kind: 'meta' })
-    } else if (line.startsWith('+')) {
-      cur.adds++
-      cur.lines.push({ text: line, kind: 'add' })
-    } else if (line.startsWith('-')) {
-      cur.dels++
-      cur.lines.push({ text: line, kind: 'del' })
-    } else {
-      cur.lines.push({ text: line, kind: 'ctx' })
-    }
-  }
-  // 文件多时默认折叠,免得一次渲染上万行卡住手机。
-  if (files.length > 3) files.forEach((f) => (f.open = false))
-  return files
-}
-
-// `diff --git a/x b/x` → 取 b/ 之后的新路径(重命名时正是要看的那个)。
-function headerPath(l: string): string {
-  const s = l.slice('diff --git '.length)
-  const i = s.indexOf(' b/')
-  return (i >= 0 ? s.slice(i + 3) : s).replace(/^"(.*)"$/, '$1')
 }
 async function doCommit() {
   if (!commitMsg.value.trim()) return
@@ -316,7 +319,10 @@ onMounted(async () => {
   await store.ensure()
   repoPath.value = store.currentPath
   load()
+  // git 认证长连接:远端要求账号密码时在此收到 ask 事件并弹窗。
+  askClient.connect()
 })
+onUnmounted(() => askClient.close())
 // 跟随工作区切换。
 watch(() => store.currentPath, (p) => {
   repoPath.value = p
@@ -386,7 +392,7 @@ watch(() => store.currentPath, (p) => {
                 </div>
                 <div v-for="e in status.staged" :key="e.path" class="git-file">
                   <span class="git-xy add">{{ e.x }}{{ e.y }}</span>
-                  <span class="git-path" :title="e.path" @click="viewDiff('staged', e.path)">{{ e.path }}</span>
+                  <span class="git-path" :title="e.path" @click="goFile('staged', e.path)">{{ e.path }}</span>
                   <n-button class="git-btn" size="tiny" quaternary title="取消暂存" aria-label="取消暂存"
                     @click="stageFiles([e], true)">
                     <n-icon :component="TrashOutline" />
@@ -402,7 +408,7 @@ watch(() => store.currentPath, (p) => {
                 </div>
                 <div v-for="e in status.unstaged" :key="e.path" class="git-file">
                   <span class="git-xy">{{ e.x }}{{ e.y }}</span>
-                  <span class="git-path" :title="e.path" @click="viewDiff('worktree', e.path)">{{ e.path }}</span>
+                  <span class="git-path" :title="e.path" @click="goFile('worktree', e.path)">{{ e.path }}</span>
                   <n-button class="git-btn" size="tiny" quaternary title="暂存" aria-label="暂存"
                     @click="stageFiles([e])">
                     <n-icon :component="CheckmarkOutline" />
@@ -417,7 +423,7 @@ watch(() => store.currentPath, (p) => {
                 </div>
                 <div v-for="e in status.untracked" :key="e.path" class="git-file">
                   <span class="git-xy">??</span>
-                  <span class="git-path" :title="e.path">{{ e.path }}</span>
+                  <span class="git-path" :title="e.path" @click="openUntracked(e)">{{ e.path }}</span>
                   <n-button class="git-btn" size="tiny" quaternary title="暂存" aria-label="暂存"
                     @click="stageFiles([e])">
                     <n-icon :component="CheckmarkOutline" />
@@ -454,25 +460,23 @@ watch(() => store.currentPath, (p) => {
       </template>
     </n-spin>
 
-    <!-- 分文件 diff -->
+    <!-- 一级:文件列表,点某行进二级页看差异/全文 -->
     <n-modal v-model:show="showDiff" preset="card" :title="diffTitle" style="width: 92%; max-width: 900px">
       <n-empty v-if="!diffFiles.length" description="没有差异" style="padding: 24px" />
       <div v-else class="diff-list">
-        <div v-for="f in diffFiles" :key="f.path" class="diff-file">
-          <div class="diff-head" role="button" tabindex="0" @click="f.open = !f.open"
-            @keydown.enter="f.open = !f.open">
-            <n-icon :component="f.open ? ChevronDownOutline : ChevronForwardOutline" />
-            <span class="diff-path" :title="f.path">{{ f.path }}</span>
-            <span class="diff-add">+{{ f.adds }}</span>
-            <span class="diff-del">-{{ f.dels }}</span>
-          </div>
-          <div v-if="f.open" class="diff-body">
-            <div class="diff-inner">
-              <div v-for="(l, i) in f.lines" :key="i" class="dl" :class="l.kind">{{ l.text || ' ' }}</div>
-            </div>
-          </div>
+        <div v-for="f in diffFiles" :key="f.path" class="diff-file list-row" role="button" tabindex="0"
+          @click="goFile(diffScope, f.path, diffCommit?.hash)" @keydown.enter="goFile(diffScope, f.path, diffCommit?.hash)">
+          <span class="diff-path" :title="f.path">{{ f.path }}</span>
+          <span class="diff-add">+{{ f.adds }}</span>
+          <span class="diff-del">-{{ f.dels }}</span>
+          <n-icon class="diff-go" :component="ChevronForwardOutline" />
         </div>
       </div>
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="showDiff = false">关闭</n-button>
+        </div>
+      </template>
     </n-modal>
 
     <!-- 提交 -->
@@ -515,6 +519,29 @@ watch(() => store.currentPath, (p) => {
         </div>
       </template>
     </n-modal>
+    <!-- 交互式认证:远端要求账号密码(推送/拉取被 git 阻塞时弹出)。独立顶层弹窗。 -->
+    <n-modal v-model:show="askModal" preset="card" title="需要账号密码" :mask-closable="false"
+      :closable="false" style="width: 92%; max-width: 460px">
+      <div class="git-hint">{{ askPrompt }}请输入远端仓库的用户名和密码。</div>
+      <n-form label-placement="top" :show-feedback="false">
+        <n-form-item label="用户名">
+          <n-input v-model:value="askUsername" placeholder="用户名" autocomplete="username"
+            @keydown.enter="submitAsk" />
+        </n-form-item>
+        <n-form-item label="密码">
+          <n-input v-model:value="askPassword" type="password" show-password-on="click"
+            placeholder="密码" autocomplete="current-password" @keydown.enter="submitAsk" />
+        </n-form-item>
+      </n-form>
+      <div class="git-hint">凭据仅用于本次操作,不会保存。</div>
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="cancelAsk">取消</n-button>
+          <n-button type="primary" @click="submitAsk">确认</n-button>
+        </div>
+      </template>
+    </n-modal>
+
     <!-- 分支:新建/切换/删除 -->
     <n-modal v-model:show="showBranch" preset="card" title="分支" style="width: 92%; max-width: 560px">
       <div class="branch-new">
@@ -599,7 +626,11 @@ watch(() => store.currentPath, (p) => {
 .log-more { padding: 12px 0; text-align: center; }
 .log-end { color: var(--lr-fg-muted); font-size: 12px; }
 .diff-list { display: flex; flex-direction: column; gap: 8px; max-height: 70vh; overflow-y: auto; }
-.diff-file { border: 1px solid rgba(127, 127, 127, 0.2); border-radius: var(--lr-radius); overflow: hidden; }
+/* flex 列容器里每个文件块必须保持自然高度,不能 flex-shrink:
+   不然展开的文件一多,各块会被容器(70vh)按比例压缩挤扁,内容被 overflow:hidden
+   裁成一条细线——这就是"文件一多只剩线条"的来源。flex: none 让每块按自身内容
+   高排布,超出部分交给 .diff-list 自己滚动。 */
+.diff-file { flex: none; border: 1px solid rgba(127, 127, 127, 0.2); border-radius: var(--lr-radius); overflow: hidden; }
 .diff-head {
   display: flex; align-items: center; gap: 6px; cursor: pointer;
   padding: 8px 10px; background: rgba(127, 127, 127, 0.08);
@@ -612,29 +643,19 @@ watch(() => store.currentPath, (p) => {
 }
 .diff-add { flex: none; color: #16a34a; font-size: 12px; }
 .diff-del { flex: none; color: var(--lr-danger); font-size: 12px; }
-.diff-body {
-  /* 每个文件块独立上下 + 水平滚动:滚动容器宽度 = 弹窗给的整行宽
-     (固定,不随内容变),这样才有横向滚动的余地,才不会出现"没法右滚"。 */
-  overflow: auto;
-  max-height: 60vh;
-  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
+/* 一级文件列表行:点整行进二级页。 */
+.diff-file.list-row {
+  border: 1px solid rgba(127, 127, 127, 0.2);
+  border-radius: var(--lr-radius);
+  cursor: pointer;
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px;
 }
-/* 内容宽度层:min-width 100% 兜底不小于容器,width max-content 让可滚动宽度
-   由最长一行撑开 → 它成了"整行"的基准。 */
-.diff-inner {
-  width: max-content;
-  min-width: 100%;
+.diff-file.list-row:hover, .diff-file.list-row:focus-visible {
+  background: rgba(127, 127, 127, 0.08);
+  outline: none;
 }
-/* 不用 <pre>:Vue 模板编译器会保留 <pre> 里的模板缩进。
-   块级 div 默认 width: 100% 铺满 .diff-inner → 所有行(无论长短)背景都铺满
-   同一个整行宽度,连续对齐,右滑时整行背景跟随。 */
-.dl {
-  white-space: pre; padding: 0 10px;
-}
-.dl.add { background: rgba(22, 163, 74, 0.16); }
-.dl.del { background: rgba(220, 38, 38, 0.16); }
-.dl.hunk { color: var(--lr-accent); background: rgba(127, 127, 127, 0.1); }
-.dl.meta { color: var(--lr-fg-muted); }
+.diff-go { flex: none; color: var(--lr-fg-muted); font-size: 14px; }
 .branch-new { display: flex; flex-wrap: wrap; gap: 6px; }
 .branch-new .n-input { flex: 1 1 130px; }
 .branch-sect { max-height: 60vh; overflow-y: auto; }
