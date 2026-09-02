@@ -4,6 +4,8 @@ import { defineStore } from 'pinia'
 import { api, type Workspace } from '@/api/client'
 
 const STORAGE_KEY = 'lr.currentWorkspace'
+// 上次访问的目录用 sessionStorage:关掉标签页即遗忘,切换工作区时主动清除。
+const LAST_DIR_KEY = 'lr.lastDir'
 
 export const useWorkspaceStore = defineStore('workspace', () => {
   const list = ref<Workspace[]>([])
@@ -26,9 +28,21 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   function select(id: string | null) {
+    const changed = id !== currentId.value
     currentId.value = id
     if (id) localStorage.setItem(STORAGE_KEY, id)
     else localStorage.removeItem(STORAGE_KEY)
+    if (changed) clearLastDir()
+  }
+
+  function lastDir(): string | null {
+    return sessionStorage.getItem(LAST_DIR_KEY)
+  }
+  function setLastDir(p: string) {
+    sessionStorage.setItem(LAST_DIR_KEY, p)
+  }
+  function clearLastDir() {
+    sessionStorage.removeItem(LAST_DIR_KEY)
   }
 
   // 视图 onMounted 调用:只在没加载过时拉一次,避免每次切页都打接口。
@@ -36,5 +50,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (!loaded.value) await load()
   }
 
-  return { list, currentId, current, currentPath, root, loaded, load, ensure, select }
+  return {
+    list, currentId, current, currentPath, root, loaded,
+    load, ensure, select, lastDir, setLastDir, clearLastDir,
+  }
 })

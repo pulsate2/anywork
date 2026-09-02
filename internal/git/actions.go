@@ -4,6 +4,9 @@ import "strings"
 
 // StageAdd 把 paths 加入暂存(index)。
 func (s *Service) StageAdd(p string, paths []string) error {
+	if err := s.allowWrite(); err != nil {
+		return err
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return err
@@ -25,6 +28,9 @@ func (s *Service) StageAdd(p string, paths []string) error {
 
 // StageReset 从暂存区移除 paths(保留工作区改动)。
 func (s *Service) StageReset(p string, paths []string) error {
+	if err := s.allowWrite(); err != nil {
+		return err
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return err
@@ -40,6 +46,9 @@ func (s *Service) StageReset(p string, paths []string) error {
 
 // Commit 提交所有已暂存改动。
 func (s *Service) Commit(p, message string, addAll bool) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -70,6 +79,9 @@ func (s *Service) Commit(p, message string, addAll bool) (string, error) {
 // Push 推送。remote 为空时走当前分支的上游配置;指定 remote 时 branch 缺省为当前分支,
 // setUpstream 对应 -u(首次推送时把远端分支记为上游)。
 func (s *Service) Push(p, remote, branch string, setUpstream bool) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -99,6 +111,9 @@ func (s *Service) Push(p, remote, branch string, setUpstream bool) (string, erro
 
 // Pull 拉取。
 func (s *Service) Pull(p string) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -120,6 +135,9 @@ func (s *Service) remoteOpRun(root string, args ...string) (string, error) {
 // Branch 分支操作。op: create|delete|switch|track。track 用于远端分支
 // (origin/feat),会建立同名本地分支并跟踪它。
 func (s *Service) Branch(p, op, name, start string) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -168,6 +186,12 @@ func checkRefArgs(names ...string) error {
 
 // Stash 操作。op: push|pop|list|clear。
 func (s *Service) Stash(p, op, message string) (string, error) {
+	// list 只是查看,只读模式下照常放行。
+	if op != "list" {
+		if err := s.allowWrite(); err != nil {
+			return "", err
+		}
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -193,6 +217,12 @@ func (s *Service) Stash(p, op, message string) (string, error) {
 
 // Worktree 操作。op: list|add|remove。path/name 为新 worktree 位置与分支。
 func (s *Service) Worktree(p, op, path, branchOrCommit string) (string, error) {
+	// list 只是查看,只读模式下照常放行。
+	if op != "list" {
+		if err := s.allowWrite(); err != nil {
+			return "", err
+		}
+	}
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -222,4 +252,106 @@ func cleanRelPathList(paths []string) []string {
 		out = append(out, cleanRelPath(p))
 	}
 	return out
+}
+
+// Restore 撤销指定文件的改动。mode:
+//
+//	worktree  — git restore:丢弃工作区改动,回到暂存区的状态
+//	all       — git restore --staged --worktree:暂存区与工作区一起回到 HEAD
+//	untracked — git clean -fd:直接删除未跟踪的文件/目录(git 里没有副本可回退)
+//
+// paths 必须显式给出至少一个文件:cleanRelPath 会把空串折成 ".",若放过空列表
+// 就等于"丢弃整个仓库的改动",风险太大,一律按 errNoPaths 拒绝。
+func (s *Service) Restore(p string, paths []string, mode string) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.Repo {
+		return "", ErrNotRepo
+	}
+	rel := make([]string, 0, len(paths))
+	for _, fp := range paths {
+		if c := cleanRelPath(fp); c != "." {
+			rel = append(rel, c)
+		}
+	}
+	if len(rel) == 0 {
+		return "", errNoPaths
+	}
+	var args []string
+	switch mode {
+	case "worktree":
+		args = []string{"restore", "--"}
+	case "all":
+		args = []string{"restore", "--staged", "--worktree", "--"}
+	case "untracked":
+		args = []string{"clean", "-fd", "--"}
+	default:
+		return "", errUnknownRestoreMode
+	}
+	return s.run(info.Root, nil, append(args, rel...)...)
+}
+
+// Revert 回滚提交。op: revert|abort。
+// revert 生成一个反向提交(--no-edit 免得 git 拉起编辑器);合并提交自动补 -m 1,
+// 否则 git 会以 "is a merge but no -m option was given" 拒绝。
+// abort 对应 git revert --abort,用来放弃卡在冲突里的 revert。
+func (s *Service) Revert(p, op, hash string) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.Repo {
+		return "", ErrNotRepo
+	}
+	if op == "abort" {
+		return s.run(info.Root, nil, "revert", "--abort")
+	}
+	if op != "revert" {
+		return "", errUnknownRevertOp
+	}
+	h, err := normCommitArg(hash)
+	if err != nil {
+		return "", err
+	}
+	// hooksPath 的用意见 Commit:revert 同样会产生提交,钩子可能要交互而卡住命令。
+	args := []string{"-c", "core.hooksPath=.git/lightremote-no-hooks", "revert", "--no-edit"}
+	if s.isMergeCommit(info.Root, h) {
+		args = append(args, "-m", "1")
+	}
+	return s.run(info.Root, nil, append(args, h)...)
+}
+
+// isMergeCommit 判断是否合并提交(父提交多于一个)。
+// rev-list --parents 的输出形如 "<commit> <p1> [<p2> ...]"。
+func (s *Service) isMergeCommit(root, hash string) bool {
+	out, err := s.run(root, nil, "rev-list", "--parents", "-n", "1", hash)
+	if err != nil {
+		return false
+	}
+	return len(strings.Fields(out)) > 2
+}
+
+// normCommitArg 只接受 4~40 位十六进制提交号:既挡住以 - 开头的伪选项,
+// 也挡住 HEAD~1 / 分支名这类会让 revert 目标失控的写法。
+func normCommitArg(hash string) (string, error) {
+	h := strings.TrimSpace(hash)
+	if len(h) < 4 || len(h) > 40 {
+		return "", errBadCommitArg
+	}
+	for _, c := range h {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return "", errBadCommitArg
+		}
+	}
+	return h, nil
 }

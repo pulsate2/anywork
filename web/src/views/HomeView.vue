@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { NButton, NEmpty, NTag, NSpin, useDialog, useMessage } from 'naive-ui'
-import { AddOutline, FolderOpenOutline, TrashOutline, CheckmarkCircle } from '@vicons/ionicons5'
+import { NButton, NEmpty, NTag, NSpin, NModal, NInput, useDialog, useMessage } from 'naive-ui'
+import { AddOutline, FolderOpenOutline, TrashOutline, CheckmarkCircle, CreateOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import { api, type Workspace } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
@@ -42,6 +42,46 @@ function pick(ws: Workspace) {
 function openFiles(ws: Workspace) {
   store.select(ws.id)
   router.push({ name: 'files' })
+}
+
+// ---- 改名 ----
+// 只改名字,路径不动:换路径等于换一个工作区。
+const renameShowing = ref(false)
+const renameTarget = ref<Workspace | null>(null)
+const renameValue = ref('')
+const renaming = ref(false)
+const renameInput = ref<InstanceType<typeof NInput> | null>(null)
+
+function openRename(ws: Workspace) {
+  renameTarget.value = ws
+  renameValue.value = ws.name
+  renameShowing.value = true
+}
+
+// 弹窗有进场动画,挂载完成前 focus 会落空,所以挂到 n-modal 的 after-enter 上。
+function focusRename() {
+  renameInput.value?.select()
+}
+
+async function submitRename() {
+  const ws = renameTarget.value
+  const name = renameValue.value.trim()
+  if (!ws || !name) return
+  if (name === ws.name) {
+    renameShowing.value = false
+    return
+  }
+  renaming.value = true
+  try {
+    await api.renameWorkspace(ws.id, name)
+    renameShowing.value = false
+    message.success('已改名')
+    load()
+  } catch (e: any) {
+    message.error(e?.message || '改名失败')
+  } finally {
+    renaming.value = false
+  }
 }
 
 function remove(ws: Workspace) {
@@ -103,7 +143,10 @@ onMounted(load)
             <div class="ws-path" :title="ws.path">{{ ws.path }}</div>
           </div>
           <n-button class="ws-act" quaternary size="small" @click.stop="openFiles(ws)">打开</n-button>
-          <n-button class="ws-del" quaternary circle type="error" aria-label="删除工作区" @click.stop="remove(ws)">
+          <n-button class="ws-icon-btn" quaternary circle aria-label="重命名工作区" @click.stop="openRename(ws)">
+            <template #icon><n-icon :component="CreateOutline" /></template>
+          </n-button>
+          <n-button class="ws-icon-btn" quaternary circle type="error" aria-label="删除工作区" @click.stop="remove(ws)">
             <template #icon><n-icon :component="TrashOutline" /></template>
           </n-button>
         </div>
@@ -112,6 +155,20 @@ onMounted(load)
     </n-spin>
 
     <workspace-create-modal v-model:show="showCreate" @created="onCreated" />
+
+    <n-modal v-model:show="renameShowing" preset="card" title="重命名工作区" class="ws-rename"
+      @after-enter="focusRename">
+      <n-input ref="renameInput" v-model:value="renameValue" placeholder="工作区名称"
+        @keydown.enter="submitRename" />
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="renameShowing = false">取消</n-button>
+          <n-button type="primary" :loading="renaming" :disabled="!renameValue.trim()" @click="submitRename">
+            保存
+          </n-button>
+        </div>
+      </template>
+    </n-modal>
   </div>
 </template>
 
@@ -167,6 +224,8 @@ onMounted(load)
   margin-top: 2px;
 }
 /* 覆盖全局 .n-button 的 44px 触控下限,否则圆形按钮会被拉成椭圆 */
-.ws-del { flex: none; width: 36px; height: 36px; min-height: 36px; }
+.ws-icon-btn { flex: none; width: 36px; height: 36px; min-height: 36px; }
 .ws-act { flex: none; min-height: 32px; }
+.ws-rename { width: min(420px, calc(100vw - 32px)); }
+.modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
 </style>

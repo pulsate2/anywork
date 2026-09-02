@@ -1,8 +1,9 @@
 <script setup lang="ts">
 // 文件浏览器二级页:单个文件的 只读语法高亮预览 / 编辑 视图。
-// 一级(FilesView)点某文件 → 路由到本页,查询参数带 path(绝对路径)与 name(展示标题)。
-// 默认只读预览;点"编辑"进入 textarea 编辑,可替换/保存。搜索在预览模式定位高亮命中。
-import { ref, computed, onMounted } from 'vue'
+// 一级(FilesView)点某文件 → 路由到本页,查询参数带 path(绝对路径)与 name(展示标题);
+// 从搜索结果点进来时还带 line(命中行号),进页面后滚到该行。
+// 图片走 <img>、压缩包走条目列表,都不读正文;markdown 只读时可切换渲染视图。
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton, NIcon, NSpin, NEmpty, NInput, useMessage,
@@ -10,9 +11,12 @@ import {
 import {
   ChevronBackOutline, SearchOutline, CreateOutline, SaveOutline,
   CloseOutline, ChevronUpOutline, ChevronDownOutline, SwapHorizontalOutline,
+  ArrowUndoOutline, ArrowRedoOutline, EyeOutline, CodeOutline, DownloadOutline,
 } from '@vicons/ionicons5'
-import { api } from '@/api/client'
+import { api, type FsArchiveEntry } from '@/api/client'
 import { highlightCode } from '@/utils/highlight'
+import { renderMarkdown } from '@/utils/markdown'
+import { fileIcon, isArchivePath, isImagePath, isMarkdownPath } from '@/utils/fileIcon'
 
 const route = useRoute()
 const router = useRouter()
@@ -28,11 +32,19 @@ function basename(p: string): string {
 
 const MAX_EDIT = 512 * 1024
 
+// 按扩展名一次定型:图片/压缩包都是二进制,读正文只会拿到 400。
+const kind = isImagePath(path) ? 'image' : isArchivePath(path) ? 'archive' : 'text'
+const isMd = isMarkdownPath(path)
+// 搜索结果带过来的命中行号(没有则 0)。
+const targetLine = Number(route.query.line) || 0
+
 // ---- 内容加载 ----
 const content = ref('')
 const editText = ref('')
 const loadError = ref('')
 const loading = ref(false)
+const archiveEntries = ref<FsArchiveEntry[]>([])
+const archiveTruncated = ref(false)
 
 async function load() {
   if (!path) {
@@ -42,8 +54,15 @@ async function load() {
   loading.value = true
   loadError.value = ''
   try {
-    content.value = await api.fsRead(path)
-    editText.value = content.value
+    if (kind === 'archive') {
+      const out = await api.fsArchiveList(path)
+      archiveEntries.value = out.entries
+      archiveTruncated.value = out.truncated
+    } else if (kind === 'text') {
+      content.value = await api.fsRead(path)
+      editText.value = content.value
+      resetHistory()
+    }
   } catch (e: any) {
     loadError.value = `无法读取文件:${e?.message || e || '未知错误'}`
     content.value = ''
@@ -51,7 +70,57 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // 行号定位要等 DOM 落地,并且必须在源码视图下才有行号栏。
+  if (targetLine && content.value) {
+    await nextTick()
+    scrollToLine(targetLine)
+  }
 }
+
+// ---- 压缩包内的目录浏览 ----
+// 后端给的是整包平铺列表(name = 包内完整路径),这里在前端按前缀切成一层层目录。
+// 目录必须从路径里推,不能只信 dir 标记:有些包(尤其 7z)根本不写目录条目,
+// 文件夹只存在于文件路径中间。
+const archiveCwd = ref('') // 包内当前目录,'' = 包根,非空时以 / 结尾
+
+interface ArchiveRow { name: string; dir: boolean; size: number }
+
+const archiveRows = computed<ArchiveRow[]>(() => {
+  const prefix = archiveCwd.value
+  const dirs = new Set<string>()
+  const files: ArchiveRow[] = []
+  for (const e of archiveEntries.value) {
+    if (!e.name.startsWith(prefix)) continue
+    const rest = e.name.slice(prefix.length).replace(/\/+$/, '')
+    if (!rest) continue // 当前目录自己那条
+    const slash = rest.indexOf('/')
+    if (slash >= 0) dirs.add(rest.slice(0, slash))
+    else if (e.dir) dirs.add(rest)
+    else files.push({ name: rest, dir: false, size: e.size })
+  }
+  const cmp = (a: ArchiveRow, b: ArchiveRow) => a.name.localeCompare(b.name)
+  // 目录优先,和文件列表页一致。
+  return [...dirs].sort().map((name) => ({ name, dir: true, size: 0 })).concat(files.sort(cmp))
+})
+
+const archiveCrumbs = computed(() => {
+  const out = [{ name: '/', prefix: '' }]
+  let acc = ''
+  for (const part of archiveCwd.value.split('/').filter(Boolean)) {
+    acc += part + '/'
+    out.push({ name: part, prefix: acc })
+  }
+  return out
+})
+
+function openArchiveRow(row: ArchiveRow) {
+  if (row.dir) archiveCwd.value += row.name + '/'
+}
+
+// ---- markdown 渲染视图(F7,只读态可切) ----
+// 从搜索结果带行号进来时默认给源码,否则 markdown 默认渲染态。
+const mdRendered = ref(isMd && !targetLine)
+const mdHtml = computed(() => (mdRendered.value ? renderMarkdown(content.value) : ''))
 
 // ---- 编辑模式 ----
 const editing = ref(false)
@@ -62,6 +131,8 @@ function enterEdit() {
     return
   }
   editText.value = content.value
+  resetHistory()
+  mdRendered.value = false // 渲染态没法编辑,切回源码
   editing.value = true
 }
 
@@ -78,7 +149,99 @@ async function save() {
 
 function cancelEdit() {
   editText.value = content.value
+  resetHistory()
   editing.value = false
+}
+
+// ---- 撤销 / 恢复(F6) ----
+// v-model 的程序化赋值会清掉 textarea 自带的 undo 栈(替换、撤销本身都会触发),
+// 所以自己维护快照栈。连续输入 800ms 内合并成一帧,免得一个字一步。
+interface Snapshot { text: string; start: number; end: number }
+const COALESCE_MS = 800
+const HISTORY_MAX = 200
+const undoStack = ref<Snapshot[]>([])
+const redoStack = ref<Snapshot[]>([])
+let lastPushAt = 0
+let composing = false
+
+const editorEl = ref<HTMLElement | null>(null)
+const gutterEl = ref<HTMLElement | null>(null)
+const inputEl = ref<HTMLTextAreaElement | null>(null)
+
+function resetHistory() {
+  undoStack.value = []
+  redoStack.value = []
+  lastPushAt = 0
+}
+
+function snapshot(): Snapshot {
+  const el = inputEl.value
+  return { text: editText.value, start: el?.selectionStart ?? 0, end: el?.selectionEnd ?? 0 }
+}
+
+// force = 结构性改动(替换、开始输入法组合),必定单独占一帧。
+function pushUndo(force = false) {
+  if (composing) return
+  const now = Date.now()
+  if (!force && undoStack.value.length && now - lastPushAt < COALESCE_MS) return
+  lastPushAt = now
+  undoStack.value.push(snapshot())
+  if (undoStack.value.length > HISTORY_MAX) undoStack.value.shift()
+  redoStack.value = []
+}
+
+function applySnapshot(s: Snapshot) {
+  editText.value = s.text
+  lastPushAt = 0 // 撤销之后的下一次输入另起一帧
+  nextTick(() => {
+    const el = inputEl.value
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(s.start, s.end)
+  })
+}
+
+function undo() {
+  const prev = undoStack.value.pop()
+  if (!prev) return
+  redoStack.value.push(snapshot())
+  applySnapshot(prev)
+}
+
+function redo() {
+  const next = redoStack.value.pop()
+  if (!next) return
+  undoStack.value.push(snapshot())
+  applySnapshot(next)
+}
+
+// beforeinput 时 editText 还是改动前的值,正好用来存快照。
+function onBeforeInput() {
+  if (editing.value) pushUndo()
+}
+
+// 输入法组合期间 beforeinput 会逐字触发,整段组合只留组合前的一帧。
+function onCompositionStart() {
+  if (editing.value) pushUndo(true)
+  composing = true
+}
+
+function onCompositionEnd() {
+  composing = false
+  lastPushAt = Date.now()
+}
+
+// 桌面端快捷键:接管 Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y,别让浏览器自己那套残缺的 undo 插手。
+function onEditorKeydown(e: KeyboardEvent) {
+  if (!editing.value || !(e.ctrlKey || e.metaKey)) return
+  const k = e.key.toLowerCase()
+  if (k === 'z' && !e.shiftKey) {
+    e.preventDefault()
+    undo()
+  } else if (k === 'y' || (k === 'z' && e.shiftKey)) {
+    e.preventDefault()
+    redo()
+  }
 }
 
 // ---- 搜索(预览模式,只读定位) ----
@@ -95,7 +258,7 @@ const preEl = ref<HTMLElement | null>(null)
 // 依据开关构造搜索正则。非正则模式转义特殊字符;g 或 gi 视大小写。
 function buildRegex(q: string): RegExp {
   const src = searchRegex.value ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(src, searchCase.value ? 'gi' : 'g')
+  return new RegExp(src, searchCase.value ? 'g' : 'gi')
 }
 
 // 记录上一次搜索的"指纹"(关键词+开关),用于判断重复点击时是否要"下一个"。
@@ -108,6 +271,8 @@ function doSearch() {
     lastSig = ''
     return
   }
+  // 命中标记只存在于源码视图里,渲染态搜索先切回源码。
+  mdRendered.value = false
   const sig = searchQ.value + '|' + (searchRegex.value ? 1 : 0) + (searchCase.value ? 1 : 0)
   const re = buildRegex(searchQ.value)
   const found: { start: number; end: number }[] = []
@@ -148,6 +313,14 @@ function scrollToHit() {
 const currentHit = computed(() =>
   hitIndex.value >= 0 && hitIndex.value < hits.value.length ? hitIndex.value + 1 : 0)
 
+// 滚到指定行(F3:从搜索结果带 line 进来时定位)。
+// 行号栏的 <span> 与代码行同处一条流内,拿它做锚点即可,不用猜行高;
+// scrollIntoView 会把沿路每一层滚动容器都带到位,不必关心究竟哪层在滚。
+function scrollToLine(n: number) {
+  const el = gutterEl.value?.children[n - 1] as HTMLElement | undefined
+  el?.scrollIntoView({ block: 'center' })
+}
+
 // ---- 渲染(预览/编辑共用):命中切片包进 <mark class="hit">,其余片段走 highlightCode 高亮。
 // 单独抽出,让 content(预览)与 editText(编辑)都经过同一套命中高亮逻辑。
 function renderHighlight(text: string): string {
@@ -187,8 +360,15 @@ function replaceAll() {
   }
   const re = buildRegex(searchQ.value)
   const count = (editText.value.match(re) || []).length
+  pushUndo(true) // 批量替换单独占一帧,一次撤销能整体还原
   editText.value = editText.value.replace(re, replaceText.value)
   message.success(`已替换 ${count} 处`)
+}
+
+function sizeHuman(n: number) {
+  if (n < 1024) return n + ' B'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+  return (n / 1024 / 1024).toFixed(1) + ' MB'
 }
 
 function goBack() {
@@ -210,7 +390,7 @@ onMounted(load)
           <div class="fv-path" :title="path">{{ name }}</div>
         </div>
         <div class="tom-tools">
-          <n-button quaternary size="small" :type="searchOpen ? 'primary' : 'default'"
+          <n-button v-if="kind === 'text'" quaternary size="small" :type="searchOpen ? 'primary' : 'default'"
             title="搜索" aria-label="搜索" @click="searchOpen = !searchOpen">
             <template #icon><n-icon :component="SearchOutline" /></template>
           </n-button>
@@ -218,12 +398,32 @@ onMounted(load)
             title="替换" aria-label="替换" @click="replaceOpen = !replaceOpen">
             <template #icon><n-icon :component="SwapHorizontalOutline" /></template>
           </n-button>
-          <template v-if="!editing">
+          <template v-if="editing">
+            <n-button quaternary size="small" :disabled="!undoStack.length"
+              title="撤销" aria-label="撤销" @click="undo">
+              <template #icon><n-icon :component="ArrowUndoOutline" /></template>
+            </n-button>
+            <n-button quaternary size="small" :disabled="!redoStack.length"
+              title="恢复" aria-label="恢复" @click="redo">
+              <template #icon><n-icon :component="ArrowRedoOutline" /></template>
+            </n-button>
+          </template>
+          <!-- markdown 只读态:渲染视图 ↔ 源码视图 -->
+          <n-button v-if="isMd && !editing" quaternary size="small" :type="mdRendered ? 'primary' : 'default'"
+            :title="mdRendered ? '看源码' : '看渲染'" :aria-label="mdRendered ? '看源码' : '看渲染'"
+            @click="mdRendered = !mdRendered">
+            <template #icon><n-icon :component="mdRendered ? CodeOutline : EyeOutline" /></template>
+          </n-button>
+          <n-button v-if="kind !== 'text'" quaternary size="small" tag="a" :href="api.fsDownloadUrl(path)"
+            title="下载" aria-label="下载">
+            <template #icon><n-icon :component="DownloadOutline" /></template>
+          </n-button>
+          <template v-if="kind === 'text' && !editing">
             <n-button quaternary size="small" type="primary" title="编辑" aria-label="编辑" @click="enterEdit">
               <template #icon><n-icon :component="CreateOutline" /></template>
             </n-button>
           </template>
-          <template v-else>
+          <template v-else-if="editing">
             <n-button quaternary size="small" type="primary" title="保存" aria-label="保存" @click="save">
               <template #icon><n-icon :component="SaveOutline" /></template>
             </n-button>
@@ -273,7 +473,41 @@ onMounted(load)
     <!-- 主体 -->
     <n-spin :show="loading" class="fv-body">
       <div v-if="loadError" class="fv-error">{{ loadError }}</div>
+
+      <!-- 图片(F2a):走下载端点的 inline 模式,会话 Cookie 由浏览器自动带上。 -->
+      <div v-else-if="kind === 'image'" class="fv-image">
+        <img :src="api.fsInlineUrl(path)" :alt="name" />
+      </div>
+
+      <!-- 压缩包(F2b):只列条目,不解压不读正文。目录可点进,层级在前端按路径前缀切。 -->
+      <div v-else-if="kind === 'archive'" class="fv-archive">
+        <div class="fa-crumb">
+          <template v-for="(c, i) in archiveCrumbs" :key="c.prefix">
+            <span v-if="i > 1" class="fa-sep">/</span>
+            <button v-if="i < archiveCrumbs.length - 1" class="fa-seg" @click="archiveCwd = c.prefix">
+              {{ c.name }}
+            </button>
+            <span v-else class="fa-seg current">{{ c.name }}</span>
+          </template>
+        </div>
+        <div class="fa-head">
+          {{ archiveRows.length }} 项
+          <span v-if="archiveTruncated" class="fa-trunc">· 条目过多,整包仅读取前 {{ archiveEntries.length }} 条,可能不完整</span>
+        </div>
+        <n-empty v-if="!archiveRows.length" :description="archiveCwd ? '空目录' : '压缩包为空'" style="padding: 24px" />
+        <div v-for="e in archiveRows" :key="e.name" class="fa-item" :class="{ 'fa-dir': e.dir }"
+          :role="e.dir ? 'button' : undefined" :tabindex="e.dir ? 0 : undefined"
+          @click="openArchiveRow(e)" @keydown.enter="openArchiveRow(e)">
+          <n-icon class="fa-ico" :component="fileIcon(e.name, e.dir).icon" :color="fileIcon(e.name, e.dir).color" />
+          <span class="fa-name">{{ e.name }}</span>
+          <span v-if="!e.dir" class="fa-size">{{ sizeHuman(e.size) }}</span>
+        </div>
+      </div>
+
       <n-empty v-else-if="!editing && !content" description="文件内容为空" style="padding: 24px" />
+
+      <!-- markdown 渲染视图(F7):只读态可切,渲染 HTML 由 markdown-it 生成(html: false)。 -->
+      <div v-else-if="mdRendered" class="md-body" v-html="mdHtml"></div>
 
       <!-- 预览/编辑 共用编辑器:高亮 <pre> 打底 + 透明 <textarea> 覆盖,行号在左侧粘性栏。 -->
       <div v-else ref="editorEl" class="code-editor">
@@ -283,7 +517,9 @@ onMounted(load)
         <div ref="preEl" class="ce-body">
           <pre><code v-html="displayHtml"></code></pre>
           <textarea ref="inputEl" class="ce-input" :readonly="!editing" v-model="editText"
-            spellcheck="false" aria-label="文件内容"></textarea>
+            spellcheck="false" aria-label="文件内容"
+            @beforeinput="onBeforeInput" @compositionstart="onCompositionStart"
+            @compositionend="onCompositionEnd" @keydown="onEditorKeydown"></textarea>
         </div>
       </div>
     </n-spin>
@@ -323,8 +559,6 @@ onMounted(load)
 }
 .tom-search { width: 180px; }
 .tom-sep { flex: 1; }
-.tom-search :deep(.n-input__input-el),
-.tom-search :deep(.n-input__placeholder) { line-height: 24px; }
 .ft-counter {
   flex: none; font-size: 12px; color: var(--lr-fg-muted);
   font-family: ui-monospace, monospace; white-space: nowrap;
@@ -338,6 +572,62 @@ onMounted(load)
   margin: 8px 0; padding: 8px 12px; border-radius: 4px;
   color: var(--lr-danger, #d03050); background: rgba(208, 48, 80, 0.1);
   font-size: 13px;
+}
+/* 图片预览:按容器宽度自适应,超高时容器滚动;棋盘底衬托透明像素。 */
+.fv-image {
+  overflow: auto;
+  padding: 8px 0;
+  text-align: center;
+}
+.fv-image img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  background-image:
+    linear-gradient(45deg, rgba(127, 127, 127, 0.12) 25%, transparent 25%, transparent 75%, rgba(127, 127, 127, 0.12) 75%),
+    linear-gradient(45deg, rgba(127, 127, 127, 0.12) 25%, transparent 25%, transparent 75%, rgba(127, 127, 127, 0.12) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+}
+/* 压缩包条目列表 */
+.fv-archive { overflow: auto; padding: 4px 0 8px; }
+/* 包内面包屑:可点的段是 <button>、当前段是 <span>,统一 flex 居中免得一上一下。 */
+.fa-crumb {
+  display: flex; align-items: center; gap: 2px;
+  overflow-x: auto; white-space: nowrap;
+  padding: 2px 0;
+}
+.fa-seg {
+  flex: none; display: flex; align-items: center;
+  min-height: 30px; padding: 0 6px;
+  border: 0; background: none; border-radius: 6px;
+  font: inherit; font-size: 13px; color: var(--lr-accent); cursor: pointer;
+}
+.fa-seg:active { background: rgba(127, 127, 127, 0.16); }
+.fa-seg.current { color: var(--lr-fg-muted); cursor: default; }
+.fa-seg.current:active { background: none; }
+.fa-sep { flex: none; color: var(--lr-fg-muted); }
+.fa-head {
+  padding: 6px 2px; font-size: 12px; color: var(--lr-fg-muted);
+}
+.fa-trunc { color: var(--lr-danger, #d03050); }
+.fa-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 2px;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.12);
+  font-size: 13px;
+}
+.fa-item.fa-dir { cursor: pointer; }
+.fa-item.fa-dir:active { background: rgba(127, 127, 127, 0.12); }
+.fa-ico { flex: none; font-size: 14px; }
+.fa-name {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+.fa-size {
+  flex: none; font-size: 12px; color: var(--lr-fg-muted);
+  font-family: ui-monospace, monospace; white-space: nowrap;
 }
 /* 代码编辑器:单个滚动容器承载 行号栏 + 高亮 pre + 透明 textarea。 */
 .code-editor {
@@ -372,10 +662,12 @@ onMounted(load)
   background: var(--lr-bg);
 }
 .ce-gutter span { display: block; }
-/* 高亮层:宽度贴合内容,让 textarea 能精确覆盖到行尾 */
+/* 高亮层:宽度贴合内容,让 textarea 能精确覆盖到行尾。
+   pre/code 的 UA 样式自带 font-family: monospace,会盖掉从 .code-editor 继承来的字体,
+   于是高亮层和 textarea 用两种字体、字宽不同 —— 光标就会和文字逐渐错开。font: inherit 打掉它。 */
 .ce-body { position: relative; flex: none; width: max-content; }
-.ce-body pre { margin: 0; white-space: pre; }
-.ce-body pre code { display: block; padding: 0; color: var(--lr-fg); }
+.ce-body pre { margin: 0; white-space: pre; font: inherit; }
+.ce-body pre code { display: block; padding: 0; font: inherit; color: var(--lr-fg); }
 /* 覆盖层 textarea:绝对铺满 .ce-body(= pre 同尺寸),透明文字只留光标。
    .ce-body 随内容变宽变高,textarea 一并长,纵向滚动时逐行仍与高亮对齐。 */
 .ce-input {
@@ -401,13 +693,6 @@ onMounted(load)
      <mark class="hit"> 不带组件 scope 属性,scoped 选择器永远匹配不上,须用全局样式。
      .file-body 前缀限定作用域,映射到 --lr-* 令牌,浅/深主题自动适配。 -->
 <style>
-.ce-body { margin: 0; max-height: 100%; overflow: auto; padding: 8px 0; }
-.ce-body code {
-  display: block;
-  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
-  color: var(--lr-fg);
-  white-space: pre; word-break: break-word;
-}
 .ce-body :where(.hljs) { color: var(--lr-fg); }
 .ce-body .hljs-attr, .ce-body .hljs-selector-tag, .ce-body .hljs-name { color: #c26; }
 .ce-body .hljs-comment, .ce-body .hljs-quote { color: var(--lr-fg-muted); font-style: italic; }
@@ -428,6 +713,80 @@ onMounted(load)
   border-radius: 2px;
   padding: 0;
 }
+/* markdown 渲染视图(F7):v-html 注入的节点同样不带 scope 属性,须用全局样式。
+   配色一律走 --lr-* 令牌或 rgba,浅/深主题自动适配,不必再写一份深色覆盖。 */
+.md-body {
+  overflow: auto;
+  padding: 8px 2px 24px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--lr-fg);
+  overflow-wrap: anywhere;
+}
+.md-body > :first-child { margin-top: 0; }
+.md-body h1, .md-body h2, .md-body h3,
+.md-body h4, .md-body h5, .md-body h6 {
+  margin: 1.4em 0 0.6em; line-height: 1.3; font-weight: 600;
+}
+.md-body h1 { font-size: 1.6em; }
+.md-body h2 { font-size: 1.35em; }
+.md-body h3 { font-size: 1.15em; }
+.md-body h4, .md-body h5, .md-body h6 { font-size: 1em; }
+.md-body h1, .md-body h2 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.24);
+}
+.md-body p, .md-body ul, .md-body ol, .md-body blockquote, .md-body table {
+  margin: 0.7em 0;
+}
+.md-body ul, .md-body ol { padding-left: 1.5em; }
+.md-body li { margin: 0.25em 0; }
+.md-body a { color: var(--lr-accent, #4078f2); }
+.md-body blockquote {
+  padding: 0 0 0 12px;
+  border-left: 3px solid rgba(127, 127, 127, 0.35);
+  color: var(--lr-fg-muted);
+}
+.md-body hr {
+  margin: 1.4em 0; border: 0;
+  border-top: 1px solid rgba(127, 127, 127, 0.24);
+}
+.md-body img { max-width: 100%; height: auto; }
+/* 行内 code 与围栏 pre.md-pre(见 utils/markdown.ts 的 highlight 回调) */
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+  background: rgba(127, 127, 127, 0.16);
+}
+.md-body pre.md-pre {
+  margin: 0.8em 0; padding: 10px 12px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.12);
+  overflow: auto;
+  line-height: 1.5;
+}
+.md-body pre.md-pre code {
+  padding: 0; background: none; font-size: 12px;
+  white-space: pre; overflow-wrap: normal;
+}
+/* 表格:窄屏靠外层 .md-body 横向滚动 */
+.md-body table { border-collapse: collapse; }
+.md-body th, .md-body td {
+  padding: 5px 10px;
+  border: 1px solid rgba(127, 127, 127, 0.28);
+}
+.md-body th { background: rgba(127, 127, 127, 0.12); font-weight: 600; }
+/* 围栏代码块的令牌色:复用 .ce-body 那套定义,这里只做选择器映射。 */
+.md-body .hljs-attr, .md-body .hljs-selector-tag, .md-body .hljs-name { color: #c26; }
+.md-body .hljs-comment, .md-body .hljs-quote { color: var(--lr-fg-muted); font-style: italic; }
+.md-body .hljs-keyword, .md-body .hljs-selector-class, .md-body .hljs-meta { color: #a626a4; }
+.md-body .hljs-string, .md-body .hljs-regexp, .md-body .hljs-addition { color: #3d8c3e; }
+.md-body .hljs-number, .md-body .hljs-literal, .md-body .hljs-deletion { color: #b76b01; }
+.md-body .hljs-title, .md-body .hljs-title.function_, .md-body .hljs-section,
+.md-body .hljs-built_in { color: #286983; }
+.md-body .hljs-type, .md-body .hljs-class, .md-body .hljs-selector-id { color: #4078f2; }
 @media (prefers-color-scheme: dark) {
   .ce-body .hljs-attr, .ce-body .hljs-selector-tag, .ce-body .hljs-name { color: #f7797b; }
   .ce-body .hljs-keyword, .ce-body .hljs-selector-class, .ce-body .hljs-meta { color: #d88cf6; }
@@ -437,5 +796,12 @@ onMounted(load)
   .ce-body .hljs-built_in { color: #7bd5ff; }
   .ce-body .hljs-type, .ce-body .hljs-class, .ce-body .hljs-selector-id { color: #9bb8ff; }
   .ce-body mark.hit { background: rgba(255, 213, 0, 0.35); }
+  .md-body .hljs-attr, .md-body .hljs-selector-tag, .md-body .hljs-name { color: #f7797b; }
+  .md-body .hljs-keyword, .md-body .hljs-selector-class, .md-body .hljs-meta { color: #d88cf6; }
+  .md-body .hljs-string, .md-body .hljs-regexp, .md-body .hljs-addition { color: #8fcc7a; }
+  .md-body .hljs-number, .md-body .hljs-literal, .md-body .hljs-deletion { color: #ffc37a; }
+  .md-body .hljs-title, .md-body .hljs-title.function_, .md-body .hljs-section,
+  .md-body .hljs-built_in { color: #7bd5ff; }
+  .md-body .hljs-type, .md-body .hljs-class, .md-body .hljs-selector-id { color: #9bb8ff; }
 }
 </style>

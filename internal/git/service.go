@@ -17,6 +17,8 @@ import (
 // Service 持有文件根边界,提供 git 操作。
 type Service struct {
 	root string
+	// readOnly 对应 --readonly:所有改动仓库或远端的命令一律拒绝。
+	readOnly bool
 	// resolve 把用户路径解析为受限绝对路径(注入 fs.Service.Resolve)。
 	resolve func(string) (string, error)
 	// broker 交互式凭据登记簿;非 nil 时 push/pull 会经它开启 GIT_ASKPASS。
@@ -24,8 +26,16 @@ type Service struct {
 }
 
 // New 构造 Git 服务。root 为文件根;resolve 复用 fs 的边界校验。
-func New(root string, resolve func(string) (string, error)) *Service {
-	return &Service{root: root, resolve: resolve}
+func New(root string, readOnly bool, resolve func(string) (string, error)) *Service {
+	return &Service{root: root, readOnly: readOnly, resolve: resolve}
+}
+
+// allowWrite 只读模式下拒绝一切写操作(暂存/提交/推送/拉取/分支/stash/restore/revert)。
+func (s *Service) allowWrite() error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+	return nil
 }
 
 // SetCredentialBroker 注入凭据登记簿(供 push/pull 交互式认证)。
@@ -37,12 +47,21 @@ func (s *Service) Broker() *CredentialBroker { return s.broker }
 // ErrNotRepo 表示目录不是 git 仓库(或找不到 root 边界内的最近仓库)。
 var ErrNotRepo = errors.New("not a git repository")
 
+// ErrReadOnly 表示服务以 --readonly 启动,拒绝任何改动仓库或远端的操作。
+// 用包级哨兵而非临时 errors.New,让 httpErr 能 errors.Is 出来映射成 403。
+var ErrReadOnly = errors.New("readonly mode")
+
 var (
-	errEmptyMessage      = errors.New("commit message required")
-	errUnknownBranchOp   = errors.New("unknown branch op")
-	errUnknownStashOp    = errors.New("unknown stash op")
-	errUnknownWorktreeOp = errors.New("unknown worktree op")
-	errBadRefArg         = errors.New("invalid branch or remote name")
+	errEmptyMessage       = errors.New("commit message required")
+	errUnknownBranchOp    = errors.New("unknown branch op")
+	errUnknownStashOp     = errors.New("unknown stash op")
+	errUnknownWorktreeOp  = errors.New("unknown worktree op")
+	errUnknownRestoreMode = errors.New("unknown restore mode")
+	errUnknownRevertOp    = errors.New("unknown revert op")
+	errBadRefArg          = errors.New("invalid branch or remote name")
+	errBadCommitArg       = errors.New("invalid commit hash")
+	errBinaryFile         = errors.New("binary cannot be read")
+	errNoPaths            = errors.New("no files specified")
 )
 
 // RepoInfo 描述解析出的仓库信息。

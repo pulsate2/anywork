@@ -91,6 +91,16 @@ export function highlightCode(content: string, path: string): string {
   }
 }
 
+// 按语言名高亮(markdown 围栏代码块用)。语言为空或未注册时回退纯转义。
+export function highlightLang(code: string, lang: string): string {
+  if (lang && hljs.getLanguage(lang)) {
+    try {
+      return hljs.highlight(code, { language: lang }).value
+    } catch { /* 落到转义兜底 */ }
+  }
+  return escapeHtml(code)
+}
+
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c))

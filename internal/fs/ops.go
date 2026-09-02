@@ -1,6 +1,8 @@
 package fs
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -73,6 +75,28 @@ func (s *Service) MkDir(p string) error {
 		return err
 	}
 	return os.MkdirAll(abs, 0o755)
+}
+
+// Touch 新建空文件。O_EXCL 保证不会静默覆盖同名文件 —— 这是它和 Write("") 的区别。
+func (s *Service) Touch(p string) error {
+	if err := s.allowWrite(); err != nil {
+		return err
+	}
+	abs, err := s.Resolve(p)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(abs, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w: 同名文件或目录已存在", ErrBadQuery)
+		}
+		return err
+	}
+	return f.Close()
 }
 
 func (s *Service) Rename(src, dst string) error {

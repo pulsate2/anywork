@@ -52,6 +52,8 @@ export const api = {
   workspaces: () => request<Workspace[]>('GET', '/api/workspaces'),
   createWorkspace: (w: { name: string; path: string; favorite?: boolean }) =>
     request<{ ok: boolean; id: string }>('POST', '/api/workspaces', w),
+  renameWorkspace: (id: string, name: string) =>
+    request<{ ok: boolean }>('PUT', `/api/workspaces/${id}`, { name }),
   deleteWorkspace: (id: string) => request<{ ok: boolean }>('DELETE', `/api/workspaces/${id}`),
   sysinfo: () => request<SysInfo>('GET', '/api/sysinfo'),
   // ---- 文件操作 ----
@@ -70,6 +72,11 @@ export const api = {
   fsReplace: (body: { files: string[]; q: string; replace: string; regex?: boolean; case?: boolean }) =>
     request<{ files: number; count: number }>('POST', '/api/fs/replace', body),
   fsExtract: (dest: string, archive: string) => request<{ ok: boolean }>('POST', '/api/fs/extract', { dest, archive }),
+  fsArchiveList: (path: string, limit?: number) => {
+    const qs = new URLSearchParams({ path })
+    if (limit) qs.set('limit', String(limit))
+    return request<FsArchiveList>('GET', `/api/fs/archive/list?${qs.toString()}`)
+  },
   fsUpload: (dir: string, file: File) => {
     const fd = new FormData()
     fd.append('dir', dir)
@@ -78,11 +85,16 @@ export const api = {
   },
   fsArchiveUrl: (path: string) => `/api/fs/archive?path=${encodeURIComponent(path)}`,
   fsDownloadUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}`,
+  // 图片预览走同一个下载端点,inline=1 让后端改用 Content-Disposition: inline(仅图片白名单生效)。
+  fsInlineUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}&inline=1`,
   // ---- Git ----
   gitRepo: (path: string) => request<GitRepo>('GET', `/api/git/repo?path=${encodeURIComponent(path)}`),
   gitStatus: (path: string) => request<GitStatus>('GET', `/api/git/status?path=${encodeURIComponent(path)}`),
   gitDiff: (path: string, scope: string, file?: string, ref?: string) =>
     requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}`),
+  // 某个提交里某个文件的全文。fsRead 读的是工作区版本,看历史提交时不能用它。
+  gitShow: (path: string, ref: string, file: string) =>
+    requestText(`/api/git/show?path=${encodeURIComponent(path)}&ref=${encodeURIComponent(ref)}&file=${encodeURIComponent(file)}`),
   gitLog: (path: string, n?: number, skip?: number) => {
     const qs = new URLSearchParams({ path })
     if (n) qs.set('n', String(n))
@@ -106,6 +118,13 @@ export const api = {
     request<{ out: string }>('POST', '/api/git/branch', { path, op, name, start }),
   gitStash: (path: string, op: string, message?: string) =>
     request<{ out: string }>('POST', '/api/git/stash', { path, op, message }),
+  // 撤回改动。mode:worktree=丢弃工作区改动;all=暂存区与工作区一起回到 HEAD;
+  // untracked=直接删除未跟踪文件(Git 里没有副本)。
+  gitRestore: (path: string, files: string[], mode: RestoreMode) =>
+    request<{ out: string }>('POST', '/api/git/restore', { path, files, mode }),
+  // 回滚提交。op:revert=生成一个反向提交;abort=放弃卡在冲突里的 revert。
+  gitRevert: (path: string, op: 'revert' | 'abort', hash?: string) =>
+    request<{ out: string }>('POST', '/api/git/revert', { path, op, hash }),
   // ---- AI 配置档案 ----
   aiProfiles: () => request<AiProfile[]>('GET', '/api/ai/profiles'),
   aiProfile: (name: string) => request<AiProfile>('GET', `/api/ai/profile?name=${encodeURIComponent(name)}`),
@@ -163,7 +182,7 @@ export interface FsEntry {
 }
 
 export interface FsOp {
-  op: 'mkdir' | 'rename' | 'copy' | 'move' | 'delete'
+  op: 'mkdir' | 'touch' | 'rename' | 'copy' | 'move' | 'delete'
   path?: string
   from?: string
   to?: string
@@ -198,6 +217,19 @@ export interface FsSearchOutcome {
   results: FsSearchResult[]
   truncated: boolean
   scanned: number
+}
+
+// 压缩包预览:name 是包内相对路径(正斜杠)。
+export interface FsArchiveEntry {
+  name: string
+  dir: boolean
+  size: number
+  mtime: string
+}
+
+export interface FsArchiveList {
+  entries: FsArchiveEntry[]
+  truncated: boolean
 }
 
 export interface Workspace {
@@ -245,7 +277,12 @@ export interface GitStatus {
   clean: boolean
   initial: boolean
   detached: boolean
+  // 有一次 revert 卡在冲突里(REVERT_HEAD 还在)。
+  reverting: boolean
 }
+
+// 撤回改动的范围,与后端 Service.Restore 的 mode 一一对应。
+export type RestoreMode = 'worktree' | 'all' | 'untracked'
 
 export interface GitCommit {
   hash: string

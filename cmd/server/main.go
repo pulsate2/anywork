@@ -98,7 +98,7 @@ func main() {
 	}
 	app.backup = backupsvc.NewHandlers(app.backupMgr)
 	// 交互式 git 认证:broker 把"需要凭据"推给浏览器弹窗,answer 回填后放行 push/pull。
-	gitService := gitsvc.New(cfg.Root, fsService.Resolve)
+	gitService := gitsvc.New(cfg.Root, cfg.ReadOnly, fsService.Resolve)
 	credBroker := gitsvc.NewCredentialBroker()
 	gitService.SetCredentialBroker(credBroker)
 	app.git = gitsvc.NewHandlers(gitService)
@@ -191,6 +191,7 @@ func (a *App) routes() http.Handler {
 		// 工作区 CRUD(里程碑 1 落库,供后续使用)。
 		pr.Get("/api/workspaces", a.handleListWorkspaces)
 		pr.Post("/api/workspaces", a.handleCreateWorkspace)
+		pr.Put("/api/workspaces/{id}", a.handleUpdateWorkspace)
 		pr.Delete("/api/workspaces/{id}", a.handleDeleteWorkspace)
 
 		// 文件操作(里程碑 3)。
@@ -203,12 +204,14 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/fs/replace", a.fs.Replace)
 		pr.Post("/api/fs/op", a.fs.Op)
 		pr.Get("/api/fs/archive", a.fs.CreateArchive)
+		pr.Get("/api/fs/archive/list", a.fs.ListArchive)
 		pr.Post("/api/fs/extract", a.fs.ExtractArchive)
 
 		// Git(里程碑 4)。
 		pr.Get("/api/git/repo", a.git.RepoInfo)
 		pr.Get("/api/git/status", a.git.Status)
 		pr.Get("/api/git/diff", a.git.Diff)
+		pr.Get("/api/git/show", a.git.Show)
 		pr.Get("/api/git/log", a.git.Log)
 		pr.Get("/api/git/branches", a.git.Branches)
 		pr.Get("/api/git/remotes", a.git.Remotes)
@@ -219,6 +222,8 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/git/branch", a.git.Branch)
 		pr.Post("/api/git/stash", a.git.Stash)
 		pr.Post("/api/git/worktree", a.git.Worktree)
+		pr.Post("/api/git/restore", a.git.Restore)
+		pr.Post("/api/git/revert", a.git.Revert)
 
 		// 交互式 git 认证(推送/拉取需要账号密码时弹窗输入)。
 		pr.Get("/api/git/auth", a.authWS.Begin)
@@ -374,6 +379,33 @@ func (a *App) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "id": id})
+}
+
+// handleUpdateWorkspace 只改名字。path 是唯一键,也是文件/终端/Git 的落脚点,
+// 换路径等于换一个工作区,重新建一个更清楚。
+func (a *App) handleUpdateWorkspace(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	res, err := a.db.Exec(`UPDATE workspaces SET name = ? WHERE id = ?`, name, chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (a *App) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {

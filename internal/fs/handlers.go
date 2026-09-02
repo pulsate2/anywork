@@ -80,6 +80,21 @@ func (h *Handlers) Upload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// inlineTypes 是允许以 inline 直出的类型白名单(前端图片预览用)。
+// 白名单之外一律回落 attachment:任意文件都能在同源下直接渲染的话,
+// 上传一个 html 就等于同源 XSS。
+var inlineTypes = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".bmp":  "image/bmp",
+	".ico":  "image/x-icon",
+	".avif": "image/avif",
+	".svg":  "image/svg+xml",
+}
+
 func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
 	f, _, _, err := h.svc.ReadInfo(p)
@@ -89,9 +104,21 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	name := filepath.Base(p)
-	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(name))
-	if ct := mime.TypeByExtension(filepath.Ext(name)); ct != "" {
+	ct := inlineTypes[strings.ToLower(filepath.Ext(name))]
+	if r.URL.Query().Get("inline") == "1" && ct != "" {
+		w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(name))
 		w.Header().Set("Content-Type", ct)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// <img> 里的 SVG 本来就不执行脚本,但地址栏直接打开这个 URL 会;sandbox 掉。
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	} else {
+		w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(name))
+		if ct == "" {
+			ct = mime.TypeByExtension(filepath.Ext(name))
+		}
+		if ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
 	}
 	fi, _ := f.Stat()
 	http.ServeContent(w, r, name, fi.ModTime(), f)
@@ -112,6 +139,8 @@ func (h *Handlers) Op(w http.ResponseWriter, r *http.Request) {
 	switch body.Op {
 	case "mkdir":
 		err = h.svc.MkDir(body.Path)
+	case "touch":
+		err = h.svc.Touch(body.Path)
 	case "rename":
 		err = h.svc.Rename(body.From, body.To)
 	case "copy":
@@ -182,6 +211,18 @@ func (h *Handlers) CreateArchive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(name))
 	w.Header().Set("Content-Type", "application/zip")
 	_ = h.svc.CreateZip(p, w)
+}
+
+// ListArchive 只列压缩包内的条目(预览用),不落盘。
+func (h *Handlers) ListArchive(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	entries, truncated, err := h.svc.ListArchive(q.Get("path"), limit)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "truncated": truncated})
 }
 
 func (h *Handlers) ExtractArchive(w http.ResponseWriter, r *http.Request) {

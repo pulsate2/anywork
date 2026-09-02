@@ -274,7 +274,8 @@ watch(fitSignal, () => applyTheme())
     </div>
 
     <!-- 移动键盘层 -->
-    <TerminalKeyboard ref="kbd" :on-key="(k: string) => client.input(k)" />
+    <TerminalKeyboard ref="kbd" :on-key="(k: string) => client.input(k)"
+      :on-blur-input="() => term?.blur()" />
 
     <!-- 会话列表抽屉 -->
     <n-modal v-model:show="showSessionList" preset="card" title="终端会话" style="width: 92%; max-width: 420px">

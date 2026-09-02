@@ -1,17 +1,18 @@
 <script setup lang="ts">
 // 文件浏览:列表/读写/上传下载/搜索/压缩解压。桌面+移动自适应。
-import { ref, onMounted, computed, watch } from "vue"
+import { ref, onMounted, computed, watch, nextTick } from "vue"
 import { useRouter } from "vue-router"
 import {
 	NButton, NIcon, NEmpty, NSpin,
 	NInput, NModal, useMessage, useDialog,
 	NTag, NList, NListItem, NSelect, NRadioGroup, NRadioButton,
 } from "naive-ui"
-import { FolderOpenOutline, DocumentOutline, ArrowBackOutline,
+import { ArrowBackOutline,
 	CreateOutline, TrashOutline, SearchOutline, DownloadOutline,
 	CloudUploadOutline, AddOutline, ArrowUpOutline, ArrowDownOutline,
 	SwapHorizontalOutline, CloseOutline } from "@vicons/ionicons5"
 import { api, type FsEntry, type FsSearchResult } from "@/api/client"
+import { fileIcon, isArchivePath, isImagePath } from "@/utils/fileIcon"
 import { useWorkspaceStore } from "@/stores/workspace"
 
 const message = useMessage()
@@ -25,10 +26,26 @@ const loading = ref(false)
 // 后端返回的都是 root 内的绝对路径(正斜杠)。root 去掉尾斜杠便于前缀比较。
 const rootPath = computed(() => trimSlash(store.root))
 const atRoot = computed(() => trimSlash(cwd.value) === rootPath.value)
-// 面包屑只显示 root 之下的部分。
-const relPath = computed(() => {
+// 面包屑分段:每段带上自己对应的绝对路径,点击即可跳到该层。
+const crumbs = computed(() => {
+	const base = rootPath.value
 	const c = trimSlash(cwd.value)
-	return c.startsWith(rootPath.value) ? c.slice(rootPath.value.length) || "/" : c
+	const rel = c.startsWith(base) ? c.slice(base.length) : c
+	const out = [{ name: "/", path: base || "/" }]
+	let acc = base
+	for (const part of rel.split("/").filter(Boolean)) {
+		acc = (acc === "/" ? "" : acc) + "/" + part
+		out.push({ name: part, path: acc })
+	}
+	return out
+})
+
+const crumbEl = ref<HTMLElement | null>(null)
+// 长路径横向滚动:目录变化后滚到末尾,保证当前目录始终可见。
+watch(crumbs, () => {
+	nextTick(() => {
+		if (crumbEl.value) crumbEl.value.scrollLeft = crumbEl.value.scrollWidth
+	})
 })
 
 function trimSlash(p: string) {
@@ -43,11 +60,33 @@ function joinPath(dir: string, name: string) {
 	return trimSlash(dir) + "/" + name
 }
 
+// 恢复上次访问的目录:必须仍在当前工作区边界之内,否则丢弃记录。
+function initialDir(): string {
+	const last = store.lastDir()
+	if (!last) return store.currentPath
+	const base = trimSlash(store.currentPath)
+	const t = trimSlash(last)
+	if (t === base || t.startsWith(base === "/" ? "/" : base + "/")) return last
+	store.clearLastDir()
+	return store.currentPath
+}
+
 async function load(dir: string) {
+	const fallback = store.currentPath
+	let target = dir || fallback
 	loading.value = true
-	cwd.value = dir || store.currentPath
 	try {
-		entries.value = await api.fsList(cwd.value)
+		try {
+			entries.value = await api.fsList(target)
+		} catch (e) {
+			// 记住的目录可能已经被删掉了:静默回落到工作区根,别把用户留在错误页上。
+			if (target === fallback) throw e
+			store.clearLastDir()
+			target = fallback
+			entries.value = await api.fsList(target)
+		}
+		cwd.value = target
+		store.setLastDir(target)
 	} catch (e: any) {
 		message.error(e?.message || "加载失败")
 	} finally {
@@ -61,8 +100,10 @@ function openEntry(e: FsEntry) {
 }
 
 // 文件点进单独预览/编辑页(二级页面,不再用模态编辑器)。
+// 大小提示只对文本有意义:图片和压缩包在二级页本来就只能预览,提了反而像是本该能编辑。
 function openFilePage(e: { path: string; name: string; size: number }) {
-	if (e.size > 512 * 1024) {
+	const editable = !isImagePath(e.path) && !isArchivePath(e.path)
+	if (editable && e.size > 512 * 1024) {
 		message.warning("文件过大,仅支持预览,不可编辑(512KB 内)")
 	}
 	router.push({ path: "/files/file", query: { path: e.path, name: e.name } })
@@ -87,16 +128,49 @@ function remove(e: FsEntry) {
 		onPositiveClick: () => doOp({ op: "delete", path: e.path }),
 	})
 }
-function mkdirPrompt() {
-	const name = window.prompt("新目录名:")
-	if (name) doOp({ op: "mkdir", path: joinPath(cwd.value, name) })
+// ---- 新建 / 重命名 ----
+// 用自定义弹窗而不是 window.prompt:系统弹窗在移动端会打断页面焦点、样式也不可控。
+// 新建与重命名共用一个弹窗,差别只有标题、是否显示类型选择、以及提交时走哪个 op。
+const nameShowing = ref(false)
+const nameMode = ref<"new" | "rename">("new")
+const nameKind = ref<"dir" | "file">("dir")
+const nameValue = ref("")
+const nameTarget = ref<FsEntry | null>(null)
+const nameInput = ref<InstanceType<typeof NInput> | null>(null)
+// 名称里出现分隔符会绕过 cwd 拼接跑到别的目录去,直接拦掉(后端 Resolve 兜底,这里只是即时反馈)。
+const nameInvalid = computed(() => /[\\/]/.test(nameValue.value))
+
+function openNew() {
+	nameMode.value = "new"
+	nameKind.value = "dir"
+	nameValue.value = ""
+	nameTarget.value = null
+	nameShowing.value = true
 }
 
-function renamePrompt(e: FsEntry) {
-	const name = window.prompt("新名称:", e.name)
-	if (name && name !== e.name) {
+function openRename(e: FsEntry) {
+	nameMode.value = "rename"
+	nameValue.value = e.name
+	nameTarget.value = e
+	nameShowing.value = true
+}
+
+// 弹窗有进场动画,挂载完成前 focus 会落空,所以挂到 n-modal 的 after-enter 上。
+function focusName() {
+	nameInput.value?.focus()
+}
+
+function submitName() {
+	const name = nameValue.value.trim()
+	if (!name || nameInvalid.value) return
+	nameShowing.value = false
+	if (nameMode.value === "rename") {
+		const e = nameTarget.value
+		if (!e || name === e.name) return
 		doOp({ op: "rename", from: e.path, to: joinPath(parentOf(e.path), name) })
+		return
 	}
+	doOp({ op: nameKind.value === "dir" ? "mkdir" : "touch", path: joinPath(cwd.value, name) })
 }
 function download(e: FsEntry) {
 	window.open(api.fsDownloadUrl(e.path), "_blank")
@@ -217,14 +291,16 @@ function segments(r: FsSearchResult) {
 	return out
 }
 
-// 点命中项:目录进目录,文件跳单独文件页。
-function openHit(g: { path: string; rel: string; dir: boolean; size: number }) {
+// 点命中项:目录进目录,文件跳单独文件页(带上行号让它定位到命中行)。
+function openHit(g: { path: string; rel: string; dir: boolean; size: number }, line?: number) {
 	if (g.dir) {
 		load(g.path)
 		clearSearch()
 		return
 	}
-	router.push({ path: "/files/file", query: { path: g.path, name: g.rel } })
+	const query: Record<string, string> = { path: g.path, name: g.rel }
+	if (line) query.line = String(line)
+	router.push({ path: "/files/file", query })
 }
 
 function doReplace() {
@@ -255,7 +331,7 @@ function doReplace() {
 }
 onMounted(async () => {
 	await store.ensure()
-	load(store.currentPath)
+	load(initialDir())
 })
 // 在别处切换工作区后回到本页,目录跟着走。
 watch(() => store.currentPath, (p) => load(p))
@@ -282,7 +358,7 @@ function up() {
 				<n-button quaternary size="small" :disabled="atRoot" aria-label="上一级" @click="up">
 					<template #icon><n-icon :component="ArrowBackOutline" /></template>
 				</n-button>
-				<n-button quaternary size="small" aria-label="新建目录" @click="mkdirPrompt">
+				<n-button quaternary size="small" aria-label="新建" @click="openNew">
 					<template #icon><n-icon :component="AddOutline" /></template>
 				</n-button>
 				<n-button quaternary size="small" aria-label="下载当前目录" @click="downloadZip">
@@ -293,7 +369,13 @@ function up() {
 				</n-button>
 			</div>
 		</div>
-		<div class="fs-crumb" :title="cwd">{{ relPath }}</div>
+		<div ref="crumbEl" class="fs-crumb" :title="cwd">
+			<template v-for="(c, i) in crumbs" :key="c.path">
+				<span v-if="i > 1" class="crumb-sep">/</span>
+				<button v-if="i < crumbs.length - 1" class="crumb-seg" @click="load(c.path)">{{ c.name }}</button>
+				<span v-else class="crumb-seg current">{{ c.name }}</span>
+			</template>
+		</div>
 
 		<div class="fs-search">
 			<n-input v-model:value="searchQ" placeholder="搜索该目录" clearable
@@ -334,11 +416,11 @@ function up() {
 			<n-list v-else clickable>
 				<n-list-item v-for="g in searchGroups" :key="g.path" class="search-item">
 					<div class="search-path" @click="openHit(g)">
-						<n-icon :component="g.dir ? FolderOpenOutline : DocumentOutline" />
+						<n-icon :component="fileIcon(g.path, g.dir).icon" :color="fileIcon(g.path, g.dir).color" />
 						<span class="search-rel">{{ g.rel }}</span>
 						<span v-if="g.hits.length" class="search-count">{{ g.hits.length }}</span>
 					</div>
-					<div v-for="h in g.hits" :key="h.line" class="search-line" @click="openHit(g)">
+					<div v-for="h in g.hits" :key="h.line" class="search-line" @click="openHit(g, h.line)">
 						<span class="search-lno">{{ h.line }}</span>
 						<span class="search-text"><span v-for="(s, i) in segments(h)" :key="i"
 							:class="{ hit: s.hit }">{{ s.text }}</span></span>
@@ -360,7 +442,7 @@ function up() {
 			<div v-if="sortedEntries.length" class="fs-list">
 				<div v-for="e in sortedEntries" :key="e.path" class="fs-item" role="button" tabindex="0"
 					@click="openEntry(e)" @keydown.enter="openEntry(e)">
-					<n-icon class="fs-ico" :component="e.dir ? FolderOpenOutline : DocumentOutline" />
+					<n-icon class="fs-ico" :component="fileIcon(e.path, e.dir).icon" :color="fileIcon(e.path, e.dir).color" />
 					<div class="fs-name">
 						<span class="fs-name-text">{{ e.name }}</span>
 						<n-tag v-if="e.symlink" size="small" type="warning" :bordered="false">link</n-tag>
@@ -369,7 +451,7 @@ function up() {
 					<div class="fs-actions">
 						<n-button v-if="!e.dir" class="fs-btn" size="tiny" quaternary aria-label="下载" @click.stop="download(e)">
 							<n-icon :component="DownloadOutline" /></n-button>
-						<n-button class="fs-btn" size="tiny" quaternary aria-label="重命名" @click.stop="renamePrompt(e)">
+						<n-button class="fs-btn" size="tiny" quaternary aria-label="重命名" @click.stop="openRename(e)">
 							<n-icon :component="CreateOutline" /></n-button>
 						<n-button class="fs-btn" size="tiny" quaternary type="error" aria-label="删除" @click.stop="remove(e)">
 							<n-icon :component="TrashOutline" /></n-button>
@@ -384,6 +466,24 @@ function up() {
 			<div v-if="uploadFiles.length" class="upload-list">待上传: {{ uploadFiles.map(f => f.name).join(", ") }}</div>
 			<template #footer><n-button @click="uploadShowing = false">关闭</n-button></template>
 		</n-modal>
+		<!-- 新建 / 重命名 -->
+		<n-modal v-model:show="nameShowing" preset="card" class="name-modal"
+			:title="nameMode === 'new' ? '新建' : '重命名'" @after-enter="focusName">
+			<n-radio-group v-if="nameMode === 'new'" v-model:value="nameKind" size="small" class="name-kind">
+				<n-radio-button value="dir">文件夹</n-radio-button>
+				<n-radio-button value="file">文件</n-radio-button>
+			</n-radio-group>
+			<n-input ref="nameInput" v-model:value="nameValue" :status="nameInvalid ? 'error' : undefined"
+				:placeholder="nameMode === 'rename' ? '新名称' : nameKind === 'dir' ? '文件夹名' : '文件名,如 note.md'"
+				@keydown.enter="submitName" />
+			<div v-if="nameInvalid" class="name-err">名称不能包含 / 或 \</div>
+			<template #footer>
+				<div class="modal-footer">
+					<n-button @click="nameShowing = false">取消</n-button>
+					<n-button type="primary" :disabled="!nameValue.trim() || nameInvalid" @click="submitName">确定</n-button>
+				</div>
+			</template>
+		</n-modal>
 	</div>
 </template>
 
@@ -393,10 +493,24 @@ function up() {
 .fs-ws { color: var(--lr-fg-muted); font-size: 12px; margin-top: 2px; }
 .fs-toolbar { display: flex; gap: 2px; }
 .fs-crumb {
-	color: var(--lr-fg-muted); font-size: 12px; font-family: ui-monospace, monospace;
-	margin: 0 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-	direction: rtl; text-align: left;
+	display: flex; align-items: center; gap: 2px;
+	margin: 0 0 8px; padding-bottom: 2px;
+	font-size: 12px; font-family: ui-monospace, monospace;
+	overflow-x: auto; white-space: nowrap;
+	scrollbar-width: none;
 }
+.fs-crumb::-webkit-scrollbar { display: none; }
+/* 当前段是 <span>、可点的段是 <button>:button 的 UA 样式会把文字在自己的盒子里居中,
+   span 撑到 min-height 后文字却贴在顶上,两者就一上一下。统一按 flex 居中。 */
+.crumb-seg {
+	flex: none; display: flex; align-items: center;
+	min-height: 32px; padding: 0 6px;
+	border: 0; background: none; border-radius: 6px;
+	font: inherit; color: var(--lr-accent); cursor: pointer;
+}
+.crumb-seg.current { color: var(--lr-fg-muted); cursor: default; }
+.crumb-seg:active:not(.current) { background: rgba(127, 127, 127, 0.18); }
+.crumb-sep { flex: none; color: var(--lr-fg-muted); }
 .fs-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .fs-item {
 	display: flex; align-items: center; gap: 10px;
@@ -406,7 +520,7 @@ function up() {
 	border-radius: var(--lr-radius);
 	cursor: pointer;
 }
-.fs-ico { flex: none; font-size: 18px; color: var(--lr-accent); }
+.fs-ico { flex: none; font-size: 18px; }
 .fs-name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; font-weight: 500; }
 .fs-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fs-size { flex: none; color: var(--lr-fg-muted); font-size: 12px; }
@@ -454,6 +568,9 @@ function up() {
 .fs-sort { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
 .fs-count { color: var(--lr-fg-muted); font-size: 12px; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
+.name-modal { width: min(420px, calc(100vw - 32px)); }
+.name-kind { margin-bottom: 10px; }
+.name-err { margin-top: 6px; color: var(--lr-danger); font-size: 12px; }
 .file-input { font-size: 13px; }
 .upload-list { margin-top: 8px; color: var(--lr-fg-muted); font-size: 12px; }
 </style>

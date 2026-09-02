@@ -51,6 +51,19 @@ func (h *Handlers) Diff(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(txt))
 }
 
+// Show 返回某个提交里某个文件的全文(纯文本,和 fs/read 一样直出正文)。
+func (h *Handlers) Show(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	txt, err := h.svc.Show(q.Get("path"), q.Get("ref"), q.Get("file"))
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(txt))
+}
+
 func (h *Handlers) Log(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	n, _ := strconv.Atoi(q.Get("n"))
@@ -193,6 +206,47 @@ func (h *Handlers) Worktree(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 	out, err := h.svc.Worktree(body.Path, body.Op, body.Path2, body.Ref)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"out": out})
+}
+
+// Restore 撤销改动。mode 见 Service.Restore(worktree|all|untracked)。
+func (h *Handlers) Restore(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path  string   `json:"path"`
+		Files []string `json:"files"`
+		Mode  string   `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	out, err := h.svc.Restore(body.Path, body.Files, body.Mode)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"out": out})
+}
+
+// Revert 回滚提交。op: revert|abort。
+func (h *Handlers) Revert(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+		Op   string `json:"op"`
+		Hash string `json:"hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if body.Op == "" {
+		body.Op = "revert"
+	}
+	out, err := h.svc.Revert(body.Path, body.Op, body.Hash)
 	if err != nil {
 		h.httpErr(w, err)
 		return

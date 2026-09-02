@@ -10,15 +10,16 @@ import {
 import {
   GitCompareOutline, GitCommitOutline, GitBranchOutline, CloudUploadOutline, CloudDownloadOutline,
   TrashOutline, CheckmarkOutline, ChevronDownOutline, ChevronForwardOutline,
+  ArrowUndoOutline,
 } from '@vicons/ionicons5'
 import {
   api, type GitStatus, type GitEntry, type GitCommit, type GitRepo,
-  type GitBranch, type GitBranchList, type GitRemote,
+  type GitBranch, type GitBranchList, type GitRemote, type RestoreMode,
 } from '@/api/client'
 import { GitAuthClient } from '@/api/gitAuth'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { parseDiff, type DiffBlock } from '@/utils/diff'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
 // 每页提交数;翻页靠 skip 累加已加载条数。
 const LOG_PAGE = 30
@@ -26,6 +27,7 @@ const LOG_PAGE = 30
 const message = useMessage()
 const dialog = useDialog()
 const router = useRouter()
+const route = useRoute()
 const store = useWorkspaceStore()
 const repo = ref<GitRepo | null>(null)
 const status = ref<GitStatus | null>(null)
@@ -41,6 +43,8 @@ const diffScope = ref('worktree')
 const diffFiles = ref<DiffBlock[]>([])
 // 当前在 diff 弹窗里展示的提交(非空 = 在查某个提交的改动,scope 走 commit)。
 const diffCommit = ref<GitCommit | null>(null)
+// 改动 / 提交历史。受控是为了从二级页返回时能连同弹窗一起切回原来那一栏。
+const activeTab = ref('changes')
 
 // 未跟踪文件没有 diff(git diff 不看它们),点开直接进二级页并默认切到"文件"视图。
 function openUntracked(e: GitEntry) {
@@ -145,14 +149,125 @@ async function stageFiles(entries: GitEntry[], reset = false) {
     message.error(e?.message || '操作失败')
   }
 }
+
+// ---- 撤回改动(restore)----
+// 丢弃的内容 git 里没有副本,所以按两道确认走:第一道讲清影响范围,第二道再点一次。
+const RESTORE_TEXT: Record<RestoreMode, { verb: string; scope: string; done: string }> = {
+  worktree: { verb: '撤回', scope: '将丢弃工作区里的修改,回到已暂存的内容。', done: '已撤回' },
+  all: { verb: '撤回', scope: '将同时丢弃暂存区与工作区的修改,回到 HEAD 的内容。', done: '已撤回' },
+  untracked: { verb: '删除', scope: '从未提交过的内容,撤回等于直接删除,git 里没有副本可还原。', done: '已删除' },
+}
+
+// 重命名要连原路径一起还原,否则只会删掉新文件而不把旧文件找回来。
+function restorePaths(e: GitEntry): string[] {
+  return e.orig ? [e.orig, e.path] : [e.path]
+}
+
+function restoreEntry(e: GitEntry, mode: RestoreMode) {
+  restoreFiles([e], mode, e.path)
+}
+
+// 整组撤回:和单文件走同一条两道确认,只是描述换成"这一组多少个文件"。
+function restoreGroup(entries: GitEntry[], mode: RestoreMode, label: string) {
+  if (!entries.length) return
+  restoreFiles(entries, mode, `${label}的 ${entries.length} 个文件`)
+}
+
+function restoreFiles(entries: GitEntry[], mode: RestoreMode, label: string) {
+  const t = RESTORE_TEXT[mode]
+  dialog.warning({
+    title: `${t.verb}改动`,
+    content: `${label} — ${t.scope}`,
+    positiveText: '继续',
+    negativeText: '取消',
+    onPositiveClick: () => { confirmRestore(entries, mode, label) },
+  })
+}
+
+// 第二道确认:用 error 型弹窗把"不可恢复"再强调一次。
+function confirmRestore(entries: GitEntry[], mode: RestoreMode, label: string) {
+  const t = RESTORE_TEXT[mode]
+  dialog.error({
+    title: '再次确认',
+    content: `确定${t.verb} ${label}?此操作不可撤销。`,
+    positiveText: `确定${t.verb}`,
+    negativeText: '返回',
+    onPositiveClick: async () => {
+      try {
+        await api.gitRestore(repoPath.value, entries.flatMap(restorePaths), mode)
+        message.success(t.done)
+        await reload()
+      } catch (err: any) {
+        message.error(err?.message || `${t.verb}失败`)
+      }
+    },
+  })
+}
+
+// ---- 回滚提交(revert)----
+// revert 生成一个反向提交,不改写历史;冲突时留在 REVERT_HEAD 状态,由"放弃回滚"收尾。
+function revertCommit(c: GitCommit) {
+  dialog.warning({
+    title: '回滚提交',
+    content: `将生成一个反向提交来抵消 ${c.short}(${c.subject}),原提交仍留在历史里。`,
+    positiveText: '回滚',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        const res = await api.gitRevert(repoPath.value, 'revert', c.hash)
+        message.success('已回滚')
+        if (res.out.trim()) dialog.info({ title: '回滚结果', content: res.out })
+        await reload()
+      } catch (e: any) {
+        message.error(e?.message || '回滚失败,可能有冲突需要先解决')
+        await reload()
+      }
+    },
+  })
+}
+
+function abortRevert() {
+  dialog.warning({
+    title: '放弃回滚',
+    content: '回到 revert 之前的状态,已解决的冲突改动会一起丢弃。',
+    positiveText: '放弃回滚',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await api.gitRevert(repoPath.value, 'abort')
+        message.success('已放弃回滚')
+        await reload()
+      } catch (e: any) {
+        message.error(e?.message || '操作失败')
+      }
+    },
+  })
+}
 const diffTitle = computed(() => {
   if (diffCommit.value) return `${diffCommit.value.short} · ${diffCommit.value.subject}`
   return diffScope.value === 'staged' ? '已暂存改动' : '工作区改动'
 })
 
 // 跳二级页看某个文件的差异/全文。scope: worktree|staged|commit|untracked。
-function goFile(scope: string, file: string, ref?: string) {
+// 路由没有 keep-alive,返回时本页会整体重建,弹窗状态会丢。所以离开前把"当前开着哪个列表"
+// 写回 /git 这条历史记录的 query,返回时按它把列表重新打开;不是从列表点进来的就把旧记录清掉,
+// 否则返回时会弹出一个跟这次操作无关的列表。
+async function goFile(scope: string, file: string, ref?: string) {
+  const back: Record<string, string> = {}
+  if (showDiff.value) {
+    back.diff = diffScope.value
+    if (diffCommit.value) {
+      back.ref = diffCommit.value.hash
+      back.sub = diffCommit.value.subject
+    }
+    // 翻过页的话把条数也记下来:返回时只补第一页,列表会比离开时短,
+    // 滚动位置就没地方还原了。
+    if (commits.value.length > LOG_PAGE) back.n = String(commits.value.length)
+  }
   showDiff.value = false
+  if (Object.keys(back).length || route.query.diff) {
+    await router.replace({ path: '/git', query: back })
+  }
   router.push({
     path: '/git/file',
     query: {
@@ -169,6 +284,7 @@ function goFile(scope: string, file: string, ref?: string) {
 async function viewDiff(scope: string) {
   diffScope.value = scope
   diffCommit.value = null
+  activeTab.value = 'changes'
   try {
     diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, scope))
     showDiff.value = true
@@ -181,6 +297,7 @@ async function viewDiff(scope: string) {
 async function viewCommit(c: GitCommit) {
   diffCommit.value = c
   diffScope.value = 'commit'
+  activeTab.value = 'log'
   try {
     diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, 'commit', undefined, c.hash))
     showDiff.value = true
@@ -315,10 +432,39 @@ function deleteBranch(b: GitBranch) {
   })
 }
 
+// 从二级页返回:按 query 里记下的 scope 重新打开一级列表。
+// 提交可能来自"加载更多"的后续页,重建后不一定还在 commits 里,所以拿不到就用 query 拼一个
+// 够弹窗标题用的最小对象。
+// 用完立刻把 query 抹掉:标记只对"这一次返回"有效,留着的话刷新页面、PWA 重新打开、
+// 或者以后再从历史记录回到这条 /git,都会莫名其妙又弹一次已经关掉的列表。
+async function restoreList() {
+  const scope = route.query.diff
+  const hash = typeof route.query.ref === 'string' ? route.query.ref : ''
+  const sub = typeof route.query.sub === 'string' ? route.query.sub : ''
+  const n = Number(route.query.n)
+  if (typeof scope !== 'string' || !scope) return
+  await router.replace({ path: '/git' })
+  // 先把离开时已经翻出来的提交补齐,不然列表比原来短,滚动位置无处可还。
+  if (n > commits.value.length) {
+    try {
+      commits.value = await api.gitLog(repoPath.value, n)
+      logMore.value = commits.value.length >= n
+    } catch { /* 补不上就按第一页显示 */ }
+  }
+  if (scope !== 'commit') {
+    await viewDiff(scope)
+    return
+  }
+  if (!hash) return
+  const found = commits.value.find(c => c.hash === hash)
+  await viewCommit(found || { hash, short: hash.slice(0, 7), parents: [], refs: [], subject: sub, date: '' })
+}
+
 onMounted(async () => {
   await store.ensure()
   repoPath.value = store.currentPath
-  load()
+  await load()
+  await restoreList()
   // git 认证长连接:远端要求账号密码时在此收到 ask 事件并弹窗。
   askClient.connect()
 })
@@ -370,17 +516,30 @@ watch(() => store.currentPath, (p) => {
             {{ status?.upstream ? `↑${status.ahead} ↓${status.behind} · ${status.upstream}` : '无上游' }}
           </span>
           <div class="spacer"></div>
+          <!-- revert 冲突后 REVERT_HEAD 还在,给个出口收尾,否则只能回终端处理。 -->
+          <n-button v-if="status?.reverting" size="tiny" quaternary type="error" @click="abortRevert">
+            放弃回滚
+          </n-button>
           <span v-if="status?.clean" class="git-sub">干净</span>
         </div>
-        <n-tabs type="line" size="small" animated>
+        <n-tabs v-model:value="activeTab" type="line" size="small" animated>
           <n-tab-pane name="changes" tab="改动">
             <n-empty v-if="status?.clean" description="没有改动" style="padding: 24px" />
             <template v-else>
               <div v-if="status && status.conflicted.length" class="git-group">
-                <div class="git-group-head"><span>冲突 ({{ status.conflicted.length }})</span></div>
+                <div class="git-group-head">
+                  <span>冲突 ({{ status.conflicted.length }})</span>
+                  <div class="spacer"></div>
+                  <n-button size="tiny" quaternary type="error"
+                    @click="restoreGroup(status.conflicted, 'all', '冲突')">全部撤回</n-button>
+                </div>
                 <div v-for="e in status.conflicted" :key="e.path" class="git-file">
                   <span class="git-xy danger">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path">{{ e.path }}</span>
+                  <n-button class="git-btn" size="tiny" quaternary title="撤回改动(回到 HEAD)"
+                    aria-label="撤回改动" @click="restoreEntry(e, 'all')">
+                    <n-icon :component="ArrowUndoOutline" />
+                  </n-button>
                 </div>
               </div>
               <div v-if="status && status.staged.length" class="git-group">
@@ -389,10 +548,16 @@ watch(() => store.currentPath, (p) => {
                   <div class="spacer"></div>
                   <n-button size="tiny" quaternary @click="viewDiff('staged')">查看</n-button>
                   <n-button size="tiny" quaternary @click="stageFiles(status.staged, true)">全部取消</n-button>
+                  <n-button size="tiny" quaternary type="error"
+                    @click="restoreGroup(status.staged, 'all', '已暂存')">全部撤回</n-button>
                 </div>
                 <div v-for="e in status.staged" :key="e.path" class="git-file">
                   <span class="git-xy add">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path" @click="goFile('staged', e.path)">{{ e.path }}</span>
+                  <n-button class="git-btn" size="tiny" quaternary title="撤回改动(回到 HEAD)"
+                    aria-label="撤回改动" @click="restoreEntry(e, 'all')">
+                    <n-icon :component="ArrowUndoOutline" />
+                  </n-button>
                   <n-button class="git-btn" size="tiny" quaternary title="取消暂存" aria-label="取消暂存"
                     @click="stageFiles([e], true)">
                     <n-icon :component="TrashOutline" />
@@ -405,10 +570,16 @@ watch(() => store.currentPath, (p) => {
                   <div class="spacer"></div>
                   <n-button size="tiny" quaternary @click="viewDiff('worktree')">查看</n-button>
                   <n-button size="tiny" quaternary @click="stageFiles(status.unstaged)">全部暂存</n-button>
+                  <n-button size="tiny" quaternary type="error"
+                    @click="restoreGroup(status.unstaged, 'worktree', '未暂存')">全部撤回</n-button>
                 </div>
                 <div v-for="e in status.unstaged" :key="e.path" class="git-file">
                   <span class="git-xy">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path" @click="goFile('worktree', e.path)">{{ e.path }}</span>
+                  <n-button class="git-btn" size="tiny" quaternary title="撤回改动" aria-label="撤回改动"
+                    @click="restoreEntry(e, 'worktree')">
+                    <n-icon :component="ArrowUndoOutline" />
+                  </n-button>
                   <n-button class="git-btn" size="tiny" quaternary title="暂存" aria-label="暂存"
                     @click="stageFiles([e])">
                     <n-icon :component="CheckmarkOutline" />
@@ -420,10 +591,16 @@ watch(() => store.currentPath, (p) => {
                   <span>未跟踪 ({{ status.untracked.length }})</span>
                   <div class="spacer"></div>
                   <n-button size="tiny" quaternary @click="stageFiles(status.untracked)">全部暂存</n-button>
+                  <n-button size="tiny" quaternary type="error"
+                    @click="restoreGroup(status.untracked, 'untracked', '未跟踪')">全部删除</n-button>
                 </div>
                 <div v-for="e in status.untracked" :key="e.path" class="git-file">
                   <span class="git-xy">??</span>
                   <span class="git-path" :title="e.path" @click="openUntracked(e)">{{ e.path }}</span>
+                  <n-button class="git-btn" size="tiny" quaternary title="删除文件" aria-label="删除文件"
+                    @click="restoreEntry(e, 'untracked')">
+                    <n-icon :component="ArrowUndoOutline" />
+                  </n-button>
                   <n-button class="git-btn" size="tiny" quaternary title="暂存" aria-label="暂存"
                     @click="stageFiles([e])">
                     <n-icon :component="CheckmarkOutline" />
@@ -436,11 +613,17 @@ watch(() => store.currentPath, (p) => {
           <n-tab-pane name="log" tab="提交历史">
             <n-list v-if="commits.length" hoverable>
               <n-list-item v-for="c in commits" :key="c.hash">
-                <div class="log-row" role="button" tabindex="0" @click="viewCommit(c)"
-                @keydown.enter="viewCommit(c)" title="查看该提交的改动">
-              <span class="log-hash">{{ c.short }}</span>
-              <span class="log-subject" :title="c.subject">{{ c.subject }}</span>
-            </div>
+                <div class="log-line">
+                  <div class="log-row" role="button" tabindex="0" title="查看该提交的改动"
+                    @click="viewCommit(c)" @keydown.enter="viewCommit(c)">
+                    <span class="log-hash">{{ c.short }}</span>
+                    <span class="log-subject" :title="c.subject">{{ c.subject }}</span>
+                  </div>
+                  <n-button class="git-btn" size="tiny" quaternary title="回滚此提交" aria-label="回滚此提交"
+                    @click="revertCommit(c)">
+                    <n-icon :component="ArrowUndoOutline" />
+                  </n-button>
+                </div>
                 <div class="log-meta">
                   <span>{{ c.date }}</span>
                   <n-tag v-for="rf in c.refs" :key="rf" size="tiny" :bordered="false">{{ rf }}</n-tag>
@@ -616,7 +799,8 @@ watch(() => store.currentPath, (p) => {
 /* 提交弹窗的"暂存所有"开关行:给 checkbox 一点呼吸,不与提示文案挤在一起 */
 .commit-stage { margin-top: 10px; }
 .git-hint { color: var(--lr-fg-muted); font-size: 12px; margin-top: 8px; }
-.log-row { display: flex; align-items: baseline; gap: 8px; }
+.log-line { display: flex; align-items: center; gap: 8px; }
+.log-row { display: flex; align-items: baseline; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
 .log-hash { flex: none; font-family: ui-monospace, monospace; font-size: 12px; color: var(--lr-accent); }
 .log-subject { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .log-meta {

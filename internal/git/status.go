@@ -25,11 +25,20 @@ type Status struct {
 	Clean      bool          `json:"clean"`
 	Initial    bool          `json:"initial"`
 	Detached   bool          `json:"detached"`
+	// Reverting 表示有一次 revert 卡在冲突里(REVERT_HEAD 还在),前端据此给出"放弃回滚"。
+	Reverting bool `json:"reverting"`
 }
 
 // Status 返回当前仓库的状态(porcelain=v1 -b)。
 func (s *Service) Status(p string) (Status, error) {
-	out, err := s.Repo(p, "status", "--porcelain=v1", "-b")
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return Status{}, err
+	}
+	if !info.Repo {
+		return Status{}, ErrNotRepo
+	}
+	out, err := s.run(info.Root, nil, "status", "--porcelain=v1", "-b")
 	if err != nil {
 		return Status{}, err
 	}
@@ -50,6 +59,10 @@ func (s *Service) Status(p string) (Status, error) {
 	}
 	if len(st.Staged) == 0 && len(st.Unstaged) == 0 && len(st.Untracked) == 0 && len(st.Conflicted) == 0 {
 		st.Clean = true
+	}
+	// revert 成功会自动提交并清掉 REVERT_HEAD;还在说明中途冲突了。
+	if _, err := s.run(info.Root, nil, "rev-parse", "--verify", "-q", "REVERT_HEAD"); err == nil {
+		st.Reverting = true
 	}
 	return st, nil
 }
@@ -96,10 +109,10 @@ func parsePorcelain(l string) StatusEntry {
 	ent.X = l[0:1]
 	ent.Y = l[1:2]
 	rest := strings.TrimSpace(l[2:])
-	// 重命名/复制:`orig -> new`(porcelain v1 中 3 制: dest 顺带,新路径在前)
+	// 重命名/复制:porcelain v1 输出 `ORIG -> NEW`(v2 才是新路径在前)。
 	if arrow := strings.LastIndex(rest, " -> "); arrow >= 0 {
-		ent.Path = rest[:arrow]
-		ent.Orig = rest[arrow+4:]
+		ent.Orig = unquotePath(rest[:arrow])
+		ent.Path = unquotePath(rest[arrow+4:])
 	} else {
 		ent.Path = unquotePath(rest)
 	}

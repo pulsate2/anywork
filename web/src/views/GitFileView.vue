@@ -23,12 +23,10 @@ const repoPath = (route.query.path as string) || '/'
 
 const title = computed(() => file)
 
-// 视图切换:差异 / 文件。
-// commit scope 只展示该提交的差异,没有可读的"当前文件"(fsRead 读到的是工作区版本),
-// 会误导,故 commit 下不提供文件视图。untracked 无 diff,只能看文件。
+// 视图切换:差异 / 文件。untracked 无 diff,只能看文件。
+// 看提交时"文件"取的是该提交里的版本(gitShow),不是工作区版本 —— 后者可能早被改过。
 type ViewMode = 'diff' | 'file'
 const mode = ref<ViewMode>(scope === 'untracked' ? 'file' : 'diff')
-const hasFileView = computed(() => scope !== 'commit')
 
 const diffBlock = ref<DiffBlock | null>(null)
 const diffLoading = ref(false)
@@ -55,12 +53,15 @@ async function loadDiff() {
 }
 
 async function loadFile() {
-  if (!hasFileView.value) return
   fileLoading.value = true
   fileError.value = ''
   try {
-    const abs = root ? `${root.replace(/\/$/, '')}/${file}` : `${repoPath}/${file}`
-    fileContent.value = await api.fsRead(abs)
+    if (scope === 'commit') {
+      fileContent.value = await api.gitShow(repoPath, commitHash, file)
+    } else {
+      const abs = root ? `${root.replace(/\/$/, '')}/${file}` : `${repoPath}/${file}`
+      fileContent.value = await api.fsRead(abs)
+    }
   } catch (e: any) {
     fileError.value = `无法读取文件:${e?.message || e || '未知错误'}`
     fileContent.value = ''
@@ -85,7 +86,6 @@ onMounted(async () => {
     loadFile()
   } else {
     loadDiff()
-    if (hasFileView.value && mode.value === 'file') loadFile()
   }
 })
 
@@ -119,7 +119,7 @@ function goBack() {
           <template #icon><n-icon :component="GitCompareOutline" /></template>
           差异
         </n-button>
-        <n-button v-if="hasFileView" size="small" :type="mode === 'file' ? 'primary' : 'default'"
+        <n-button size="small" :type="mode === 'file' ? 'primary' : 'default'"
           title="文件" aria-label="文件" @click="switchMode('file')">
           <template #icon><n-icon :component="DocumentTextOutline" /></template>
           文件
