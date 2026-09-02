@@ -1,6 +1,6 @@
 name: Release
 
-# 推 v* tag 自动发布;也可手动填一个已存在的 tag 补发(tag 早于本文件时只能走这条)。
+# 推 v* tag 自动发布;也可手动跑,填个 tag 名就行,tag 由本流程创建。
 on:
   push:
     tags:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的 tag(必须已存在)'
+        description: '要发布的 tag,如 v1.0.0(不存在会自动创建,指向上面选的分支)'
         required: true
 
 permissions:
@@ -20,9 +20,9 @@ jobs:
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      # 不写 ref:让它就取触发这次运行的 commit —— tag push 时是 tag 指向的提交,
+      # 手动跑时是所选分支的 HEAD。手动跑时 tag 还不存在,写了 ref 会 fetch 失败。
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
 
       - uses: actions/setup-node@v4
         with:
@@ -63,13 +63,14 @@ jobs:
           pack windows amd64 .exe
           cd out && sha256sum lightremote-* > SHA256SUMS.txt && ls -lh
 
-      # 用 runner 自带的 gh,免引第三方 action。重跑同一个 tag 时覆盖同名文件而不是报错。
+      # 用 runner 自带的 gh,免引第三方 action。--target 让 gh 顺手把不存在的 tag
+      # 建在刚编译的这个 commit 上,不用先手动打 tag。重跑同一个 tag 覆盖同名文件而不是报错。
       - name: 上传到 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --generate-notes
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
           fi
           gh release upload "$TAG" out/* --clobber
