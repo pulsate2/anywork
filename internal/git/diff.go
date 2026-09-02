@@ -5,8 +5,9 @@ import (
 	"strings"
 )
 
-// Diff 返回 unified 文本。scope: "worktree"|"staged"|"head";file 可选限定单个文件。
-func (s *Service) Diff(p, scope, file string) (string, error) {
+// Diff 返回 unified 文本。scope: "worktree"|"staged"|"head"|"commit";
+// file 可选限定单个文件;commit 时 ref 指定提交哈希(取该提交相对父的改动)。
+func (s *Service) Diff(p, scope, file, ref string) (string, error) {
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -14,13 +15,21 @@ func (s *Service) Diff(p, scope, file string) (string, error) {
 	if !info.Repo {
 		return "", ErrNotRepo
 	}
-	args := []string{"diff"}
+	var args []string
 	switch scope {
 	case "staged":
-		args = append(args, "--cached")
+		args = []string{"diff", "--cached"}
 	case "head":
-		args = append(args, "HEAD")
+		args = []string{"diff", "HEAD"}
+	case "commit":
+		if ref == "" {
+			return "", errBadRefArg
+		}
+		// git show 输出提交元信息 + unified diff,前端 parseDiff 吃 diff --git 头,
+		// 元信息行会被当成 meta 展示,正好能看到提交说明。
+		args = []string{"show", ref}
 	default: // worktree
+		args = []string{"diff"}
 	}
 	if file != "" {
 		args = append(args, "--", cleanRelPath(file))

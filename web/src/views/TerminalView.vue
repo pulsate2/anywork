@@ -147,6 +147,8 @@ function createSession() {
   const ws = workspaces.value.find((w) => w.id === selectedWs.value)
   const dir = ws?.path ?? store.root
   if (ws) store.select(ws.id)
+  // 切换前整屏重置:新会话从空回放开始,避免上个会话的残留输出盖在新终端上。
+  term?.reset()
   client.createSession(dir, execShell.value, term?.cols || 80, term?.rows || 24)
   showNewModal.value = false
   execShell.value = ''
@@ -266,8 +268,8 @@ watch(fitSignal, () => applyTheme())
     </div>
 
     <!-- xterm 容器 -->
-    <div ref="terminalWrap" class="term-wrap" :class="{ focused: activeId }">
-      <div ref="termEl" class="term-el"></div>
+    <div ref="terminalWrap" class="term-wrap" :class="{ focused: activeId, 'is-empty': !activeId }">
+      <div ref="termEl" class="term-el" :class="{ 'is-empty': !activeId }"></div>
       <n-empty v-if="!activeId" description="选择或新建一个会话开始" class="term-empty" />
     </div>
 
@@ -281,13 +283,14 @@ watch(fitSignal, () => applyTheme())
           <div class="sess-main" @click="attachSession(s)">
             <div class="sess-name">
               {{ sessionShortName(s) }}
+              <n-tag v-if="s.id === activeId" size="small" type="info" :bordered="false">当前</n-tag>
               <n-tag v-if="s.dead" size="small" type="error" :bordered="false">结束</n-tag>
               <n-tag v-else size="small" type="success" :bordered="false">运行中</n-tag>
             </div>
             <div class="sess-dir">{{ s.dir }}</div>
           </div>
           <template #suffix>
-            <n-button size="tiny" quaternary type="error" @click.stop="killSession(s.id)">结束</n-button>
+            <n-button class="sess-kill" size="tiny" quaternary type="error" @click.stop="killSession(s.id)">结束</n-button>
           </template>
         </n-list-item>
       </n-list>
@@ -361,12 +364,25 @@ watch(fitSignal, () => applyTheme())
   }
 }
 .term-el { width: 100%; height: 100%; }
-.term-empty { position: absolute; inset: 0; margin: auto; }
+/* 空状态:让 term-wrap 变 flex 居中。之前的 position:absolute; inset:0; margin:auto
+   在元素尺寸不固定时会把空状态推到容器左上角,文字就贴到了顶部没有边距。
+   改为整容器 flex 居中 + 内边距,文字真正垂直水平居中且四周留白。 */
+.term-wrap.is-empty { display: flex; align-items: center; justify-content: center; }
+.term-el.is-empty { display: none; }
+.term-empty { padding: 12px; }
 .sess-main { flex: 1; min-width: 0; cursor: pointer; }
 /* n-list-item 的 __main 是 flex: 1 但 min-width 仍是 auto,不清零长路径会把 suffix 里的
    结束按钮挤出可视区。 */
 .sess-item :deep(.n-list-item__main) { min-width: 0; }
 .sess-item :deep(.n-list-item__suffix) { margin-left: 12px; }
+/* 结束按钮统一给一层浅色底色:quaternary 默认是无背景纯文字,第一个会话的按钮
+   因弹窗打开时被自动聚焦而显出 hover/focus 底色,其余行没有——视觉上就参差不齐。
+   显式设相同背景(用 color-mix 让浅/深主题下都跟随 --lr-danger),让每行一致。 */
+.sess-item :deep(.sess-kill),
+.sess-item :deep(.sess-kill.n-button:hover),
+.sess-item :deep(.sess-kill.n-button:focus) {
+  background: color-mix(in srgb, var(--lr-danger) 12%, transparent);
+}
 .sess-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
 .sess-dir {
   color: var(--lr-fg-muted); font-size: 12px;

@@ -41,7 +41,7 @@ func (h *Handlers) Diff(w http.ResponseWriter, r *http.Request) {
 	if scope == "" {
 		scope = "worktree"
 	}
-	txt, err := h.svc.Diff(q.Get("path"), scope, q.Get("file"))
+	txt, err := h.svc.Diff(q.Get("path"), scope, q.Get("file"), q.Get("ref"))
 	if err != nil {
 		h.httpErr(w, err)
 		return

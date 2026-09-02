@@ -99,6 +99,14 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 				continue
 			}
 			// 附加到新会话,回放(空)。
+			// 先释放当前附加的旧会话,再附加新会话:否则同一连接会同时挂载在
+			// 新旧两个会话上,旧会话继续向此连接广播输出,前端看到的就是"新建了
+			// 却还在旧会话里"。与 detach 分支同样的清理逻辑。
+			mu.Lock()
+			if *curID != "" {
+				m.Detach(*curID, c)
+			}
+			mu.Unlock()
 			if _, _, err := m.Attach(sum.ID, c); err != nil {
 				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
 				continue

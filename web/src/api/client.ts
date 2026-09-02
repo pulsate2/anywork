@@ -81,8 +81,8 @@ export const api = {
   // ---- Git ----
   gitRepo: (path: string) => request<GitRepo>('GET', `/api/git/repo?path=${encodeURIComponent(path)}`),
   gitStatus: (path: string) => request<GitStatus>('GET', `/api/git/status?path=${encodeURIComponent(path)}`),
-  gitDiff: (path: string, scope: string, file?: string) =>
-    requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}`),
+  gitDiff: (path: string, scope: string, file?: string, ref?: string) =>
+    requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}`),
   gitLog: (path: string, n?: number, skip?: number) => {
     const qs = new URLSearchParams({ path })
     if (n) qs.set('n', String(n))

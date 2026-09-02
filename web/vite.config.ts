@@ -28,7 +28,8 @@ export default defineConfig({
   server: {
     // 本地开发代理到 Go 后端。字符串简写不转发 WebSocket upgrade,/api/term 必须显式 ws: true。
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8080', ws: true },
+      '/api': { target: 'http://127.0.0.1:18080', ws: true },
     },
+    allowedHosts: true
   },
 })
