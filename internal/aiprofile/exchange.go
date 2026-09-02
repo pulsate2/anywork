@@ -1,131 +1,89 @@
 package aiprofile
 
 import (
-	"archive/tar"
-	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 )
 
-// ExportWriter 把档案以 tar.gz 流式写入 w。包含 env.json + claude/ + codex/。
-func (s *service) ExportWriter(name string, w io.Writer) error {
-	if !nameOK(name) {
-		return ErrNotFound
-	}
-	dir := s.profileDir(name)
-	if _, err := os.Stat(dir); err != nil {
-		return ErrNotFound
-	}
-	gz := gzip.NewWriter(w)
-	tw := tar.NewWriter(gz)
-	err := addDir(tw, dir, "")
-	if err != nil {
-		tw.Close()
-		gz.Close()
-		return err
-	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	return gz.Close()
+// dump 导出格式:按 app 分组的配置清单。当前生效项不导出 —— 那是本机状态,
+// 换台机器上再决定切到哪份。
+type dump struct {
+	Version int                   `json:"version"`
+	Apps    map[string][]Provider `json:"apps"`
 }
 
-func addDir(tw *tar.Writer, dir, prefix string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		p := filepath.Join(dir, e.Name())
-		name := e.Name()
-		if prefix != "" {
-			name = prefix + "/" + e.Name()
+// Export 把全部配置写成一份 JSON。
+func (s *Service) Export(w io.Writer) error {
+	d := dump{Version: 1, Apps: map[string][]Provider{}}
+	for _, app := range []string{AppClaude, AppCodex} {
+		list, err := s.List(app)
+		if err != nil {
+			return err
 		}
-		if e.IsDir() {
-			if err := tw.WriteHeader(&tar.Header{
-				Name: name + "/", Typeflag: tar.TypeDir, Mode: 0o700}); err != nil {
-				return err
-			}
-			if err := addDir(tw, p, name); err != nil {
-				return err
-			}
+		d.Apps[app] = list
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(d)
+}
+
+// Import 按名字合并导入的配置:同名覆盖,新名新增。返回落库的条数。
+func (s *Service) Import(r io.Reader) (int, error) {
+	var d dump
+	// 4MB 够放几百份配置了,不设上限的话一个大文件就能把内存吃干。
+	if err := json.NewDecoder(io.LimitReader(r, 4<<20)).Decode(&d); err != nil {
+		return 0, invalid("不是合法的配置清单: %v", err)
+	}
+	n := 0
+	for app, list := range d.Apps {
+		if !appOK(app) {
 			continue
 		}
-		fi, err := os.Stat(p)
-		if err != nil {
-			return err
+		for _, p := range list {
+			p.App = app
+			if err := s.upsertByName(p); err != nil {
+				return n, err
+			}
+			n++
 		}
-		if err := tw.WriteHeader(&tar.Header{
-			Name: name, Mode: 0o600, Size: fi.Size(), ModTime: fi.ModTime()}); err != nil {
-			return err
-		}
-		f, err := os.Open(p)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(tw, f); err != nil {
-			f.Close()
-			return err
-		}
-		f.Close()
 	}
-	return nil
+	return n, nil
 }
 
-// Import 从 r 读入 tar.gz 档案内容到 name。覆盖已有档案。
-// 顶层条目可能带目录前缀,统一解压到 profiles/<name>/ 下。
-func (s *service) Import(name string, r io.Reader) error {
-	if !nameOK(name) {
-		return errorsNew("invalid profile name")
+// upsertByName 走 Create/Update 而不是直接写库,校验和"改到当前生效那份就顺手
+// 落盘"的逻辑都能复用。
+func (s *Service) upsertByName(p Provider) error {
+	p.Name = cleanName(p.Name)
+	if p.Name == "" {
+		return invalid("配置名不能为空")
 	}
-	dir := s.profileDir(name)
-	_ = os.RemoveAll(dir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	old, err := s.byName(p.App, p.Name)
+	switch {
+	case err == nil:
+		p.ID = old.ID
+		_, err = s.Update(p)
+		return err
+	case errors.Is(err, ErrNotFound):
+		p.ID = ""
+		_, err = s.Create(p)
 		return err
 	}
-	gz, err := gzip.NewReader(r)
+	return err
+}
+
+func (s *Service) byName(app, name string) (Provider, error) {
+	rows, err := s.db.Query(selectCols+` WHERE app = ? AND name = ?`, app, name)
 	if err != nil {
-		return err
+		return Provider{}, err
 	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		clean := sanitizePath(hdr.Name)
-		if clean == "" {
-			continue
-		}
-		dest := filepath.Join(dir, clean)
-		if !withinWithin(dest, dir) {
-			return errorsNew("archive path escapes")
-		}
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			_ = os.MkdirAll(dest, 0o700)
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return err
-			}
-			f.Close()
-		}
+	defer rows.Close()
+	list, err := scanProviders(rows)
+	if err != nil {
+		return Provider{}, err
 	}
-	return nil
+	if len(list) == 0 {
+		return Provider{}, ErrNotFound
+	}
+	return list[0], nil
 }
-
-func errorsNew(msg string) error { return errors.New(msg) }

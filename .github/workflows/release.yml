@@ -1,0 +1,75 @@
+name: Release
+
+# 推 v* tag 自动发布;也可手动填一个已存在的 tag 补发(tag 早于本文件时只能走这条)。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag(必须已存在)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      # 前端产物落在 cmd/server/dist,由 //go:embed 打进二进制,所以必须先于 go build。
+      - name: 构建前端
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: 交叉编译并打包
+        run: |
+          set -euo pipefail
+          mkdir -p stage out
+          pack() {
+            local goos=$1 goarch=$2 ext=${3:-}
+            local name="lightremote-${TAG}-${goos}-${goarch}"
+            mkdir -p "stage/${name}"
+            GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 \
+              go build -trimpath -ldflags='-s -w' -o "stage/${name}/lightremote${ext}" ./cmd/server
+            cp README.md "stage/${name}/"
+            if [ "$goos" = windows ]; then
+              (cd stage && zip -qr "../out/${name}.zip" "$name")
+            else
+              tar -czf "out/${name}.tar.gz" -C stage "$name"
+            fi
+          }
+          pack linux amd64
+          pack linux arm64
+          pack darwin amd64
+          pack darwin arm64
+          pack windows amd64 .exe
+          cd out && sha256sum lightremote-* > SHA256SUMS.txt && ls -lh
+
+      # 用 runner 自带的 gh,免引第三方 action。重跑同一个 tag 时覆盖同名文件而不是报错。
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" out/* --clobber

@@ -69,7 +69,18 @@ func main() {
 	}
 
 	fsService := fsvc.NewService(cfg.Root, cfg.ReadOnly)
-	aiHandlers := aiprofile.NewHandlers(aiprofile.New(database.DB, cfg.DataDir))
+	// AI 配置切换直接改真实配置文件(~/.claude、~/.codex),落点是用户主目录。
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("主目录: %v", err)
+	}
+	aiSvc := aiprofile.New(database.DB, home)
+	aiHandlers := aiprofile.NewHandlers(aiSvc)
+	// 配置文件缺失(容器里 HOME 是临时的、被别的工具清掉)时按 current 补写一份,
+	// 文件在就不动 —— 开机不覆盖机器上手改的内容。要强制覆盖走页面上的"立即设定"。
+	if restored := aiSvc.RestoreMissing(); len(restored) > 0 {
+		log.Printf("AI 配置: 配置文件缺失,已按当前记录补写 %s", strings.Join(restored, ", "))
+	}
 
 	// Web Push:VAPID 密钥(配置/文件/生成)+ 订阅存储 + 投递器。
 	vapidKey, err := pushsvc.LoadOrCreate(cfg.DataDir, cfg.VapidPrivate)
@@ -103,10 +114,6 @@ func main() {
 	gitService.SetCredentialBroker(credBroker)
 	app.git = gitsvc.NewHandlers(gitService)
 	app.authWS = gitsvc.NewAuthWSHandler(gitService)
-	// 新终端会话继承当前 AI 档案的 env(已运行进程不受影响)。
-	app.terminal.EnvProvider = func() []string {
-		return aiHandlers.SessionEnv(os.Environ())
-	}
 	// 终端空闲 → Web Push "命令完成"通知。
 	if cfg.PushIdle > 0 {
 		go app.terminal.IdleWatcher(1*time.Second, time.Duration(cfg.PushIdle)*time.Second,
@@ -229,16 +236,14 @@ func (a *App) routes() http.Handler {
 		pr.Get("/api/git/auth", a.authWS.Begin)
 		pr.Post("/api/git/auth/answer", a.authWS.Answer)
 
-		// AI 配置档案(里程碑 5)。
-		pr.Get("/api/ai/profiles", a.ai.List)
-		pr.Get("/api/ai/profile", a.ai.Get)
-		pr.Post("/api/ai/profile", a.ai.Create)
-		pr.Put("/api/ai/profile", a.ai.Update)
-		pr.Delete("/api/ai/profile", a.ai.Delete)
-		pr.Get("/api/ai/active", a.ai.Active)
-		pr.Post("/api/ai/active", a.ai.SetActive)
-		pr.Get("/api/ai/profile/export", a.ai.Export)
-		pr.Post("/api/ai/profile/import", a.ai.Import)
+		// AI 供应商配置切换:一份记录就是一份真实配置文件的内容。
+		pr.Get("/api/ai/providers", a.ai.List)
+		pr.Post("/api/ai/provider", a.ai.Create)
+		pr.Put("/api/ai/provider", a.ai.Update)
+		pr.Delete("/api/ai/provider", a.ai.Delete)
+		pr.Post("/api/ai/switch", a.ai.Switch)
+		pr.Get("/api/ai/export", a.ai.Export)
+		pr.Post("/api/ai/import", a.ai.Import)
 
 		// 备份(里程碑 6)。
 		pr.Get("/api/backup/jobs", a.backup.List)

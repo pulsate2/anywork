@@ -1,19 +1,22 @@
 <script setup lang="ts">
 // 文件浏览:列表/读写/上传下载/搜索/压缩解压。桌面+移动自适应。
-import { ref, onMounted, computed, watch, nextTick } from "vue"
+import { ref, onMounted, computed, watch, nextTick, h, type Component } from "vue"
 import { useRouter } from "vue-router"
 import {
 	NButton, NIcon, NEmpty, NSpin,
 	NInput, NModal, useMessage, useDialog,
 	NTag, NList, NListItem, NSelect, NRadioGroup, NRadioButton,
+	NDropdown, type DropdownOption, type DropdownDividerOption,
 } from "naive-ui"
 import { ArrowBackOutline,
 	CreateOutline, TrashOutline, SearchOutline, DownloadOutline,
 	CloudUploadOutline, AddOutline, ArrowUpOutline, ArrowDownOutline,
-	SwapHorizontalOutline, CloseOutline } from "@vicons/ionicons5"
+	SwapHorizontalOutline, CloseOutline, EllipsisVerticalOutline,
+	CopyOutline, ArrowForwardOutline } from "@vicons/ionicons5"
 import { api, type FsEntry, type FsSearchResult } from "@/api/client"
 import { fileIcon, isArchivePath, isImagePath } from "@/utils/fileIcon"
 import { useWorkspaceStore } from "@/stores/workspace"
+import DirTreePicker from "@/components/DirTreePicker.vue"
 
 const message = useMessage()
 const dialog = useDialog()
@@ -57,7 +60,9 @@ function parentOf(p: string) {
 	return i <= 0 ? t : t.slice(0, i)
 }
 function joinPath(dir: string, name: string) {
-	return trimSlash(dir) + "/" + name
+	// root 本身就是 "/" 时不能再补一道斜杠,否则拼出 "//x",复制/移动的同路径判断会对不上。
+	const d = trimSlash(dir)
+	return (d === "/" ? "" : d) + "/" + name
 }
 
 // 恢复上次访问的目录:必须仍在当前工作区边界之内,否则丢弃记录。
@@ -177,6 +182,95 @@ function download(e: FsEntry) {
 }
 function downloadZip() {
 	window.open(api.fsArchiveUrl(cwd.value))
+}
+// ---- 行操作菜单 ----
+// 全部收进三点菜单:一行只留一个触控目标,移动端不会误点到删除。
+function rowMenu(e: FsEntry): Array<DropdownOption | DropdownDividerOption> {
+	const icon = (c: Component, color?: string) => () => h(NIcon, { component: c, color })
+	const out: Array<DropdownOption | DropdownDividerOption> = []
+	if (!e.dir) out.push({ key: "download", label: "下载", icon: icon(DownloadOutline) })
+	out.push({ key: "rename", label: "重命名", icon: icon(CreateOutline) })
+	out.push({ key: "copy", label: "复制到…", icon: icon(CopyOutline) })
+	out.push({ key: "move", label: "移动到…", icon: icon(ArrowForwardOutline) })
+	out.push({ key: "sep", type: "divider" })
+	// 弹层 teleport 到 body,scoped 样式选不中,危险色只能内联。
+	out.push({
+		key: "delete", label: "删除",
+		icon: icon(TrashOutline, "var(--lr-danger)"),
+		props: { style: { color: "var(--lr-danger)" } },
+	})
+	return out
+}
+
+function onRowMenu(key: string | number, e: FsEntry) {
+	if (key === "download") download(e)
+	else if (key === "rename") openRename(e)
+	else if (key === "copy") openTransfer("copy", e)
+	else if (key === "move") openTransfer("move", e)
+	else if (key === "delete") remove(e)
+}
+
+// ---- 复制 / 移动 ----
+// 选目标目录用的是新建工作区那套目录树,默认展开到当前目录。
+const transferShowing = ref(false)
+const transferMode = ref<"copy" | "move">("copy")
+const transferTarget = ref<FsEntry | null>(null)
+const transferDir = ref("")
+const transferChecking = ref(false)
+
+function openTransfer(mode: "copy" | "move", e: FsEntry) {
+	transferMode.value = mode
+	transferTarget.value = e
+	transferDir.value = cwd.value
+	transferShowing.value = true
+}
+
+// 后端 Copy/Move 的 dst 是含最终名字的完整路径,不是父目录。
+const transferTo = computed(() => {
+	const e = transferTarget.value
+	const dir = trimSlash(transferDir.value.trim())
+	return e && dir ? joinPath(dir, e.name) : ""
+})
+
+// 后端不挡这两种:原地复制会被 os.Create 截成空文件;目录进自己的子树会无限递归。
+const transferError = computed(() => {
+	const e = transferTarget.value
+	const to = transferTo.value
+	if (!e || !to) return ""
+	const from = trimSlash(e.path)
+	if (to === from) return "目标目录就是当前位置"
+	if (e.dir && to.startsWith(from + "/")) return "不能放进自己的子目录"
+	return ""
+})
+
+async function submitTransfer() {
+	const e = transferTarget.value
+	const to = transferTo.value
+	if (!e || !to || transferError.value) return
+	// 同名会被直接盖掉(copy 走 os.Create,move 在 Linux 上也是覆盖),先问一句。
+	transferChecking.value = true
+	let clash = false
+	try {
+		clash = (await api.fsList(trimSlash(transferDir.value.trim()))).some((it) => it.name === e.name)
+	} catch {
+		// 目标目录读不到就别拦,让后端去报真正的错
+	} finally {
+		transferChecking.value = false
+	}
+	const verb = transferMode.value === "copy" ? "复制" : "移动"
+	const run = () => doOp({ op: transferMode.value, from: e.path, to })
+	transferShowing.value = false
+	if (!clash) {
+		run()
+		return
+	}
+	dialog.warning({
+		title: "目标已存在",
+		content: `目标目录里已有「${e.name}」,继续会覆盖它。`,
+		positiveText: "覆盖" + verb,
+		negativeText: "取消",
+		onPositiveClick: run,
+	})
 }
 // ---- 上传 ----
 const uploadShowing = ref(false)
@@ -449,12 +543,11 @@ function up() {
 					</div>
 					<span class="fs-size">{{ e.dir ? "" : sizeHuman(e.size) }}</span>
 					<div class="fs-actions">
-						<n-button v-if="!e.dir" class="fs-btn" size="tiny" quaternary aria-label="下载" @click.stop="download(e)">
-							<n-icon :component="DownloadOutline" /></n-button>
-						<n-button class="fs-btn" size="tiny" quaternary aria-label="重命名" @click.stop="openRename(e)">
-							<n-icon :component="CreateOutline" /></n-button>
-						<n-button class="fs-btn" size="tiny" quaternary type="error" aria-label="删除" @click.stop="remove(e)">
-							<n-icon :component="TrashOutline" /></n-button>
+						<n-dropdown trigger="click" placement="bottom-end" size="large" :options="rowMenu(e)"
+							@select="(k) => onRowMenu(k, e)">
+							<n-button class="fs-btn" size="tiny" quaternary aria-label="更多操作" @click.stop>
+								<n-icon :component="EllipsisVerticalOutline" /></n-button>
+						</n-dropdown>
 					</div>
 				</div>
 			</div>
@@ -481,6 +574,20 @@ function up() {
 				<div class="modal-footer">
 					<n-button @click="nameShowing = false">取消</n-button>
 					<n-button type="primary" :disabled="!nameValue.trim() || nameInvalid" @click="submitName">确定</n-button>
+				</div>
+			</template>
+		</n-modal>
+		<!-- 复制 / 移动 -->
+		<n-modal v-model:show="transferShowing" preset="card" class="dir-modal"
+			:title="transferMode === 'copy' ? '复制到' : '移动到'">
+			<div class="transfer-src">{{ transferTarget?.name }}</div>
+			<dir-tree-picker v-model="transferDir" placeholder="目标目录" default-open />
+			<div class="transfer-to" :class="{ bad: !!transferError }">{{ transferError || transferTo }}</div>
+			<template #footer>
+				<div class="modal-footer">
+					<n-button @click="transferShowing = false">取消</n-button>
+					<n-button type="primary" :loading="transferChecking" :disabled="!transferTo || !!transferError"
+						@click="submitTransfer">{{ transferMode === 'copy' ? '复制' : '移动' }}</n-button>
 				</div>
 			</template>
 		</n-modal>
@@ -569,6 +676,17 @@ function up() {
 .fs-count { color: var(--lr-fg-muted); font-size: 12px; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
 .name-modal { width: min(420px, calc(100vw - 32px)); }
+.dir-modal { width: min(460px, calc(100vw - 32px)); }
+.transfer-src {
+	margin-bottom: 8px; font-weight: 600;
+	overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.transfer-to {
+	margin-top: 8px; font-size: 12px;
+	color: var(--lr-fg-muted); font-family: ui-monospace, monospace;
+	word-break: break-all;
+}
+.transfer-to.bad { color: var(--lr-danger); font-family: inherit; }
 .name-kind { margin-bottom: 10px; }
 .name-err { margin-top: 6px; color: var(--lr-danger); font-size: 12px; }
 .file-input { font-size: 13px; }

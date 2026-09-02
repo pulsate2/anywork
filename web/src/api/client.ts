@@ -125,22 +125,18 @@ export const api = {
   // 回滚提交。op:revert=生成一个反向提交;abort=放弃卡在冲突里的 revert。
   gitRevert: (path: string, op: 'revert' | 'abort', hash?: string) =>
     request<{ out: string }>('POST', '/api/git/revert', { path, op, hash }),
-  // ---- AI 配置档案 ----
-  aiProfiles: () => request<AiProfile[]>('GET', '/api/ai/profiles'),
-  aiProfile: (name: string) => request<AiProfile>('GET', `/api/ai/profile?name=${encodeURIComponent(name)}`),
-  aiCreate: (b: { name: string; env?: Record<string,string>; preset?: string; cloneFrom?: string }) =>
-    request<AiProfile>('POST', '/api/ai/profile', b),
-  aiUpdate: (name: string, env: Record<string,string>) =>
-    request<AiProfile>('PUT', '/api/ai/profile', { name, env }),
-  aiDelete: (name: string) => request<{ ok: boolean }>('DELETE', `/api/ai/profile?name=${encodeURIComponent(name)}`),
-  aiActive: () => request<{ name: string }>('GET', '/api/ai/active'),
-  aiSetActive: (name: string) => request<{ ok: boolean }>('POST', '/api/ai/active', { name }),
-  aiExportUrl: (name: string) => `/api/ai/profile/export?name=${encodeURIComponent(name)}`,
-  aiImport: (name: string, file: File) => {
+  // ---- AI 配置切换 ----
+  aiProviders: (app: AiApp) => request<AiProviderList>('GET', `/api/ai/providers?app=${app}`),
+  aiProviderCreate: (p: AiProviderInput) => request<AiProvider>('POST', '/api/ai/provider', p),
+  aiProviderUpdate: (p: AiProviderInput & { id: string }) => request<AiProvider>('PUT', '/api/ai/provider', p),
+  aiProviderDelete: (app: AiApp, id: string) =>
+    request<{ ok: boolean }>('DELETE', `/api/ai/provider?app=${app}&id=${encodeURIComponent(id)}`),
+  aiSwitch: (app: AiApp, id: string) => request<{ ok: boolean }>('POST', '/api/ai/switch', { app, id }),
+  aiExportUrl: () => '/api/ai/export',
+  aiImport: (file: File) => {
     const fd = new FormData()
-    fd.append('name', name)
     fd.append('file', file)
-    return fetch('/api/ai/profile/import', { method: 'POST', body: fd, credentials: 'same-origin' })
+    return fetch('/api/ai/import', { method: 'POST', body: fd, credentials: 'same-origin' })
   },
   // ---- 备份 ----
   backupJobs: () => request<BackupJob[]>('GET', '/api/backup/jobs'),
@@ -313,13 +309,34 @@ export interface GitRemote {
   url: string
 }
 
-export interface AiProfile {
+export type AiApp = 'claude' | 'codex'
+
+// AiProvider.config 就是要落到真实配置文件里的内容:claude 存 settings.json 本身,
+// codex 存 { auth, config }(config 是 config.toml 全文)。
+export interface AiProvider {
+  id: string
+  app: AiApp
   name: string
-  env: Record<string, string>
-  hasClaude: boolean
-  hasCodex: boolean
+  category: string
+  websiteUrl: string
+  config: unknown
+  isCurrent: boolean
   createdAt: string
   updatedAt: string
+}
+
+export interface AiProviderInput {
+  app: AiApp
+  name: string
+  category?: string
+  websiteUrl?: string
+  config: unknown
+}
+
+export interface AiProviderList {
+  app: AiApp
+  current: string
+  providers: AiProvider[]
 }
 
 export interface BackupJob {

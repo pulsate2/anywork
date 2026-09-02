@@ -5,141 +5,116 @@ import (
 	"net/http"
 )
 
-// Handlers 承载 AI 档案 HTTP 端点。
+// Handlers 承载 AI 配置切换的 HTTP 端点。
 type Handlers struct {
-	svc *service
+	svc *Service
 }
 
-func NewHandlers(svc *service) *Handlers {
+func NewHandlers(svc *Service) *Handlers {
 	return &Handlers{svc: svc}
 }
 
-// List 列出全部档案。
+// List 列出某个 app 的全部配置,并带上当前生效项的 id。
 func (h *Handlers) List(w http.ResponseWriter, r *http.Request) {
-	profiles, err := h.svc.List()
-	if err != nil {
-		httpError(w, err, http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, profiles)
-}
-
-// Get 读取单个档案。
-func (h *Handlers) Get(w http.ResponseWriter, r *http.Request) {
-	p, err := h.svc.Get(r.URL.Query().Get("name"))
+	app := r.URL.Query().Get("app")
+	list, err := h.svc.List(app)
 	if err != nil {
 		httpError(w, err, statusFor(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	current := ""
+	for _, p := range list {
+		if p.IsCurrent {
+			current = p.ID
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"app": app, "current": current, "providers": list,
+	})
 }
 
-// Create 新建档案。
+// Create 新增一份配置。
 func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name      string            `json:"name"`
-		Env       map[string]string `json:"env"`
-		Preset    string            `json:"preset"`
-		CloneFrom string            `json:"cloneFrom"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	var p Provider
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	p, err := h.svc.Create(body.Name, body.Env, body.Preset, body.CloneFrom)
+	out, err := h.svc.Create(p)
 	if err != nil {
 		httpError(w, err, statusFor(err))
 		return
 	}
-	writeJSON(w, http.StatusCreated, p)
+	writeJSON(w, http.StatusCreated, out)
 }
 
-// Update 覆盖档案 env。
+// Update 覆盖一份配置。
 func (h *Handlers) Update(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name string            `json:"name"`
-		Env  map[string]string `json:"env"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	var p Provider
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	p, err := h.svc.Update(body.Name, body.Env)
+	out, err := h.svc.Update(p)
 	if err != nil {
 		httpError(w, err, statusFor(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(w, http.StatusOK, out)
 }
 
-// Delete 删除档案。
+// Delete 删除一份配置。
 func (h *Handlers) Delete(w http.ResponseWriter, r *http.Request) {
-	if err := h.svc.Delete(r.URL.Query().Get("name")); err != nil {
+	q := r.URL.Query()
+	if err := h.svc.Delete(q.Get("app"), q.Get("id")); err != nil {
 		httpError(w, err, statusFor(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// Active 返回当前生效档案。
-func (h *Handlers) Active(w http.ResponseWriter, r *http.Request) {
-	name, err := h.svc.Active()
-	if err != nil {
-		httpError(w, err, http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"name": name})
-}
-
-// SetActive 切换当前生效档案。
-func (h *Handlers) SetActive(w http.ResponseWriter, r *http.Request) {
+// Switch 切换当前生效配置,即把它写回真实配置文件。
+func (h *Handlers) Switch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		App string `json:"app"`
+		ID  string `json:"id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := h.svc.SetActive(body.Name); err != nil {
+	if err := h.svc.Switch(body.App, body.ID); err != nil {
 		httpError(w, err, statusFor(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// Export 以 tar.gz 下载档案。
+// Export 下载全部配置的 JSON 清单。
 func (h *Handlers) Export(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Disposition",
-		"attachment; filename="+name+".tar.gz")
-	if err := h.svc.ExportWriter(name, w); err != nil {
-		// 头部已写,只能 200;内容错误由客户端校验。
-		return
-	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="ai-providers.json"`)
+	// 头一旦写出去就没法改状态码了,出错只能截断,由客户端解析时发现。
+	_ = h.svc.Export(w)
 }
 
-// Import 从上传的 tar.gz 导入档案。
+// Import 从上传的 JSON 清单按名字合并配置。
 func (h *Handlers) Import(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	name := r.FormValue("name")
 	f, _, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "file required", http.StatusBadRequest)
 		return
 	}
 	defer f.Close()
-	if err := h.svc.Import(name, f); err != nil {
+	n, err := h.svc.Import(f)
+	if err != nil {
 		httpError(w, err, statusFor(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// SessionEnv 返回 new terminal 会话应注入的 env(供主应用 EnvProvider 调用)。
-func (h *Handlers) SessionEnv(base []string) []string {
-	return h.svc.SessionEnv(base)
+	writeJSON(w, http.StatusOK, map[string]int{"imported": n})
 }

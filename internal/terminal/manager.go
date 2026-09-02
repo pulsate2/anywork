@@ -21,9 +21,6 @@ type Manager struct {
 	Root string
 	// ReadOnly 只读模式禁止创建/写入。
 	ReadOnly bool
-	// EnvProvider 返回新建会话的基础 env。nil 则用 os.Environ()。
-	// 由主应用注入,使新会话继承当前 AI 配置档案的 env(见 DESIGN 5.4)。
-	EnvProvider func() []string
 }
 
 func NewManager(root string, readonly bool) *Manager {
@@ -79,11 +76,7 @@ func (m *Manager) Create(dir, shell string, cols, rows int) (*Summary, error) {
 	}
 
 	id := newID()
-	env := os.Environ()
-	if m.EnvProvider != nil {
-		env = m.EnvProvider()
-	}
-	s := NewSession(id, dir, shell, env, cols, rows)
+	s := NewSession(id, dir, shell, os.Environ(), cols, rows)
 	if err := s.start(); err != nil {
 		return nil, err
 	}
