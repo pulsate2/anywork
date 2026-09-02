@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 文件浏览:列表/读写/上传下载/搜索/压缩解压。桌面+移动自适应。
 import { ref, onMounted, computed, watch } from "vue"
+import { useRouter } from "vue-router"
 import {
 	NButton, NIcon, NEmpty, NSpin,
 	NInput, NModal, useMessage, useDialog,
@@ -16,6 +17,7 @@ import { useWorkspaceStore } from "@/stores/workspace"
 const message = useMessage()
 const dialog = useDialog()
 const store = useWorkspaceStore()
+const router = useRouter()
 const cwd = ref("/")
 const entries = ref<FsEntry[]>([])
 const loading = ref(false)
@@ -55,40 +57,15 @@ async function load(dir: string) {
 
 function openEntry(e: FsEntry) {
 	if (e.dir) load(e.path)
-	else openEditor(e)
+	else openFilePage(e)
 }
 
-// ---- 编辑器 ----
-const editor = ref<FsEntry | null>(null)
-const showEditor = ref(false)
-const editText = ref("")
-const editSaving = ref(false)
-async function openEditor(e: FsEntry) {
+// 文件点进单独预览/编辑页(二级页面,不再用模态编辑器)。
+function openFilePage(e: { path: string; name: string; size: number }) {
 	if (e.size > 512 * 1024) {
-		message.warning("文件过大,仅支持编辑 512KB 内")
-		return
+		message.warning("文件过大,仅支持预览,不可编辑(512KB 内)")
 	}
-	try {
-		const text = await api.fsRead(e.path)
-		editor.value = e
-		editText.value = text
-		showEditor.value = true
-	} catch (e: any) {
-		message.error(e?.message || "读取失败(可能是二进制)")
-	}
-}
-async function saveEditor() {
-	if (!editor.value) return
-	editSaving.value = true
-	try {
-		await api.fsWrite(editor.value.path, editText.value)
-		message.success("已保存")
-		editor.value = null
-		showEditor.value = false
-		load(cwd.value)
-	} finally {
-		editSaving.value = false
-	}
+	router.push({ path: "/files/file", query: { path: e.path, name: e.name } })
 }
 
 // ---- 文件操作 ----
@@ -240,15 +217,14 @@ function segments(r: FsSearchResult) {
 	return out
 }
 
-// 点命中项:目录进目录,文件开编辑器(沿用 512KB 上限)。
+// 点命中项:目录进目录,文件跳单独文件页。
 function openHit(g: { path: string; rel: string; dir: boolean; size: number }) {
 	if (g.dir) {
 		load(g.path)
 		clearSearch()
 		return
 	}
-	const name = g.rel.split("/").pop() || g.rel
-	openEditor({ name, path: g.path, dir: false, size: g.size, mtime: "", mode: "", symlink: false })
+	router.push({ path: "/files/file", query: { path: g.path, name: g.rel } })
 }
 
 function doReplace() {
@@ -402,17 +378,6 @@ function up() {
 			</div>
 			<n-empty v-else description="空目录" style="padding: 40px" />
 		</n-spin>
-		<!-- 编辑器 -->
-		<n-modal v-model:show="showEditor" preset="card" :title="editor?.name">
-			<n-input v-model:value="editText" type="textarea" :autosize="{ minRows: 12, maxRows: 20 }" />
-			<template #footer>
-				<div class="modal-footer">
-					<n-button @click="showEditor = false">关闭</n-button>
-					<n-button type="primary" :loading="editSaving" @click="saveEditor">保存</n-button>
-				</div>
-			</template>
-		</n-modal>
-
 		<!-- 上传 -->
 		<n-modal v-model:show="uploadShowing" preset="card" title="上传文件">
 			<input type="file" :multiple="true" class="file-input" @change="onFilePick" />
