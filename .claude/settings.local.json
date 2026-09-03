@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Bash(gofmt -l internal/terminal/)",
+      "Bash(sed -n '1,60p' views/SettingsView.vue)",
+      "Bash(sed -n '1,60p' views/AIView.vue)",
+      "Bash(sed -n '90,115p' components/DirTreePicker.vue)",
+      "Bash(sed -n '540,570p' views/GitView.vue)",
+      "Bash(sed -n '1,20p' components/CommandFavorites.vue)"
+    ]
+  }
+}

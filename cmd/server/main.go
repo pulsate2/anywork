@@ -3,9 +3,12 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +19,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -453,24 +458,105 @@ func serveEmbed(w http.ResponseWriter, r *http.Request, name string) {
 		http.NotFound(w, r)
 		return
 	}
-	content, err := fs.ReadFile(webFS, "dist/"+name)
+	asset, err := loadAsset(name)
 	if err != nil {
 		// 未命中真实文件 → 回退 SPA index.html。
-		index, err2 := fs.ReadFile(webFS, "dist/index.html")
-		if err2 != nil {
+		name = "index.html"
+		asset, err = loadAsset(name)
+		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		w.Write(index)
+	}
+
+	h := w.Header()
+	if asset.ctype != "" {
+		h.Set("Content-Type", asset.ctype)
+	}
+	// assets/ 下的文件名带内容哈希,内容不可能变,给一年强缓存 —— 否则手机端每次
+	// 切页都要重新下载整个路由分块(xterm 那个 300KB+),就是肉眼可见的卡顿。
+	// 外壳(index.html/sw.js/manifest)必须每次校验,不然改版后客户端一直吃旧壳。
+	if strings.HasPrefix(name, "assets/") {
+		h.Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		h.Set("Cache-Control", "no-cache")
+	}
+	h.Set("ETag", asset.etag)
+	if strings.Contains(r.Header.Get("If-None-Match"), asset.etag) {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	ctype := mimeTypeByExt(name)
-	if ctype != "" {
-		w.Header().Set("Content-Type", ctype)
+
+	body := asset.body
+	if asset.gz != nil && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		h.Set("Content-Encoding", "gzip")
+		h.Set("Vary", "Accept-Encoding")
+		body = asset.gz
 	}
-	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(content))
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.Write(body)
+}
+
+// asset 一份 embed 静态文件的就绪形态。embed 内容在进程生命周期内不变,
+// 所以哈希与压缩只算一次,之后每个请求都是纯内存拷贝。
+type asset struct {
+	body  []byte
+	gz    []byte // nil = 不值得压缩或压不动
+	etag  string
+	ctype string
+}
+
+var assetCache sync.Map // name -> *asset
+
+func loadAsset(name string) (*asset, error) {
+	if v, ok := assetCache.Load(name); ok {
+		return v.(*asset), nil
+	}
+	content, err := fs.ReadFile(webFS, "dist/"+name)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(content)
+	a := &asset{
+		body:  content,
+		etag:  `"` + hex.EncodeToString(sum[:8]) + `"`,
+		ctype: mimeTypeByExt(name),
+	}
+	if gz, ok := gzipAsset(a.ctype, content); ok {
+		a.gz = gz
+	}
+	assetCache.Store(name, a)
+	return a, nil
+}
+
+// gzipAsset 压缩文本类资源。只压一次并常驻内存,所以直接用最高压缩比;
+// 压完没变小(已压缩格式、极小文件)就放弃。
+func gzipAsset(ctype string, content []byte) ([]byte, bool) {
+	if len(content) < 1024 {
+		return nil, false
+	}
+	switch {
+	case strings.HasPrefix(ctype, "text/"),
+		strings.HasPrefix(ctype, "application/json"),
+		ctype == "image/svg+xml":
+	default:
+		return nil, false
+	}
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil, false
+	}
+	if _, err := zw.Write(content); err != nil {
+		return nil, false
+	}
+	if err := zw.Close(); err != nil {
+		return nil, false
+	}
+	if buf.Len() >= len(content) {
+		return nil, false
+	}
+	return buf.Bytes(), true
 }
 
 func mimeTypeByExt(name string) string {

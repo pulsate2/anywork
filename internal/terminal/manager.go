@@ -76,7 +76,7 @@ func (m *Manager) Create(dir, shell string, cols, rows int) (*Summary, error) {
 	}
 
 	id := newID()
-	s := NewSession(id, dir, shell, os.Environ(), cols, rows)
+	s := NewSession(id, dir, shell, sessionEnv(), cols, rows)
 	if err := s.start(); err != nil {
 		return nil, err
 	}
@@ -86,6 +86,20 @@ func (m *Manager) Create(dir, shell string, cols, rows int) (*Summary, error) {
 	m.mu.Unlock()
 	go m.watchExit(s)
 	return &Summary{ID: id, Dir: s.dir}, nil
+}
+
+// sessionEnv 会话环境 = 服务进程环境,但强制 TERM=xterm:父进程的 TERM 可能缺失
+// (Windows 服务)或是前端 xterm.js 不认的类型,TUI 程序会据此发出解析不了的转义序列。
+func sessionEnv() []string {
+	base := os.Environ()
+	env := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		if k, _, ok := strings.Cut(kv, "="); ok && strings.EqualFold(k, "TERM") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "TERM=xterm")
 }
 
 // watchExit 等进程退出,然后把 exit 与最新会话列表推给所有连接。

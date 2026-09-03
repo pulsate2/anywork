@@ -18,9 +18,11 @@ export default defineConfig({
     chunkSizeWarningLimit: 600, // vendor(壳)+ xterm 懒加载分块,首屏 <600KB 预算内
     rollupOptions: {
       output: {
-        // 按需拆分:核心壳 / xterm(懒加载) / codemirror(后续)
+        // 按需拆分:核心壳 / xterm(懒加载)。xterm 单独成块,改终端页的代码时
+        // 用户只需重下几 KB 的视图块,300KB+ 的 xterm 仍命中强缓存。
         manualChunks: {
           vendor: ['vue', 'vue-router', 'naive-ui'],
+          xterm: ['@xterm/xterm', '@xterm/addon-fit'],
         },
       },
     },

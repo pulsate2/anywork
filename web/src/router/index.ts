@@ -17,6 +17,18 @@ function waitForHeight(top: number) {
   })
 }
 
+// 底栏各页都是懒加载分块。集中登记一份,既给路由用,也给 prefetchViews 预热用 ——
+// 两处必须是同一个 import() 表达式,Vite 才会认成同一个分块。
+const views = {
+  terminal: () => import('@/views/TerminalView.vue'),
+  files: () => import('@/views/FilesView.vue'),
+  filesFile: () => import('@/views/FilesFileView.vue'),
+  git: () => import('@/views/GitView.vue'),
+  gitFile: () => import('@/views/GitFileView.vue'),
+  ai: () => import('@/views/AIView.vue'),
+  settings: () => import('@/views/SettingsView.vue'),
+}
+
 const router = createRouter({
   history: createWebHistory(),
   async scrollBehavior(to, from, saved) {
@@ -31,23 +43,38 @@ const router = createRouter({
   routes: [
     { path: '/', name: 'home', component: HomeView },
     { path: '/login', name: 'login', component: LoginView },
-    { path: '/terminal', name: 'terminal', component: () => import('@/views/TerminalView.vue') },
-    { path: '/files', name: 'files', component: () => import('@/views/FilesView.vue') },
-    { path: '/files/file', name: 'files-file', component: () => import('@/views/FilesFileView.vue') },
-    { path: '/git', name: 'git', component: () => import('@/views/GitView.vue') },
-    { path: '/git/file', name: 'git-file', component: () => import('@/views/GitFileView.vue') },
-    { path: '/ai', name: 'ai', component: () => import('@/views/AIView.vue') },
-    { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
+    { path: '/terminal', name: 'terminal', component: views.terminal },
+    { path: '/files', name: 'files', component: views.files },
+    { path: '/files/file', name: 'files-file', component: views.filesFile },
+    { path: '/git', name: 'git', component: views.git },
+    { path: '/git/file', name: 'git-file', component: views.gitFile },
+    { path: '/ai', name: 'ai', component: views.ai },
+    { path: '/settings', name: 'settings', component: views.settings },
   ],
 })
 
+// prefetchViews 空闲时把各页分块提前拉到本地,让底栏切换不再等网络。
+// 顺序串行:预热是背景任务,不该跟页面自己的请求抢带宽。
+export async function prefetchViews() {
+  for (const load of Object.values(views)) {
+    try {
+      await load()
+    } catch { /* 预热失败无所谓,真正切页时还会再要一次 */ }
+  }
+}
+
 // 登录守卫:未认证(401)则跳登录页。
 // fetch 只在网络失败时 reject,HTTP 错误码需显式检查。
+// 只在本次加载的首次导航校验一次:每次切页都多一个往返,弱网下就是切页卡顿的主因,
+// 而会话中途失效由 api/client.ts 统一拦 401 跳登录页兜底。
+let authChecked = false
+
 router.beforeEach(async (to) => {
-  if (to.name === 'login') return true
+  if (to.name === 'login' || authChecked) return true
   try {
     const res = await fetch('/api/me', { credentials: 'same-origin' })
     if (res.status === 401) return { name: 'login' }
+    authChecked = true
     return true
   } catch {
     return { name: 'login' }
