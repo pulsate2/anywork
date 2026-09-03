@@ -4,7 +4,7 @@
 // 从搜索结果点进来时还带 line(命中行号)与 q/regex/case(一级用的关键词和开关),
 // 进页面后把关键词的全部命中标出来,当前项落在命中行上 —— 不只是滚到那一行。
 // 图片走 <img>、压缩包走条目列表,都不读正文;markdown 只读时可切换渲染视图。
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton, NIcon, NSpin, NEmpty, NInput, useMessage,
@@ -249,16 +249,56 @@ function onEditorKeydown(e: KeyboardEvent) {
   }
 }
 
-// ---- 搜索(预览模式,只读定位) ----
+// 点最后一行下方的空白:textarea 的高度必须贴合内容(否则光标会和高亮层错开),
+// 那片空白落在滚动容器自己身上,textarea 收不到事件 —— 补一手,把焦点交给它、
+// 光标落到文末,和常见编辑器的行为一致。右侧空白由 CSS 让 .ce-body grow 吃掉,不用管。
+function onEditorMouseDown(e: MouseEvent) {
+  if (e.target !== editorEl.value) return // 只处理落在容器自身空白上的点击
+  const el = inputEl.value
+  if (!el) return
+  e.preventDefault() // 默认行为会把焦点收到容器上,反而抢掉 textarea 的
+  el.focus()
+  // 容器上下各有 8px padding,点上沿那条窄缝时甩到文末很突兀:按落点在内容上方还是
+  // 下方分别落到文首/文末。
+  const box = preEl.value?.getBoundingClientRect()
+  const pos = box && e.clientY < box.top ? 0 : editText.value.length
+  el.setSelectionRange(pos, pos)
+}
+
+// ---- 搜索(预览定位 / 编辑态替换共用) ----
 // 关键词/开关从一级搜索带过来时直接沿用,并把搜索行展开:既解释了满屏高亮的来由,
 // 也能就地按上一个/下一个在同一文件的命中间走。
+//
+// 当前屏幕上的原始文本:编辑态是编辑缓冲,预览态是已加载的正文。搜索、行号、
+// 高亮、替换全都按这一份算 —— 早先搜索扫的是 content,编辑态下改过内容再搜,
+// 命中下标属于旧文本、mark 却画在新文本上,标记落点和 N/M 计数都是错的。
+const displayText = computed(() => (editing.value ? editText.value : content.value))
+
 const searchQ = ref(initialQ)
 const searchRegex = ref(route.query.regex === '1')
 const searchCase = ref(route.query.case === '1')
 const searchOpen = ref(Boolean(initialQ)) // 顶部工具栏「搜索」按钮是否展开输入行
-const replaceOpen = ref(false) // 顶部工具栏「替换」按钮是否展开输入行
+const replaceOpen = ref(false) // 顶部工具栏「替换」按钮是否展开「替换为」那一行
 const hits = ref<{ start: number; end: number }[]>([])
 const hitIndex = ref(-1) // -1 = 未定位(无当前命中)
+
+// 查找行(关键词 + 正则/大小写开关 + 上一个/下一个)只有一份,替换直接复用它 ——
+// 两个查找框各写一遍关键词、开关只挂在其中一行上,是纯粹的重复。所以只要搜索或替换
+// 有一个开着,这行就得在;editing 兜一手:退出编辑态后 replaceOpen 不该再撑着它。
+const findOpen = computed(() => searchOpen.value || (editing.value && replaceOpen.value))
+
+// 搜索钮 = 查找行的开关。关掉时连替换一起收:替换离了查找框没法用。
+function toggleSearch() {
+  if (findOpen.value) closeFind()
+  else searchOpen.value = true
+}
+
+// Esc 专用:必须幂等 —— 面板上的 keydown 和输入框里的 keyup 会各来一次,
+// 用 toggleSearch 的话第二次又给开回来了。
+function closeFind() {
+  searchOpen.value = false
+  replaceOpen.value = false
+}
 
 const preEl = ref<HTMLElement | null>(null)
 
@@ -269,11 +309,17 @@ function buildRegex(q: string): RegExp {
 }
 
 // 记录上一次搜索的"指纹"(关键词+开关),用于判断重复点击时是否要"下一个"。
-let lastSig = ''
+// 用 ref 是为了让模板能判断"这次搜索到底跑过没有":命中数/无命中只有在搜过
+// 之后才有意义 —— 光看输入框里有没有字,刚打第一个字就会报"无命中"。
+const lastSig = ref('')
 
 function sigOf() {
   return searchQ.value + '|' + (searchRegex.value ? 1 : 0) + (searchCase.value ? 1 : 0)
 }
+
+// 输入框里的关键词/开关与上次真正搜过的那次一致 —— 不一致(还没搜、或搜完又改了)
+// 就把计数藏起来,免得拿旧结果糊弄当前的关键词。
+const searchDone = computed(() => Boolean(lastSig.value) && sigOf() === lastSig.value)
 
 // 收集全文命中下标。正则模式下 q 可能是后端(Go RE2)编得过、JS 编不过的写法,
 // 也可能是用户正打到一半的半截正则,一律按"无命中"处理,别让异常炸出去。
@@ -288,7 +334,7 @@ function collectHits(q: string): { start: number; end: number }[] {
   }
   let m: RegExpExecArray | null
   // 用 exec 循环收集所有命中下标(RegExp 带 g,lastIndex 自动推进)。
-  while ((m = re.exec(content.value)) !== null) {
+  while ((m = re.exec(displayText.value)) !== null) {
     found.push({ start: m.index, end: m.index + m[0].length })
     // 空命中会死循环:手动推进 lastIndex。
     if (m[0].length === 0) re.lastIndex++
@@ -300,7 +346,7 @@ function doSearch() {
   if (!searchQ.value) {
     hits.value = []
     hitIndex.value = -1
-    lastSig = ''
+    lastSig.value = ''
     return
   }
   // 命中标记只存在于源码视图里,渲染态搜索先切回源码。
@@ -308,12 +354,12 @@ function doSearch() {
   const sig = sigOf()
   hits.value = collectHits(searchQ.value)
   // 关键:若这次与上次是同一查询(关键词/开关都没变),重复点击视为"跳到下一个命中"。
-  if (sig === lastSig && hits.value.length) {
+  if (sig === lastSig.value && hits.value.length) {
     hitIndex.value = (hitIndex.value + 1 + hits.value.length) % hits.value.length
     scrollToHit()
     return
   }
-  lastSig = sig
+  lastSig.value = sig
   hitIndex.value = hits.value.length ? 0 : -1
   scrollToHit()
 }
@@ -328,7 +374,9 @@ function gotoHit(next: number) {
 // class 是直接改 DOM 而不是掺进 displayHtml 的:后者会让每次"上一个/下一个"
 // 都把全文重新过一遍 highlightCode,大文件上按一下卡一下。
 // displayHtml 一变,mark 节点整批重建,current 自然消失,再由这里重新标上。
-function scrollToHit(smooth = true) {
+// scroll=false:只把 current 补回去,不动视口 —— 编辑时每敲一个字 mark 都会重建,
+// 这时候把视口拽到当前命中上会让人没法打字。
+function scrollToHit(smooth = true, scroll = true) {
   requestAnimationFrame(() => {
     const marks = preEl.value?.querySelectorAll<HTMLElement>('mark.hit')
     if (!marks) return
@@ -337,13 +385,32 @@ function scrollToHit(smooth = true) {
     const el = marks[hitIndex.value]
     if (!el) return
     el.classList.add('current')
-    el.scrollIntoView({ block: 'center', behavior: smooth ? 'smooth' : 'auto' })
+    if (scroll) el.scrollIntoView({ block: 'center', behavior: smooth ? 'smooth' : 'auto' })
   })
 }
 
+// 命中下标是"搜索那一刻"算出来的绝对偏移,编辑态下正文每敲一个字就全体失效:
+// 不重收的话 mark 会整体错位、N/M 也不再对得上,而替换用的是当下的 editText。
+// 只在搜过一次(lastSig 非空)之后才跟,免得没用搜索的人白白扫全文。
+watch(displayText, () => {
+  if (!lastSig.value || !searchQ.value) return
+  hits.value = collectHits(searchQ.value)
+  if (hitIndex.value >= hits.value.length) hitIndex.value = hits.value.length - 1
+  scrollToHit(false, false)
+})
+
+// 关键词或开关一改,上次那次搜索的结果就作废:标记和计数一起撤掉,回到"还没搜"的状态。
+// 不这么做的话,屏幕上留着旧关键词的 mark、计数却按新关键词藏了,两边说的不是一回事。
+watch([searchQ, searchRegex, searchCase], () => {
+  if (sigOf() === lastSig.value) return // 改回和上次一样的条件,原结果仍然有效
+  lastSig.value = ''
+  hitIndex.value = -1
+  if (hits.value.length) hits.value = []
+})
+
 // 第 n 行(1 起)在正文里的字符区间,end 指向行末(不含换行)。
 function lineBounds(n: number): { start: number; end: number } {
-  const text = content.value
+  const text = displayText.value
   let start = 0
   for (let i = 1; i < n; i++) {
     const nl = text.indexOf('\n', start)
@@ -368,7 +435,7 @@ function hitAtLine(n: number): number {
 // 正文里一处都不命中(文件已改、或该正则在 JS 里不成立)就退回只滚到行号。
 function highlightFromSearch() {
   hits.value = collectHits(searchQ.value)
-  lastSig = sigOf() // 展开的搜索行里再回车一次 = 下一个,而不是从头再来
+  lastSig.value = sigOf() // 展开的搜索行里再回车一次 = 下一个,而不是从头再来
   if (!hits.value.length) {
     hitIndex.value = -1
     if (targetLine) scrollToLine(targetLine)
@@ -406,19 +473,22 @@ function renderHighlight(text: string): string {
   return out
 }
 
-// 当前展示的原始文本:编辑态取 editText,预览态取 content。
-const displayText = computed(() => (editing.value ? editText.value : content.value))
-
 // 行号 1..N,基于当前展示文本的换行数,编辑态随换行实时更新。
 const gutterLines = computed<number[]>(() => {
   const n = displayText.value.split('\n').length
   return Array.from({ length: n }, (_, i) => i + 1)
 })
 
-// 覆盖层要显示的语法高亮 HTML。
-const displayHtml = computed<string>(() => renderHighlight(displayText.value))
+// 覆盖层要显示的语法高亮 HTML。末尾必须补一个 \n:pre 里最后那个换行不生成行框
+// (`<pre>a\n</pre>` 只有一行高),而 textarea 的值 "a\n" 是实打实的两行。文件基本都以
+// 换行结尾,于是高亮层比 textarea 矮一行,而 .ce-body 的高度就是高亮层的高度 ——
+// height: 100% 的 textarea 也跟着矮一行:最后那行空白行既点不到,光标一旦落到文末
+// 还会让 textarea 自己内部滚一行,从此整层文字和高亮错开,点倒数第二行反而落到末行行首。
+// 补一个换行后,pre 的行框数恒等于 split('\n').length,与行号列、textarea 三边对齐。
+const displayHtml = computed<string>(() => renderHighlight(displayText.value) + '\n')
 
 // ---- 替换(仅编辑模式) ----
+// 查找词与正则/大小写开关都取上面那条查找行,这里只管「替换为」。
 const replaceText = ref('')
 
 function replaceAll() {
@@ -426,10 +496,25 @@ function replaceAll() {
     message.warning('请先输入查找内容')
     return
   }
-  const re = buildRegex(searchQ.value)
+  let re: RegExp
+  try {
+    re = buildRegex(searchQ.value)
+  } catch {
+    // 开着正则时用户可能打了半截表达式,别让异常炸出去。
+    message.error('正则表达式无效')
+    return
+  }
   const count = (editText.value.match(re) || []).length
+  if (!count) {
+    message.warning('没有匹配内容')
+    return
+  }
+  // String.replace 的替换串里 $ 是特殊记号($1 引用捕获组、$& 整个匹配、$$ 一个字面 $)。
+  // 正则模式下这是能力,留着;非正则模式下查找侧已经转义成字面量了,替换侧也得对称,
+  // 否则「把 a 换成 $&」会换出 a 自己。
+  const rep = searchRegex.value ? replaceText.value : replaceText.value.replace(/\$/g, '$$$$')
   pushUndo(true) // 批量替换单独占一帧,一次撤销能整体还原
-  editText.value = editText.value.replace(re, replaceText.value)
+  editText.value = editText.value.replace(re, rep)
   message.success(`已替换 ${count} 处`)
 }
 
@@ -458,8 +543,8 @@ onMounted(load)
           <div class="fv-path" :title="path">{{ name }}</div>
         </div>
         <div class="tom-tools">
-          <n-button v-if="kind === 'text'" quaternary size="small" :type="searchOpen ? 'primary' : 'default'"
-            title="搜索" aria-label="搜索" @click="searchOpen = !searchOpen">
+          <n-button v-if="kind === 'text'" quaternary size="small" :type="findOpen ? 'primary' : 'default'"
+            title="搜索" aria-label="搜索" @click="toggleSearch">
             <template #icon><n-icon :component="SearchOutline" /></template>
           </n-button>
           <n-button v-if="editing" quaternary size="small" :type="replaceOpen ? 'primary' : 'default'"
@@ -502,10 +587,10 @@ onMounted(load)
         </div>
       </div>
 
-      <!-- 搜索输入行:点搜索钮展开 -->
-      <div v-if="searchOpen" class="tom-panel" @keydown.esc="searchOpen = false">
-        <n-input v-model:value="searchQ" size="small" placeholder="搜索当前文件" class="tom-search" clearable
-          @keyup.enter="doSearch" @keyup.esc="searchOpen = false" />
+      <!-- 查找行:搜索钮或替换钮展开。替换共用这里的关键词与正则/大小写开关。 -->
+      <div v-if="findOpen" class="tom-panel" @keydown.esc="closeFind">
+        <n-input v-model:value="searchQ" size="small" :placeholder="replaceOpen ? '查找' : '搜索当前文件'"
+          class="tom-search" clearable @keyup.enter="doSearch" @keyup.esc="closeFind" />
         <n-button size="small" :type="searchRegex ? 'primary' : 'default'" quaternary
           title="正则" aria-label="正则" @click="searchRegex = !searchRegex">.*</n-button>
         <n-button size="small" :type="searchCase ? 'primary' : 'default'" quaternary
@@ -514,8 +599,8 @@ onMounted(load)
           <template #icon><n-icon :component="SearchOutline" /></template>
         </n-button>
         <span class="tom-sep"></span>
-        <span v-if="searchQ && hits.length" class="ft-counter">{{ currentHit }}/{{ hits.length }}</span>
-        <span v-else-if="searchQ && !hits.length" class="ft-nohit">无命中</span>
+        <span v-if="searchDone && hits.length" class="ft-counter">{{ currentHit }}/{{ hits.length }}</span>
+        <span v-else-if="searchDone" class="ft-nohit">无命中</span>
         <n-button size="small" quaternary :disabled="!hits.length" title="上一个" aria-label="上一个" @click="gotoHit(-1)">
           <template #icon><n-icon :component="ChevronUpOutline" /></template>
         </n-button>
@@ -524,15 +609,11 @@ onMounted(load)
         </n-button>
       </div>
 
-      <!-- 替换输入行:点替换钮展开(仅编辑态) -->
+      <!-- 替换行:只放「替换为」,查找词取上面那一行(仅编辑态) -->
       <div v-if="editing && replaceOpen" class="tom-panel" @keydown.esc="replaceOpen = false">
-        <n-input v-model:value="searchQ" size="small" placeholder="查找" class="tom-search" clearable
-          @keyup.enter="doSearch" />
-        <n-button size="small" type="primary" title="查找" aria-label="查找" @click="doSearch">
-          <template #icon><n-icon :component="SearchOutline" /></template>
-        </n-button>
-        <n-input v-model:value="replaceText" size="small" placeholder="替换为" class="tom-search" />
-        <n-button size="small" type="error" title="全部替换" aria-label="全部替换" @click="replaceAll">
+        <n-input v-model:value="replaceText" size="small" placeholder="替换为" class="tom-search"
+          @keyup.enter="replaceAll" @keyup.esc="replaceOpen = false" />
+        <n-button size="small" type="error" :disabled="!searchQ" title="全部替换" aria-label="全部替换" @click="replaceAll">
           <template #icon><n-icon :component="SwapHorizontalOutline" /></template>
         </n-button>
       </div>
@@ -578,7 +659,7 @@ onMounted(load)
       <div v-else-if="mdRendered" class="md-body" v-html="mdHtml"></div>
 
       <!-- 预览/编辑 共用编辑器:高亮 <pre> 打底 + 透明 <textarea> 覆盖,行号在左侧粘性栏。 -->
-      <div v-else ref="editorEl" class="code-editor">
+      <div v-else ref="editorEl" class="code-editor" @mousedown="onEditorMouseDown">
         <div ref="gutterEl" class="ce-gutter">
           <span v-for="n in gutterLines" :key="n">{{ n }}</span>
         </div>
@@ -704,6 +785,9 @@ onMounted(load)
   flex: 1;
   min-height: 0;
   display: flex;
+  /* 必须 flex-start,不能用默认的 stretch:单行 flex 容器高度是确定的,stretch 会把
+     .ce-body 的高度钉成容器高度(cross 轴的 min-height: auto 解析成 0,不按内容兜底),
+     而 textarea 是 height: 100% —— 长文件下半截就没有 textarea 可点了。 */
   align-items: flex-start;
   padding: 8px 0;
   /* 共享字级:pre/code/textarea 全部继承,保证覆盖层像素对齐 */
@@ -730,10 +814,13 @@ onMounted(load)
   background: var(--lr-bg);
 }
 .ce-gutter span { display: block; }
-/* 高亮层:宽度贴合内容,让 textarea 能精确覆盖到行尾。
+/* 高亮层:宽度基准贴合内容(max-content),textarea 才能精确覆盖到行尾。
    pre/code 的 UA 样式自带 font-family: monospace,会盖掉从 .code-editor 继承来的字体,
-   于是高亮层和 textarea 用两种字体、字宽不同 —— 光标就会和文字逐渐错开。font: inherit 打掉它。 */
-.ce-body { position: relative; flex: none; width: max-content; }
+   于是高亮层和 textarea 用两种字体、字宽不同 —— 光标就会和文字逐渐错开。font: inherit 打掉它。
+   flex: 1 0 auto —— max-content 只是"起点":全文都是短行时,余下的宽度得由它 grow 吃掉,
+   否则右边那一大片空白落在 .code-editor 上,textarea 收不到 mousedown,点了不聚焦光标;
+   shrink 保持 0,行比容器长时照旧溢出、由 .code-editor 横向滚动。 */
+.ce-body { position: relative; flex: 1 0 auto; width: max-content; }
 .ce-body pre { margin: 0; white-space: pre; font: inherit; }
 .ce-body pre code { display: block; padding: 0; font: inherit; color: var(--lr-fg); }
 /* 覆盖层 textarea:绝对铺满 .ce-body(= pre 同尺寸),透明文字只留光标。
