@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // 文件浏览器二级页:单个文件的 只读语法高亮预览 / 编辑 视图。
 // 一级(FilesView)点某文件 → 路由到本页,查询参数带 path(绝对路径)与 name(展示标题);
-// 从搜索结果点进来时还带 line(命中行号),进页面后滚到该行。
+// 从搜索结果点进来时还带 line(命中行号)与 q/regex/case(一级用的关键词和开关),
+// 进页面后把关键词的全部命中标出来,当前项落在命中行上 —— 不只是滚到那一行。
 // 图片走 <img>、压缩包走条目列表,都不读正文;markdown 只读时可切换渲染视图。
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -37,6 +38,9 @@ const kind = isImagePath(path) ? 'image' : isArchivePath(path) ? 'archive' : 'te
 const isMd = isMarkdownPath(path)
 // 搜索结果带过来的命中行号(没有则 0)。
 const targetLine = Number(route.query.line) || 0
+// 一级搜索的关键词与开关。带了关键词就在本页复用文件内搜索那套命中标记,
+// 让人落地先看见高亮的内容;点文件名那行进来(没有 line)则定位到第一处命中。
+const initialQ = (route.query.q as string) || ''
 
 // ---- 内容加载 ----
 const content = ref('')
@@ -70,10 +74,11 @@ async function load() {
   } finally {
     loading.value = false
   }
-  // 行号定位要等 DOM 落地,并且必须在源码视图下才有行号栏。
-  if (targetLine && content.value) {
+  // 命中高亮/行号定位都要等 DOM 落地,并且必须在源码视图下才有行号栏与命中标记。
+  if (content.value && (initialQ || targetLine)) {
     await nextTick()
-    scrollToLine(targetLine)
+    if (initialQ) highlightFromSearch()
+    else scrollToLine(targetLine)
   }
 }
 
@@ -118,8 +123,8 @@ function openArchiveRow(row: ArchiveRow) {
 }
 
 // ---- markdown 渲染视图(F7,只读态可切) ----
-// 从搜索结果带行号进来时默认给源码,否则 markdown 默认渲染态。
-const mdRendered = ref(isMd && !targetLine)
+// 从搜索结果进来时默认给源码(命中标记只存在于源码视图),否则 markdown 默认渲染态。
+const mdRendered = ref(isMd && !targetLine && !initialQ)
 const mdHtml = computed(() => (mdRendered.value ? renderMarkdown(content.value) : ''))
 
 // ---- 编辑模式 ----
@@ -245,10 +250,12 @@ function onEditorKeydown(e: KeyboardEvent) {
 }
 
 // ---- 搜索(预览模式,只读定位) ----
-const searchQ = ref('')
-const searchRegex = ref(false)
-const searchCase = ref(false)
-const searchOpen = ref(false) // 顶部工具栏「搜索」按钮是否展开输入行
+// 关键词/开关从一级搜索带过来时直接沿用,并把搜索行展开:既解释了满屏高亮的来由,
+// 也能就地按上一个/下一个在同一文件的命中间走。
+const searchQ = ref(initialQ)
+const searchRegex = ref(route.query.regex === '1')
+const searchCase = ref(route.query.case === '1')
+const searchOpen = ref(Boolean(initialQ)) // 顶部工具栏「搜索」按钮是否展开输入行
 const replaceOpen = ref(false) // 顶部工具栏「替换」按钮是否展开输入行
 const hits = ref<{ start: number; end: number }[]>([])
 const hitIndex = ref(-1) // -1 = 未定位(无当前命中)
@@ -264,6 +271,31 @@ function buildRegex(q: string): RegExp {
 // 记录上一次搜索的"指纹"(关键词+开关),用于判断重复点击时是否要"下一个"。
 let lastSig = ''
 
+function sigOf() {
+  return searchQ.value + '|' + (searchRegex.value ? 1 : 0) + (searchCase.value ? 1 : 0)
+}
+
+// 收集全文命中下标。正则模式下 q 可能是后端(Go RE2)编得过、JS 编不过的写法,
+// 也可能是用户正打到一半的半截正则,一律按"无命中"处理,别让异常炸出去。
+function collectHits(q: string): { start: number; end: number }[] {
+  const found: { start: number; end: number }[] = []
+  if (!q) return found
+  let re: RegExp
+  try {
+    re = buildRegex(q)
+  } catch {
+    return found
+  }
+  let m: RegExpExecArray | null
+  // 用 exec 循环收集所有命中下标(RegExp 带 g,lastIndex 自动推进)。
+  while ((m = re.exec(content.value)) !== null) {
+    found.push({ start: m.index, end: m.index + m[0].length })
+    // 空命中会死循环:手动推进 lastIndex。
+    if (m[0].length === 0) re.lastIndex++
+  }
+  return found
+}
+
 function doSearch() {
   if (!searchQ.value) {
     hits.value = []
@@ -273,25 +305,16 @@ function doSearch() {
   }
   // 命中标记只存在于源码视图里,渲染态搜索先切回源码。
   mdRendered.value = false
-  const sig = searchQ.value + '|' + (searchRegex.value ? 1 : 0) + (searchCase.value ? 1 : 0)
-  const re = buildRegex(searchQ.value)
-  const found: { start: number; end: number }[] = []
-  let m: RegExpExecArray | null
-  // 用 exec 循环收集所有命中下标(RegExp 带 g,lastIndex 自动推进)。
-  while ((m = re.exec(content.value)) !== null) {
-    found.push({ start: m.index, end: m.index + m[0].length })
-    // 空命中会死循环:手动推进 lastIndex。
-    if (m[0].length === 0) re.lastIndex++
-  }
-  hits.value = found
+  const sig = sigOf()
+  hits.value = collectHits(searchQ.value)
   // 关键:若这次与上次是同一查询(关键词/开关都没变),重复点击视为"跳到下一个命中"。
-  if (sig === lastSig && found.length) {
-    hitIndex.value = (hitIndex.value + 1 + found.length) % found.length
+  if (sig === lastSig && hits.value.length) {
+    hitIndex.value = (hitIndex.value + 1 + hits.value.length) % hits.value.length
     scrollToHit()
     return
   }
   lastSig = sig
-  hitIndex.value = found.length ? 0 : -1
+  hitIndex.value = hits.value.length ? 0 : -1
   scrollToHit()
 }
 
@@ -301,13 +324,58 @@ function gotoHit(next: number) {
   scrollToHit()
 }
 
-function scrollToHit() {
+// 定位当前命中:滚到它,并把 .current 记在它身上(其余命中只留浅底色)。
+// class 是直接改 DOM 而不是掺进 displayHtml 的:后者会让每次"上一个/下一个"
+// 都把全文重新过一遍 highlightCode,大文件上按一下卡一下。
+// displayHtml 一变,mark 节点整批重建,current 自然消失,再由这里重新标上。
+function scrollToHit(smooth = true) {
   requestAnimationFrame(() => {
-    if (hitIndex.value < 0 || hitIndex.value >= hits.value.length) return
     const marks = preEl.value?.querySelectorAll<HTMLElement>('mark.hit')
-    const el = marks?.[hitIndex.value]
-    el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    if (!marks) return
+    marks.forEach((m) => m.classList.remove('current'))
+    if (hitIndex.value < 0 || hitIndex.value >= hits.value.length) return
+    const el = marks[hitIndex.value]
+    if (!el) return
+    el.classList.add('current')
+    el.scrollIntoView({ block: 'center', behavior: smooth ? 'smooth' : 'auto' })
   })
+}
+
+// 第 n 行(1 起)在正文里的字符区间,end 指向行末(不含换行)。
+function lineBounds(n: number): { start: number; end: number } {
+  const text = content.value
+  let start = 0
+  for (let i = 1; i < n; i++) {
+    const nl = text.indexOf('\n', start)
+    if (nl < 0) return { start: text.length, end: text.length }
+    start = nl + 1
+  }
+  const nl = text.indexOf('\n', start)
+  return { start, end: nl < 0 ? text.length : nl }
+}
+
+// 落地该把哪一处设成当前:先找命中行上的第一处,退而找该行之后的第一处,
+// 再退到全文第一处 —— 文件可能在搜索之后被改过,行号未必还对得上。
+function hitAtLine(n: number): number {
+  const { start, end } = lineBounds(n)
+  const onLine = hits.value.findIndex((h) => h.start >= start && h.start <= end)
+  if (onLine >= 0) return onLine
+  const after = hits.value.findIndex((h) => h.start >= start)
+  return after >= 0 ? after : 0
+}
+
+// 从一级搜索结果进页:标出关键词的全部命中,当前项落在命中行那一处。
+// 正文里一处都不命中(文件已改、或该正则在 JS 里不成立)就退回只滚到行号。
+function highlightFromSearch() {
+  hits.value = collectHits(searchQ.value)
+  lastSig = sigOf() // 展开的搜索行里再回车一次 = 下一个,而不是从头再来
+  if (!hits.value.length) {
+    hitIndex.value = -1
+    if (targetLine) scrollToLine(targetLine)
+    return
+  }
+  hitIndex.value = targetLine ? hitAtLine(targetLine) : 0
+  scrollToHit(false) // 刚进页面直接落位,不做跨半个文件的平滑滚动
 }
 
 const currentHit = computed(() =>
@@ -713,6 +781,12 @@ onMounted(load)
   border-radius: 2px;
   padding: 0;
 }
+/* 当前命中(上一个/下一个走到的那处、从搜索结果跳进来落在的那处):
+   底色更重并描边,一屏几十处高亮时也能立刻认出停在哪。 */
+.ce-body mark.hit.current {
+  background: rgba(255, 145, 0, 0.6);
+  box-shadow: 0 0 0 1px rgba(217, 108, 0, 0.9);
+}
 /* markdown 渲染视图(F7):v-html 注入的节点同样不带 scope 属性,须用全局样式。
    配色一律走 --lr-* 令牌或 rgba,浅/深主题自动适配,不必再写一份深色覆盖。 */
 .md-body {
@@ -796,6 +870,10 @@ onMounted(load)
   .ce-body .hljs-built_in { color: #7bd5ff; }
   .ce-body .hljs-type, .ce-body .hljs-class, .ce-body .hljs-selector-id { color: #9bb8ff; }
   .ce-body mark.hit { background: rgba(255, 213, 0, 0.35); }
+  .ce-body mark.hit.current {
+    background: rgba(255, 145, 0, 0.5);
+    box-shadow: 0 0 0 1px rgba(255, 176, 66, 0.9);
+  }
   .md-body .hljs-attr, .md-body .hljs-selector-tag, .md-body .hljs-name { color: #f7797b; }
   .md-body .hljs-keyword, .md-body .hljs-selector-class, .md-body .hljs-meta { color: #d88cf6; }
   .md-body .hljs-string, .md-body .hljs-regexp, .md-body .hljs-addition { color: #8fcc7a; }

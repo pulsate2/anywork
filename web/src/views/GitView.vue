@@ -819,11 +819,13 @@ watch(() => store.currentPath, (p) => {
   display: flex; align-items: center; gap: 6px; cursor: pointer;
   padding: 8px 10px; background: rgba(127, 127, 127, 0.08);
 }
+/* 这个列表是唯一能看全路径的地方(二级页标题也是一行省略号),所以长路径换行
+   铺开,不再用 rtl + 省略号截掉开头。overflow-wrap: anywhere 只在单个路径段自身
+   就撑满一行时才在段内断开,平时断点落在 / 上。 */
 .diff-path {
   flex: 1; min-width: 0;
   font-family: ui-monospace, monospace; font-size: 12px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  direction: rtl; text-align: left;
+  overflow-wrap: anywhere;
 }
 .diff-add { flex: none; color: #16a34a; font-size: 12px; }
 .diff-del { flex: none; color: var(--lr-danger); font-size: 12px; }

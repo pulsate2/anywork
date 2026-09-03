@@ -5,16 +5,18 @@ import { useRouter } from "vue-router"
 import {
 	NButton, NIcon, NEmpty, NSpin,
 	NInput, NModal, useMessage, useDialog,
-	NTag, NList, NListItem, NSelect, NRadioGroup, NRadioButton,
+	NTag, NList, NListItem, NSelect, NRadioGroup, NRadioButton, NCheckbox,
 	NDropdown, type DropdownOption, type DropdownDividerOption,
 } from "naive-ui"
 import { ArrowBackOutline,
 	CreateOutline, TrashOutline, SearchOutline, DownloadOutline,
 	CloudUploadOutline, AddOutline, ArrowUpOutline, ArrowDownOutline,
 	SwapHorizontalOutline, CloseOutline, EllipsisVerticalOutline,
-	CopyOutline, ArrowForwardOutline } from "@vicons/ionicons5"
-import { api, type FsEntry, type FsSearchResult } from "@/api/client"
+	CopyOutline, ArrowForwardOutline, ClipboardOutline,
+	CheckboxOutline } from "@vicons/ionicons5"
+import { api, type FsEntry, type FsOp, type FsSearchResult } from "@/api/client"
 import { fileIcon, isArchivePath, isImagePath } from "@/utils/fileIcon"
+import { copyText } from "@/utils/clipboard"
 import { useWorkspaceStore } from "@/stores/workspace"
 import DirTreePicker from "@/components/DirTreePicker.vue"
 
@@ -91,6 +93,8 @@ async function load(dir: string) {
 			entries.value = await api.fsList(target)
 		}
 		cwd.value = target
+		// 勾选存的是绝对 path,换目录(或刷新当前目录)后旧的全部失效,留着会删错东西。
+		selected.value.clear()
 		store.setLastDir(target)
 	} catch (e: any) {
 		message.error(e?.message || "加载失败")
@@ -124,13 +128,87 @@ async function doOp(op: any) {
 		message.error(e?.message || "操作失败")
 	}
 }
-function remove(e: FsEntry) {
+// ---- 批量执行 ----
+// doOp 每次都弹 toast + reload,放进循环会刷屏也会刷爆列表。批量走这条:
+// 串行跑完再汇总一次。串行而不并发:后端是同一个进程在动同一棵目录树,
+// 并发只会让"哪几项失败了"更难归因,几十项的量级串行也够快。
+const batchRunning = ref(false)
+const batchDone = ref(0)
+const batchTotal = ref(0)
+
+// 名字最多列 3 个,再多了只报数 —— toast 太长在手机上会糊满半屏。
+function names(list: string[]) {
+	return list.length > 3 ? `${list.slice(0, 3).join("、")} 等 ${list.length} 项` : list.join("、")
+}
+
+async function runBatch(verb: string, items: FsEntry[], make: (e: FsEntry) => FsOp) {
+	if (!items.length || batchRunning.value) return
+	batchRunning.value = true
+	batchDone.value = 0
+	batchTotal.value = items.length
+	const failed: string[] = []
+	let firstErr = ""
+	for (const e of items) {
+		try {
+			await api.fsOp(make(e))
+		} catch (err: any) {
+			failed.push(e.name)
+			if (!firstErr) firstErr = err?.message || ""
+		}
+		batchDone.value++
+	}
+	batchRunning.value = false
+	const ok = items.length - failed.length
+	if (!failed.length) {
+		message.success(items.length === 1 ? `已${verb}「${items[0].name}」` : `已${verb} ${ok} 项`)
+	} else if (items.length === 1) {
+		// 单条时把后端的原话透出来,这是用户唯一能拿到的线索。
+		message.error(firstErr || `${verb}失败`)
+	} else if (!ok) {
+		message.error(`${verb}失败:${names(failed)}${firstErr ? `(${firstErr})` : ""}`)
+	} else {
+		message.warning(`已${verb} ${ok} 项,${failed.length} 项失败:${names(failed)}`)
+	}
+	load(cwd.value)
+}
+
+// ---- 删除 ----
+// 后端是 os.RemoveAll(internal/fs/ops.go),目录连整棵子树一起删,没有回收站也没有 undo,
+// 所以和 Git 的「撤回改动」对齐,过两道:第一道说清删的是什么,第二道只强调不可撤销。
+// 不去数目录里有多少条:那要多打一次 fsList 还得处理它失败,文案点明"连里面的全部内容"
+// 已经把风险讲清了。
+function deleteScope(items: FsEntry[]) {
+	if (items.length === 1) {
+		const e = items[0]
+		return e.dir
+			? `将删除文件夹「${e.name}」,连里面的全部内容一起删。`
+			: `将删除「${e.name}」。`
+	}
+	const dirs = items.filter((e) => e.dir).length
+	const files = items.length - dirs
+	const parts: string[] = []
+	if (files) parts.push(`${files} 个文件`)
+	if (dirs) parts.push(`${dirs} 个文件夹`)
+	return `将删除 ${parts.join("、")}${dirs ? "(文件夹会连里面的全部内容一起删)" : ""}。`
+}
+
+function confirmDelete(items: FsEntry[]) {
+	if (!items.length) return
+	const what = items.length === 1 ? `「${items[0].name}」` : `这 ${items.length} 项`
 	dialog.warning({
 		title: "删除",
-		content: "确定删除「" + e.name + "」?",
-		positiveText: "删除",
+		content: deleteScope(items) + "删除后无法恢复。",
+		positiveText: "继续",
 		negativeText: "取消",
-		onPositiveClick: () => doOp({ op: "delete", path: e.path }),
+		onPositiveClick: () => {
+			dialog.error({
+				title: "再次确认",
+				content: `确定删除${what}?此操作不可撤销。`,
+				positiveText: "确定删除",
+				negativeText: "返回",
+				onPositiveClick: () => runBatch("删除", items, (e) => ({ op: "delete", path: e.path })),
+			})
+		},
 	})
 }
 // ---- 新建 / 重命名 ----
@@ -183,16 +261,70 @@ function download(e: FsEntry) {
 function downloadZip() {
 	window.open(api.fsArchiveUrl(cwd.value))
 }
+// ---- 复制路径 ----
+// 相对路径以工作区根为基准:终端就是在这个目录起的,Git 也以它为仓库根,
+// 复制出来的路径粘到命令行里直接能用。没选工作区时它等于服务端根目录。
+// 面包屑能一路走到工作区上面去,那时用 ../ 回退 —— 一个叫"相对路径"的菜单项
+// 不该突然吐出绝对路径。
+function relativeTo(base: string, target: string): string {
+	const b = trimSlash(base).split("/").filter(Boolean)
+	const t = trimSlash(target).split("/").filter(Boolean)
+	let i = 0
+	while (i < b.length && i < t.length && b[i] === t[i]) i++
+	const up: string[] = Array(b.length - i).fill("..")
+	return [...up, ...t.slice(i)].join("/") || "."
+}
+
+async function copyPath(e: FsEntry, kind: "rel" | "abs") {
+	const text = kind === "abs" ? trimSlash(e.path) : relativeTo(store.currentPath, e.path)
+	const label = kind === "abs" ? "绝对路径" : "相对路径"
+	if (await copyText(text)) message.success(`已复制${label}`)
+	// 写不进剪贴板时(非安全上下文 + execCommand 也被拦)至少把内容摆出来。
+	else message.warning(`浏览器不给写剪贴板:${text}`)
+}
+
+// ---- 批量选择 ----
+// 入口是工具栏那个开关钮。开着的时候整行点击变成勾选、三点菜单收起来,
+// 一行仍然只有一个触控目标(手指粗,别在一行里塞两个热区)。
+const selectMode = ref(false)
+const selected = ref<Set<string>>(new Set())
+// 只认当前目录里还在的项:选完之后别人删掉了文件,刷新后勾选自动作废。
+const selectedEntries = computed(() => sortedEntries.value.filter((e) => selected.value.has(e.path)))
+const allSelected = computed(() =>
+	sortedEntries.value.length > 0 && selectedEntries.value.length === sortedEntries.value.length)
+const batchDisabled = computed(() => !selectedEntries.value.length || batchRunning.value)
+
+function toggleSelectMode() {
+	selectMode.value = !selectMode.value
+	if (!selectMode.value) selected.value.clear()
+}
+function toggleSelect(e: FsEntry) {
+	if (selected.value.has(e.path)) selected.value.delete(e.path)
+	else selected.value.add(e.path)
+}
+function toggleSelectAll() {
+	if (allSelected.value) selected.value.clear()
+	else for (const e of sortedEntries.value) selected.value.add(e.path)
+}
+function onRowClick(e: FsEntry) {
+	if (selectMode.value) toggleSelect(e)
+	else openEntry(e)
+}
+
 // ---- 行操作菜单 ----
 // 全部收进三点菜单:一行只留一个触控目标,移动端不会误点到删除。
+// 只读的(下载/复制路径)放前面,改动文件的放后面,中间用分隔线隔开。
 function rowMenu(e: FsEntry): Array<DropdownOption | DropdownDividerOption> {
 	const icon = (c: Component, color?: string) => () => h(NIcon, { component: c, color })
 	const out: Array<DropdownOption | DropdownDividerOption> = []
 	if (!e.dir) out.push({ key: "download", label: "下载", icon: icon(DownloadOutline) })
+	out.push({ key: "copy-rel", label: "复制相对路径", icon: icon(ClipboardOutline) })
+	out.push({ key: "copy-abs", label: "复制绝对路径", icon: icon(ClipboardOutline) })
+	out.push({ key: "sep-1", type: "divider" })
 	out.push({ key: "rename", label: "重命名", icon: icon(CreateOutline) })
 	out.push({ key: "copy", label: "复制到…", icon: icon(CopyOutline) })
 	out.push({ key: "move", label: "移动到…", icon: icon(ArrowForwardOutline) })
-	out.push({ key: "sep", type: "divider" })
+	out.push({ key: "sep-2", type: "divider" })
 	// 弹层 teleport 到 body,scoped 样式选不中,危险色只能内联。
 	out.push({
 		key: "delete", label: "删除",
@@ -204,69 +336,87 @@ function rowMenu(e: FsEntry): Array<DropdownOption | DropdownDividerOption> {
 
 function onRowMenu(key: string | number, e: FsEntry) {
 	if (key === "download") download(e)
+	else if (key === "copy-rel") copyPath(e, "rel")
+	else if (key === "copy-abs") copyPath(e, "abs")
 	else if (key === "rename") openRename(e)
-	else if (key === "copy") openTransfer("copy", e)
-	else if (key === "move") openTransfer("move", e)
-	else if (key === "delete") remove(e)
+	else if (key === "copy") openTransfer("copy", [e])
+	else if (key === "move") openTransfer("move", [e])
+	else if (key === "delete") confirmDelete([e])
 }
 
 // ---- 复制 / 移动 ----
 // 选目标目录用的是新建工作区那套目录树,默认展开到当前目录。
+// 单条(行菜单)和批量(操作条)都走这里,单条就是长度 1 的一组,只留一条代码路径。
 const transferShowing = ref(false)
 const transferMode = ref<"copy" | "move">("copy")
-const transferTarget = ref<FsEntry | null>(null)
+const transferItems = ref<FsEntry[]>([])
 const transferDir = ref("")
 const transferChecking = ref(false)
 
-function openTransfer(mode: "copy" | "move", e: FsEntry) {
+function openTransfer(mode: "copy" | "move", items: FsEntry[]) {
+	if (!items.length) return
 	transferMode.value = mode
-	transferTarget.value = e
+	transferItems.value = [...items]
 	transferDir.value = cwd.value
 	transferShowing.value = true
 }
 
-// 后端 Copy/Move 的 dst 是含最终名字的完整路径,不是父目录。
+const transferDest = computed(() => trimSlash(transferDir.value.trim()))
+const transferNames = computed(() => names(transferItems.value.map((e) => e.name)))
+// 后端 Copy/Move 的 dst 是含最终名字的完整路径,不是父目录:每项各自拼一个。
+// 一项时把落点全路径显示出来,多项时只报目标目录 —— 逐条铺开占不下。
 const transferTo = computed(() => {
-	const e = transferTarget.value
-	const dir = trimSlash(transferDir.value.trim())
-	return e && dir ? joinPath(dir, e.name) : ""
+	const dir = transferDest.value
+	const list = transferItems.value
+	if (!dir || !list.length) return ""
+	return list.length === 1 ? joinPath(dir, list[0].name) : dir
 })
 
 // 后端不挡这两种:原地复制会被 os.Create 截成空文件;目录进自己的子树会无限递归。
+// 批量里只要有一项犯规就整个禁掉,并指名是哪一项 —— 否则用户只能一个个试。
 const transferError = computed(() => {
-	const e = transferTarget.value
-	const to = transferTo.value
-	if (!e || !to) return ""
-	const from = trimSlash(e.path)
-	if (to === from) return "目标目录就是当前位置"
-	if (e.dir && to.startsWith(from + "/")) return "不能放进自己的子目录"
+	const dir = transferDest.value
+	const list = transferItems.value
+	if (!dir || !list.length) return ""
+	const who = (e: FsEntry) => (list.length === 1 ? "" : `(${e.name})`)
+	for (const e of list) {
+		const from = trimSlash(e.path)
+		const to = joinPath(dir, e.name)
+		if (to === from) return "目标目录就是当前位置" + who(e)
+		if (e.dir && to.startsWith(from + "/")) return "不能放进自己的子目录" + who(e)
+	}
 	return ""
 })
 
 async function submitTransfer() {
-	const e = transferTarget.value
-	const to = transferTo.value
-	if (!e || !to || transferError.value) return
+	const list = transferItems.value
+	const dir = transferDest.value
+	if (!list.length || !dir || transferError.value) return
 	// 同名会被直接盖掉(copy 走 os.Create,move 在 Linux 上也是覆盖),先问一句。
+	// 只打一次 fsList:拿目标目录的名字集跟所选名字求交集。
 	transferChecking.value = true
-	let clash = false
+	let clash: string[] = []
 	try {
-		clash = (await api.fsList(trimSlash(transferDir.value.trim()))).some((it) => it.name === e.name)
+		const there = new Set((await api.fsList(dir)).map((it) => it.name))
+		clash = list.filter((e) => there.has(e.name)).map((e) => e.name)
 	} catch {
 		// 目标目录读不到就别拦,让后端去报真正的错
 	} finally {
 		transferChecking.value = false
 	}
 	const verb = transferMode.value === "copy" ? "复制" : "移动"
-	const run = () => doOp({ op: transferMode.value, from: e.path, to })
+	const op = transferMode.value
+	const run = () => runBatch(verb, list, (e) => ({ op, from: e.path, to: joinPath(dir, e.name) }))
 	transferShowing.value = false
-	if (!clash) {
+	if (!clash.length) {
 		run()
 		return
 	}
 	dialog.warning({
 		title: "目标已存在",
-		content: `目标目录里已有「${e.name}」,继续会覆盖它。`,
+		content: clash.length === 1
+			? `目标目录里已有「${clash[0]}」,继续会覆盖它。`
+			: `目标目录里已有 ${clash.length} 个同名项(${names(clash)}),继续会覆盖它们。`,
 		positiveText: "覆盖" + verb,
 		negativeText: "取消",
 		onPositiveClick: run,
@@ -386,6 +536,8 @@ function segments(r: FsSearchResult) {
 }
 
 // 点命中项:目录进目录,文件跳单独文件页(带上行号让它定位到命中行)。
+// 关键词和开关一并带过去:二级页要把命中标出来,而不是只把视口滚到那一行。
+// 只有内容模式才带 —— 文件名模式的关键词未必出现在正文里,标出来只会误导。
 function openHit(g: { path: string; rel: string; dir: boolean; size: number }, line?: number) {
 	if (g.dir) {
 		load(g.path)
@@ -394,6 +546,11 @@ function openHit(g: { path: string; rel: string; dir: boolean; size: number }, l
 	}
 	const query: Record<string, string> = { path: g.path, name: g.rel }
 	if (line) query.line = String(line)
+	if (searchMode.value === "content" && searchQ.value) {
+		query.q = searchQ.value
+		if (searchRegex.value) query.regex = "1"
+		if (searchCase.value) query.case = "1"
+	}
 	router.push({ path: "/files/file", query })
 }
 
@@ -451,6 +608,11 @@ function up() {
 			<div class="fs-toolbar">
 				<n-button quaternary size="small" :disabled="atRoot" aria-label="上一级" @click="up">
 					<template #icon><n-icon :component="ArrowBackOutline" /></template>
+				</n-button>
+				<n-button quaternary size="small" :type="selectMode ? 'primary' : 'default'"
+					:title="selectMode ? '退出选择' : '批量选择'" :aria-label="selectMode ? '退出选择' : '批量选择'"
+					:aria-pressed="selectMode" @click="toggleSelectMode">
+					<template #icon><n-icon :component="CheckboxOutline" /></template>
 				</n-button>
 				<n-button quaternary size="small" aria-label="新建" @click="openNew">
 					<template #icon><n-icon :component="AddOutline" /></template>
@@ -532,17 +694,43 @@ function up() {
 			<span class="fs-count">{{ entries.length }} 项</span>
 		</div>
 
+		<!-- 批量操作条:吸顶在列表上方,长列表滚下去按钮也还在手边 -->
+		<div v-if="selectMode" class="fs-batch">
+			<n-checkbox :checked="allSelected" :indeterminate="!allSelected && selectedEntries.length > 0"
+				:disabled="!sortedEntries.length || batchRunning" @update:checked="toggleSelectAll">全选</n-checkbox>
+			<span class="fs-batch-n">{{ batchRunning
+				? `${batchDone}/${batchTotal}`
+				: `已选 ${selectedEntries.length} 项` }}</span>
+			<div class="spacer"></div>
+			<div class="fs-batch-ops">
+				<n-button size="tiny" secondary :disabled="batchDisabled" @click="openTransfer('copy', selectedEntries)">
+					<template #icon><n-icon :component="CopyOutline" /></template>复制
+				</n-button>
+				<n-button size="tiny" secondary :disabled="batchDisabled" @click="openTransfer('move', selectedEntries)">
+					<template #icon><n-icon :component="ArrowForwardOutline" /></template>移动
+				</n-button>
+				<n-button size="tiny" type="error" secondary :disabled="batchDisabled" @click="confirmDelete(selectedEntries)">
+					<template #icon><n-icon :component="TrashOutline" /></template>删除
+				</n-button>
+			</div>
+		</div>
+
 		<n-spin :show="loading">
 			<div v-if="sortedEntries.length" class="fs-list">
-				<div v-for="e in sortedEntries" :key="e.path" class="fs-item" role="button" tabindex="0"
-					@click="openEntry(e)" @keydown.enter="openEntry(e)">
+				<div v-for="e in sortedEntries" :key="e.path" class="fs-item"
+					:class="{ picked: selectMode && selected.has(e.path) }"
+					:role="selectMode ? 'checkbox' : 'button'"
+					:aria-checked="selectMode ? selected.has(e.path) : undefined"
+					tabindex="0" @click="onRowClick(e)" @keydown.enter="onRowClick(e)">
+					<!-- 纯视觉指示:pointer-events 关掉,点哪儿都由整行接管,免得点在框上切两次 -->
+					<n-checkbox v-if="selectMode" class="fs-check" :checked="selected.has(e.path)" :focusable="false" />
 					<n-icon class="fs-ico" :component="fileIcon(e.path, e.dir).icon" :color="fileIcon(e.path, e.dir).color" />
 					<div class="fs-name">
 						<span class="fs-name-text">{{ e.name }}</span>
 						<n-tag v-if="e.symlink" size="small" type="warning" :bordered="false">link</n-tag>
 					</div>
 					<span class="fs-size">{{ e.dir ? "" : sizeHuman(e.size) }}</span>
-					<div class="fs-actions">
+					<div v-if="!selectMode" class="fs-actions">
 						<n-dropdown trigger="click" placement="bottom-end" size="large" :options="rowMenu(e)"
 							@select="(k) => onRowMenu(k, e)">
 							<n-button class="fs-btn" size="tiny" quaternary aria-label="更多操作" @click.stop>
@@ -580,7 +768,9 @@ function up() {
 		<!-- 复制 / 移动 -->
 		<n-modal v-model:show="transferShowing" preset="card" class="dir-modal"
 			:title="transferMode === 'copy' ? '复制到' : '移动到'">
-			<div class="transfer-src">{{ transferTarget?.name }}</div>
+			<div class="transfer-src">{{ transferItems.length === 1
+				? transferItems[0].name
+				: `已选 ${transferItems.length} 项:${transferNames}` }}</div>
 			<dir-tree-picker v-model="transferDir" placeholder="目标目录" default-open />
 			<div class="transfer-to" :class="{ bad: !!transferError }">{{ transferError || transferTo }}</div>
 			<template #footer>
@@ -627,6 +817,8 @@ function up() {
 	border-radius: var(--lr-radius);
 	cursor: pointer;
 }
+/* 勾中的行:边框 + 淡底色。移动端看不见 hover,选中态得足够显眼。 */
+.fs-item.picked { border-color: var(--lr-accent); background: rgba(37, 99, 235, 0.1); }
 .fs-ico { flex: none; font-size: 18px; }
 .fs-name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; font-weight: 500; }
 .fs-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -674,6 +866,21 @@ function up() {
 .search-replace { display: flex; gap: 6px; margin: 6px 0; }
 .fs-sort { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
 .fs-count { color: var(--lr-fg-muted); font-size: 12px; }
+/* 批量操作条:整页是文档滚动(App 里没有 overflow 容器),所以 top: 0 就贴在视口顶上。
+   窄屏放不下三个按钮时靠 flex-wrap 折成两行,而不是把按钮挤成图标。 */
+.fs-batch {
+	position: sticky; top: 0; z-index: 5;
+	display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+	margin-top: 8px; padding: 6px 8px;
+	background: var(--lr-bg-elevated);
+	border: 1px solid rgba(127, 127, 127, 0.2);
+	border-radius: var(--lr-radius);
+}
+.fs-batch-n { color: var(--lr-fg-muted); font-size: 12px; }
+.fs-batch-ops { display: flex; align-items: center; gap: 6px; }
+/* 同 .fs-btn:压掉全局 .n-button 的 44px 下限,否则吸顶条会顶掉一大截列表 */
+.fs-batch .n-button { min-height: 34px; height: 34px; }
+.fs-check { flex: none; pointer-events: none; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
 .name-modal { width: min(420px, calc(100vw - 32px)); }
 .dir-modal { width: min(460px, calc(100vw - 32px)); }

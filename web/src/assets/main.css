@@ -45,6 +45,13 @@ body {
 /* 触控友好:让组件库按钮/输入框达到 44px 下限 */
 .n-button { min-height: var(--lr-touch); }
 .n-input { min-height: var(--lr-touch); }
+/* n-input 是 inline-flex 且没写 align-items(默认 stretch),里面的 <input> 自带
+   height/line-height: var(--n-height)(size=small 只有 28px),被这条 44px 下限撑高后
+   它只会贴在盒子顶部 —— 文字看着没垂直居中就是这么来的,size 越小偏得越明显。
+   居中交给外层:内层那 28px 整体(前后缀图标、清除钮都在里面)一起居中,
+   边框/背景是绝对定位的 __border,仍占满 44px,外观不变。
+   textarea 的 __textarea-el 是 height: 100% 撑满的,靠 stretch 才对,排除在外。 */
+.n-input:not(.n-input--textarea) { align-items: center; }
 
 /* 导航条:移动端固定在底部,桌面端在下面的 @media 里竖成左侧栏 */
 .bottom-nav {
