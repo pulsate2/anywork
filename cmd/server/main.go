@@ -226,6 +226,8 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/git/commit", a.git.Commit)
 		pr.Post("/api/git/push", a.git.Push)
 		pr.Post("/api/git/pull", a.git.Pull)
+		pr.Post("/api/git/fetch", a.git.Fetch)
+		pr.Post("/api/git/remote", a.git.Remote)
 		pr.Post("/api/git/branch", a.git.Branch)
 		pr.Post("/api/git/stash", a.git.Stash)
 		pr.Post("/api/git/worktree", a.git.Worktree)

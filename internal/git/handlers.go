@@ -168,6 +168,39 @@ func (h *Handlers) Pull(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"out": out})
 }
+
+// Fetch 只更新远端跟踪引用,不合并。body: {path, remote?}。
+func (h *Handlers) Fetch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path   string `json:"path"`
+		Remote string `json:"remote"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	out, err := h.svc.Fetch(body.Path, body.Remote)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"out": out})
+}
+
+// Remote 远端管理。op: add|remove|rename|set-url;value 是 URL 或新名字。
+func (h *Handlers) Remote(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path  string `json:"path"`
+		Op    string `json:"op"`
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	out, err := h.svc.RemoteOp(body.Path, body.Op, body.Name, body.Value)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"out": out})
+}
+
 func (h *Handlers) Branch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path  string `json:"path"`

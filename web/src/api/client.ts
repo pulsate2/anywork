@@ -111,6 +111,12 @@ export const api = {
   gitPush: (path: string, opt?: { remote?: string; branch?: string; setUpstream?: boolean }) =>
     request<{ out: string }>('POST', '/api/git/push', { path, ...opt }),
   gitPull: (path: string) => request<{ out: string }>('POST', '/api/git/pull', { path }),
+  // 只更新远端跟踪引用(refs/remotes/*),不合并 —— 状态里的 ↓behind 靠它才有意义:
+  // git status 不联网,而 pull 内部虽然也 fetch,但紧接着就合并掉了。remote 空 = 所有远端。
+  gitFetch: (path: string, remote?: string) => request<{ out: string }>('POST', '/api/git/fetch', { path, remote }),
+  // 远端管理。value:add/set-url 时是 URL,rename 时是新名字,remove 不用。
+  gitRemote: (path: string, op: RemoteOp, name: string, value?: string) =>
+    request<{ out: string }>('POST', '/api/git/remote', { path, op, name, value }),
   // 回填 git 交互认证的用户名/密码(连接已在 WS 中保持)。空值 = 取消。
   gitAuthAnswer: (token: string, username?: string, password?: string) =>
     request<{ ok: boolean }>('POST', '/api/git/auth/answer', { token, username, password }),
@@ -308,6 +314,9 @@ export interface GitRemote {
   name: string
   url: string
 }
+
+// 远端管理的操作,与后端 Service.RemoteOp 的 op 一一对应。
+export type RemoteOp = 'add' | 'remove' | 'rename' | 'set-url'
 
 export type AiApp = 'claude' | 'codex'
 

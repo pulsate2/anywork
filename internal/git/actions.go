@@ -124,6 +124,77 @@ func (s *Service) Pull(p string) (string, error) {
 	return s.remoteOpRun(info.Root, "pull", "--ff-only")
 }
 
+// Fetch 只更新远端跟踪引用(refs/remotes/*),不动工作区也不合并。
+// 存在的意义是让状态里的 ↓behind 有意义:git status 从不联网,它比的是本地那份
+// 远端跟踪引用,而这份引用只有 fetch 会更新 —— pull 虽然内部也 fetch,但紧接着就
+// 合并掉了,所以光用 pull 的话 behind 永远是 0。
+// --prune 顺手清掉远端已删除分支留下的本地引用;remote 为空时抓所有远端。
+func (s *Service) Fetch(p, remote string) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.Repo {
+		return "", ErrNotRepo
+	}
+	if err := checkRefArgs(remote); err != nil {
+		return "", err
+	}
+	args := []string{"fetch", "--prune"}
+	if remote != "" {
+		args = append(args, remote)
+	} else {
+		args = append(args, "--all")
+	}
+	return s.remoteOpRun(info.Root, args...)
+}
+
+// RemoteOp 远端管理。op: add|remove|rename|set-url。
+// value 是第二个参数:add/set-url 时是 URL,rename 时是新名字。
+// 名字和 URL 都过 checkRefArgs:以 - 开头会被 git 当成选项。
+func (s *Service) RemoteOp(p, op, name, value string) (string, error) {
+	if err := s.allowWrite(); err != nil {
+		return "", err
+	}
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.Repo {
+		return "", ErrNotRepo
+	}
+	if err := checkRefArgs(name, value); err != nil {
+		return "", err
+	}
+	if name == "" {
+		return "", errBadRemoteArg
+	}
+	switch op {
+	case "add":
+		// 空 URL git 是收的,存下来就是个死远端,这里直接拦掉。
+		if value == "" {
+			return "", errBadRemoteArg
+		}
+		return s.run(info.Root, nil, "remote", "add", name, value)
+	case "remove":
+		return s.run(info.Root, nil, "remote", "remove", name)
+	case "rename":
+		if value == "" {
+			return "", errBadRemoteArg
+		}
+		return s.run(info.Root, nil, "remote", "rename", name, value)
+	case "set-url":
+		if value == "" {
+			return "", errBadRemoteArg
+		}
+		return s.run(info.Root, nil, "remote", "set-url", name, value)
+	}
+	return "", errUnknownRemoteOp
+}
+
 // remoteOpRun push/pull 执行 git;有 broker 时走交互式凭据(runWithCreds)。
 func (s *Service) remoteOpRun(root string, args ...string) (string, error) {
 	if s.broker != nil {

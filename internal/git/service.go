@@ -58,6 +58,8 @@ var (
 	errUnknownWorktreeOp  = errors.New("unknown worktree op")
 	errUnknownRestoreMode = errors.New("unknown restore mode")
 	errUnknownRevertOp    = errors.New("unknown revert op")
+	errUnknownRemoteOp    = errors.New("unknown remote op")
+	errBadRemoteArg       = errors.New("remote name and url required")
 	errBadRefArg          = errors.New("invalid branch or remote name")
 	errBadCommitArg       = errors.New("invalid commit hash")
 	errBinaryFile         = errors.New("binary cannot be read")

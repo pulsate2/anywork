@@ -10,7 +10,7 @@ import {
 import {
   GitCompareOutline, GitCommitOutline, GitBranchOutline, CloudUploadOutline, CloudDownloadOutline,
   TrashOutline, CheckmarkOutline, ChevronDownOutline, ChevronForwardOutline,
-  ArrowUndoOutline,
+  ArrowUndoOutline, SyncOutline, GitNetworkOutline, SaveOutline,
 } from '@vicons/ionicons5'
 import {
   api, type GitStatus, type GitEntry, type GitCommit, type GitRepo,
@@ -69,6 +69,15 @@ const pushBranch = ref('')
 const pushUpstream = ref(false)
 const pushing = ref(false)
 const pulling = ref(false)
+const fetching = ref(false)
+
+// 远端管理:行内编辑,每个远端一份可改的名字/地址副本,按原名字做 key。
+// 存副本而不是直接改 remotes,是为了跟原值比出该跑 rename 还是 set-url(或两个都跑)。
+const showRemote = ref(false)
+const remoteBusy = ref(false)
+const remoteEdits = ref<Record<string, { name: string; url: string }>>({})
+const newRemoteName = ref('')
+const newRemoteUrl = ref('')
 
 // git 交互认证:远端要求账号密码时,WS 推 ask 事件 → 打开独立顶层弹窗 →
 // 用户填用户名/密码 → POST answer 回填,放行被阻塞的 push/pull。
@@ -325,7 +334,9 @@ async function openPush() {
   // 没有上游时默认带 -u,否则首次推送会被 git 拒绝。
   pushUpstream.value = !status.value?.upstream
   try {
-    remotes.value = await api.gitRemotes(repoPath.value)
+    // 走 loadRemotes 而不是直接赋 remotes:远端弹窗的行内编辑副本按 remotes 的名字取,
+    // 两边必须同时更新,否则它那边会读到不存在的键。
+    await loadRemotes()
     if (!pushRemote.value) {
       pushRemote.value = remotes.value.find((r) => r.name === 'origin')?.name
         ?? remotes.value[0]?.name ?? null
@@ -367,6 +378,109 @@ async function doPull() {
     pulling.value = false
   }
 }
+async function doFetch() {
+  fetching.value = true
+  try {
+    const res = await api.gitFetch(repoPath.value)
+    await reload()
+    // fetch 的进度全在 stderr,out 基本是空的;真正的结果是刷新后的 ↓behind。
+    const b = status.value?.behind ?? 0
+    message.success(b > 0 ? `已获取,落后 ${b} 个提交` : '已获取,没有新提交')
+    if (res.out.trim()) dialog.info({ title: '获取结果', content: res.out })
+  } catch (e: any) {
+    message.error(e?.message || '获取失败')
+  } finally {
+    fetching.value = false
+  }
+}
+
+// ---- 远端管理 ----
+async function loadRemotes() {
+  remotes.value = await api.gitRemotes(repoPath.value)
+  remoteEdits.value = Object.fromEntries(
+    remotes.value.map((r) => [r.name, { name: r.name, url: r.url }]))
+}
+
+async function openRemote() {
+  showRemote.value = true
+  try {
+    await loadRemotes()
+  } catch (e: any) {
+    message.error(e?.message || '读取远端失败')
+  }
+}
+
+// 改过名字或地址才让保存钮亮起来。
+function remoteDirty(r: GitRemote) {
+  const ed = remoteEdits.value[r.name]
+  if (!ed) return false
+  const name = ed.name.trim()
+  const url = ed.url.trim()
+  return Boolean(name) && Boolean(url) && (name !== r.name || url !== r.url)
+}
+
+// 保存一行:改名和改地址是 git 里两条命令,按需各跑一次。
+// 顺序不能反 —— 先 rename,set-url 就得用新名字了。
+async function saveRemote(r: GitRemote) {
+  const ed = remoteEdits.value[r.name]
+  if (!ed || !remoteDirty(r)) return
+  const name = ed.name.trim()
+  const url = ed.url.trim()
+  remoteBusy.value = true
+  try {
+    if (name !== r.name) await api.gitRemote(repoPath.value, 'rename', r.name, name)
+    if (url !== r.url) await api.gitRemote(repoPath.value, 'set-url', name, url)
+    message.success('已保存')
+    await loadRemotes()
+    await reload() // 改名会带着上游一起改,状态栏那行要跟着刷
+  } catch (e: any) {
+    message.error(e?.message || '保存失败')
+    await loadRemotes() // 可能 rename 成了、set-url 没成,重读一遍免得界面说谎
+  } finally {
+    remoteBusy.value = false
+  }
+}
+
+async function addRemote() {
+  const name = newRemoteName.value.trim()
+  const url = newRemoteUrl.value.trim()
+  if (!name || !url) return
+  remoteBusy.value = true
+  try {
+    await api.gitRemote(repoPath.value, 'add', name, url)
+    newRemoteName.value = ''
+    newRemoteUrl.value = ''
+    message.success('已添加')
+    await loadRemotes()
+  } catch (e: any) {
+    message.error(e?.message || '添加失败')
+  } finally {
+    remoteBusy.value = false
+  }
+}
+
+// 删远端只动本地配置(不碰远端服务器上的东西),一道确认够了;
+// 但要说清连带影响:跟踪它的分支会失去上游。
+function deleteRemote(r: GitRemote) {
+  dialog.warning({
+    title: '删除远端',
+    content: `确定删除远端 ${r.name}(${r.url})?本地跟踪它的分支会失去上游,远端仓库本身不受影响。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await api.gitRemote(repoPath.value, 'remove', r.name)
+        message.success('已删除')
+        if (pushRemote.value === r.name) pushRemote.value = null
+        await loadRemotes()
+        await reload()
+      } catch (e: any) {
+        message.error(e?.message || '删除失败')
+      }
+    },
+  })
+}
+
 async function openBranch() {
   showBranch.value = true
   try {
@@ -499,8 +613,16 @@ watch(() => store.currentPath, (p) => {
           aria-label="拉取" @click="doPull">
           <template #icon><n-icon :component="CloudDownloadOutline" /></template>
         </n-button>
+        <!-- 只更新远端跟踪引用,不合并 —— 上面那行的 ↓behind 靠它才会动。 -->
+        <n-button quaternary size="small" :disabled="!repo?.repo || fetching" :loading="fetching" title="获取远端"
+          aria-label="获取远端" @click="doFetch">
+          <template #icon><n-icon :component="SyncOutline" /></template>
+        </n-button>
         <n-button quaternary size="small" :disabled="!repo?.repo" title="分支" aria-label="分支" @click="openBranch">
           <template #icon><n-icon :component="GitBranchOutline" /></template>
+        </n-button>
+        <n-button quaternary size="small" :disabled="!repo?.repo" title="远端" aria-label="远端" @click="openRemote">
+          <template #icon><n-icon :component="GitNetworkOutline" /></template>
         </n-button>
       </div>
     </div>
@@ -760,6 +882,32 @@ watch(() => store.currentPath, (p) => {
       <div v-else class="branch-loading">加载中…</div>
     </n-modal>
 
+    <!-- 远端:行内改名字/地址,保存时按需跑 rename / set-url -->
+    <n-modal v-model:show="showRemote" preset="card" title="远端" style="width: 92%; max-width: 560px">
+      <div class="branch-new">
+        <n-input v-model:value="newRemoteName" size="small" placeholder="名字(如 origin)" />
+        <n-input v-model:value="newRemoteUrl" size="small" placeholder="地址(https:// 或 git@)" />
+        <n-button size="small" type="primary" :disabled="!newRemoteName.trim() || !newRemoteUrl.trim() || remoteBusy"
+          @click="addRemote">添加</n-button>
+      </div>
+      <n-empty v-if="!remotes.length" description="还没有远端" size="small" style="padding: 16px 0" />
+      <div v-else class="branch-sect">
+        <div v-for="r in remotes" :key="r.name" class="remote-item">
+          <n-input v-model:value="remoteEdits[r.name].name" size="small" class="remote-name" placeholder="名字" />
+          <n-button class="git-btn" size="tiny" quaternary type="primary" :disabled="!remoteDirty(r) || remoteBusy"
+            title="保存" aria-label="保存" @click="saveRemote(r)">
+            <n-icon :component="SaveOutline" />
+          </n-button>
+          <n-button class="git-btn" size="tiny" quaternary type="error" :disabled="remoteBusy" title="删除远端"
+            aria-label="删除远端" @click="deleteRemote(r)">
+            <n-icon :component="TrashOutline" />
+          </n-button>
+          <n-input v-model:value="remoteEdits[r.name].url" size="small" class="remote-url" placeholder="地址" />
+        </div>
+      </div>
+      <div class="git-hint">删除只改本地配置,远端仓库本身不受影响。</div>
+    </n-modal>
+
 
   </div>
 </template>
@@ -768,7 +916,8 @@ watch(() => store.currentPath, (p) => {
 .git-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
 .git-header h2 { margin: 0; font-size: 20px; }
 .git-ws { color: var(--lr-fg-muted); font-size: 12px; margin-top: 2px; }
-.git-toolbar { display: flex; gap: 2px; }
+/* 7 个图标钮在窄屏(360px)上放不下一行,让它换行并靠右收边。 */
+.git-toolbar { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px; }
 .git-meta { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
 .git-sub {
   color: var(--lr-fg-muted); font-size: 12px;
@@ -862,6 +1011,13 @@ watch(() => store.currentPath, (p) => {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .branch-loading { padding: 16px 0; text-align: center; color: var(--lr-fg-muted); font-size: 12px; }
+/* 远端一行:第一行是名字 + 保存 + 删除,地址单独占第二行(URL 太长,挤一行没法看)。 */
+.remote-item {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 4px 6px;
+  padding: 8px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.14);
+}
+.remote-name { min-width: 0; }
+.remote-url { grid-column: 1 / -1; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
 
 </style>
