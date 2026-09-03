@@ -7,8 +7,6 @@ import { BackspaceOutline, ReturnDownForwardOutline } from '@vicons/ionicons5'
 
 const props = defineProps<{
   onKey: (key: string) => void
-  // 让 xterm 的隐藏输入框失焦。软键盘处于收起状态时点本键盘条要调用它,见 onBarTouch。
-  onBlurInput?: () => void
 }>()
 
 // 粘滞修饰符:Ctrl / Alt / Shift。点一下激活,点下一个键后自动清除。
@@ -18,6 +16,37 @@ const stickyShift = ref(false)
 
 function send(seq: string) {
   props.onKey(applySticky(seq))
+}
+
+// ---- 按键手势 ----
+// 所有键都走 pointerdown + preventDefault,一个 click 都不用。理由有三条,缺一不可:
+//
+// 1. click 是在手指抬起时按「抬起位置命中的元素」派发的。软键盘一开一合会让整页重排
+//    (WebView 那类浏览器直接把 layout viewport 变矮),键盘条在按下和抬起之间移了位置,
+//    click 就落到别的元素上 —— 表现正是「点快捷键没反应,键盘还闪一下」。
+//    pointerdown 在按下那一刻就发,重排还没发生,不会丢。
+// 2. preventDefault 掉 pointerdown 会连带取消后面的 mousedown,焦点因此不会从 xterm 的
+//    隐藏输入框上跑掉:软键盘不收起,粘滞的 Ctrl/Alt 还能和软键盘上的字母组合(Ctrl+C)。
+// 3. 焦点从头到尾没动过,也就不存在「焦点回来时输入法又被顶起来」那一下闪动。
+//    所以这里不再嗅探软键盘是开是关(那个判断只在 Chrome 的 resizes-visual 行为下成立,
+//    在 WebView 上永远算出 0,反而每次触摸都去 blur,才是这条路上真正的 bug)。
+//
+// 代价是 :active 那套原生按下反馈没了(它跟着被取消的鼠标事件走),自己加 is-down 类补上。
+function mark(e: PointerEvent, on: boolean) {
+  (e.currentTarget as HTMLElement | null)?.classList.toggle('is-down', on)
+}
+
+// key 发一次按键;hold=true 的键(方向键)按住连发。
+function key(e: PointerEvent, seq: string, hold = false) {
+  mark(e, true)
+  if (hold) holdStart(seq)
+  else send(seq)
+}
+
+// tap 给不发字符、只切状态的键(Ctrl/Alt/Shift/符号面板)。
+function tap(e: PointerEvent, fn: () => void) {
+  mark(e, true)
+  fn()
 }
 
 // ---- 方向键长按连发 ----
@@ -93,75 +122,64 @@ function detectTouch() {
   isTouch.value = 'ontouchstart' in window || navigator.maxTouchPoints > 0
 }
 
-// ---- 软键盘可见性 ----
-// Android 上软键盘收起后,xterm 的隐藏 textarea 依然是 document.activeElement。
-// 此后任何一次点击手势都会被 Chrome 当作"点在已聚焦的可编辑元素上"而把输入法重新弹出,
-// 于是"键盘收起时点 Ctrl 又把键盘顶起来"。mousedown.prevent 拦不住:输入法是随手势
-// 弹出的,不是随焦点变化弹出的,而且 mousedown 比手势识别晚。
-// 所以在 touchstart(手势识别之前)判断:软键盘已收起就先 blur,让页面上没有可聚焦的
-// 编辑元素。软键盘打开时绝不 blur —— 否则粘滞修饰符没法再和软键盘上的字母组合(Ctrl+C)。
-const IME_MIN_HEIGHT = 120
-const imeOpen = ref(false)
+// ---- 松手 ----
+// 统一挂在 window 上而不是每个按钮上:手指/鼠标在别处松开时按钮自己收不到 pointerup,
+// 那样连发会停不下来、按下态也会留着不消。
+const barEl = ref<HTMLDivElement>()
 
-function syncIme() {
-  const vv = window.visualViewport
-  if (!vv) return
-  // 未声明 interactive-widget,Chrome 默认 resizes-visual:键盘只压缩 visual viewport,
-  // 与 layout viewport(innerHeight)的差值就是键盘高度。阈值过滤掉地址栏收缩(~56px)。
-  imeOpen.value = window.innerHeight - vv.height > IME_MIN_HEIGHT
-}
-
-function onBarTouch() {
-  if (!imeOpen.value) props.onBlurInput?.()
+function releaseAll() {
+  holdStop()
+  barEl.value?.querySelectorAll('.is-down').forEach((el) => el.classList.remove('is-down'))
 }
 
 onMounted(() => {
   detectTouch()
-  if (isTouch.value) window.visualViewport?.addEventListener('resize', syncIme)
+  window.addEventListener('pointerup', releaseAll)
+  window.addEventListener('pointercancel', releaseAll)
 })
 onUnmounted(() => {
   holdStop()
-  window.visualViewport?.removeEventListener('resize', syncIme)
+  window.removeEventListener('pointerup', releaseAll)
+  window.removeEventListener('pointercancel', releaseAll)
 })
 
 defineExpose({ applySticky })
 </script>
 
 <template>
-  <!-- mousedown.prevent:阻止按键抢走 xterm 隐藏输入框的焦点,否则一点 Ctrl
-       系统软键盘就收起来了,粘滞修饰符也就没法配合软键盘上的字母。
-       touchstart:软键盘已收起时反过来主动放掉焦点,免得这一下手势又把输入法顶起来。 -->
-  <div v-if="isTouch" class="term-kbd" @mousedown.prevent @touchstart="onBarTouch">
+  <!-- touchstart.prevent 在根上兜一道:彻底掐掉这次手势的默认动作(合成 click、
+       双击缩放、以及「点一下已聚焦的编辑框就重新弹输入法」那条路)。按键动作本身
+       在 pointerdown 里做完了,不依赖 click —— 见 script 里 key() 上面那段。 -->
+  <div v-if="isTouch" ref="barEl" class="term-kbd" @touchstart.prevent @mousedown.prevent>
     <div v-if="showSymbols" class="kbd-grid symbols">
-      <button v-for="s in symbols" :key="s" class="kbd" @click="send(s)">{{ s }}</button>
+      <button v-for="s in symbols" :key="s" class="kbd" @pointerdown.prevent="key($event, s)">{{ s }}</button>
     </div>
 
     <!-- 7 列均分网格,按 DOM 顺序自动填两行。方向键不额外占块:
          ↑ 落在上排第 6 格,←↓→ 落在下排第 5~7 格,倒 T 形由网格位置自然形成。 -->
     <div class="kbd-grid keys">
-      <button class="kbd" @click="send('\x1b')">Esc</button>
-      <button class="kbd" @click="send('\t')">Tab</button>
-      <button class="kbd" @click="showSymbols = !showSymbols">?#</button>
-      <button class="kbd" @click="send('\x1b[H')">Home</button>
-      <button class="kbd" @click="send('\x1b[F')">End</button>
-      <button class="kbd" title="上(长按连发)" @pointerdown.prevent="holdStart('\x1b[A')"
-        @pointerup="holdStop" @pointercancel="holdStop" @pointerleave="holdStop">↑</button>
-      <button class="kbd" aria-label="Backspace" @click="send('\x7f')">
+      <button class="kbd" @pointerdown.prevent="key($event, '\x1b')">Esc</button>
+      <button class="kbd" @pointerdown.prevent="key($event, '\t')">Tab</button>
+      <button class="kbd" @pointerdown.prevent="tap($event, () => showSymbols = !showSymbols)">?#</button>
+      <button class="kbd" @pointerdown.prevent="key($event, '\x1b[H')">Home</button>
+      <button class="kbd" @pointerdown.prevent="key($event, '\x1b[F')">End</button>
+      <button class="kbd" title="上(长按连发)" @pointerdown.prevent="key($event, '\x1b[A', true)">↑</button>
+      <button class="kbd" aria-label="Backspace" @pointerdown.prevent="key($event, '\x7f')">
         <n-icon :component="BackspaceOutline" />
       </button>
 
-      <button class="kbd mod" :class="{ on: stickyCtrl }" @click="stickyCtrl = !stickyCtrl">Ctrl</button>
-      <button class="kbd mod" :class="{ on: stickyAlt }" @click="stickyAlt = !stickyAlt">Alt</button>
-      <button class="kbd mod" :class="{ on: stickyShift }" @click="stickyShift = !stickyShift">Shift</button>
-      <button class="kbd accent" aria-label="Enter" @click="send('\r')">
+      <button class="kbd mod" :class="{ on: stickyCtrl }"
+        @pointerdown.prevent="tap($event, () => stickyCtrl = !stickyCtrl)">Ctrl</button>
+      <button class="kbd mod" :class="{ on: stickyAlt }"
+        @pointerdown.prevent="tap($event, () => stickyAlt = !stickyAlt)">Alt</button>
+      <button class="kbd mod" :class="{ on: stickyShift }"
+        @pointerdown.prevent="tap($event, () => stickyShift = !stickyShift)">Shift</button>
+      <button class="kbd accent" aria-label="Enter" @pointerdown.prevent="key($event, '\r')">
         <n-icon :component="ReturnDownForwardOutline" />
       </button>
-      <button class="kbd" title="左(长按连发)" @pointerdown.prevent="holdStart('\x1b[D')"
-        @pointerup="holdStop" @pointercancel="holdStop" @pointerleave="holdStop">←</button>
-      <button class="kbd" title="下(长按连发)" @pointerdown.prevent="holdStart('\x1b[B')"
-        @pointerup="holdStop" @pointercancel="holdStop" @pointerleave="holdStop">↓</button>
-      <button class="kbd" title="右(长按连发)" @pointerdown.prevent="holdStart('\x1b[C')"
-        @pointerup="holdStop" @pointercancel="holdStop" @pointerleave="holdStop">→</button>
+      <button class="kbd" title="左(长按连发)" @pointerdown.prevent="key($event, '\x1b[D', true)">←</button>
+      <button class="kbd" title="下(长按连发)" @pointerdown.prevent="key($event, '\x1b[B', true)">↓</button>
+      <button class="kbd" title="右(长按连发)" @pointerdown.prevent="key($event, '\x1b[C', true)">→</button>
     </div>
   </div>
 </template>
@@ -179,6 +197,9 @@ defineExpose({ applySticky })
   gap: 6px;
   z-index: 20;
   user-select: none;
+  /* 按键动作全在 pointerdown 上,不需要浏览器的手势识别;关掉它顺手免掉
+     拖动被当成平移(会发 pointercancel,把方向键的连发掐断)。 */
+  touch-action: none;
 }
 .kbd-grid {
   display: grid;
@@ -203,6 +224,14 @@ defineExpose({ applySticky })
 .kbd:active { background: var(--lr-accent); color: #fff; }
 .kbd.mod.on { background: var(--lr-accent); color: #fff; border-color: var(--lr-accent); }
 .kbd.accent { background: var(--lr-accent); color: #fff; border-color: var(--lr-accent); }
+/* 按下反馈:pointerdown 被 preventDefault 之后原生 :active 不一定还来,自己标一个类。
+   选择器要压得住 .mod.on / .accent,不然已经点亮的修饰键再按看不出反应。 */
+.term-kbd .kbd.is-down {
+  background: var(--lr-accent);
+  color: #fff;
+  border-color: var(--lr-accent);
+  filter: brightness(1.25);
+}
 /* 符号面板列更多、键更矮,单独一套尺寸 */
 .symbols { grid-template-columns: repeat(10, minmax(0, 1fr)); }
 .symbols .kbd { height: 32px; font-size: 12px; }

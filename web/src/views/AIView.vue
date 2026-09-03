@@ -6,7 +6,10 @@ import {
   NButton, NEmpty, NInput, NModal, NPopconfirm, NSelect, NSpin, NTag, useMessage,
 } from 'naive-ui'
 import { api, type AiApp, type AiProvider } from '@/api/client'
-import { API_KEY_PLACEHOLDER, categoryLabel, fillKey, presetsFor } from '@/config/aiPresets'
+import {
+  API_KEY_PLACEHOLDER, MODEL_PLACEHOLDER,
+  categoryLabel, fillTemplate, hasPlaceholder, presetsFor, type PlaceholderName,
+} from '@/config/aiPresets'
 
 // 两套 CLI 各有各的配置落点,切换条的两个档位就是它们。
 const APPS: { value: AiApp; label: string }[] = [
@@ -28,11 +31,21 @@ const editCategory = ref('custom')
 const editSite = ref('')
 const presetName = ref<string | null>(null)
 const apiKey = ref('')
+const modelName = ref('')
+const baseUrl = ref('')
 const configText = ref('')
 const authText = ref('')
 const saving = ref(false)
 
 const keyHint = `保存时替换配置里的 ${API_KEY_PLACEHOLDER}`
+const baseUrlHint = `供应商给的接口地址,如 https://api.example.com`
+// claude 那边一个模型名要钉四个字段(含 haiku/sonnet/opus 别名),所以正文里写占位符,
+// 这个输入框一填全改到。
+const modelHint = computed(() =>
+  app.value === 'claude'
+    ? `一次填好 4 个模型字段(${MODEL_PLACEHOLDER});留空则不钉模型`
+    : `替换 config.toml 里的 ${MODEL_PLACEHOLDER};留空则不钉模型`,
+)
 
 const activeApp = computed(() => APPS.find((a) => a.value === app.value) ?? APPS[0])
 
@@ -43,10 +56,13 @@ const presetOptions = computed(() =>
   })),
 )
 
-// 正文里还留着占位符才需要填 key;编辑已有配置时里面是真值,这个输入框就不出现了。
-const needsKey = computed(
-  () => configText.value.includes(API_KEY_PLACEHOLDER) || authText.value.includes(API_KEY_PLACEHOLDER),
-)
+// 正文里还留着占位符才需要填对应的输入框;编辑已有配置时里面是真值,这些框就不出现了。
+function needs(name: PlaceholderName): boolean {
+  return hasPlaceholder(configText.value, name) || hasPlaceholder(authText.value, name)
+}
+const needsKey = computed(() => needs('API_KEY'))
+const needsModel = computed(() => needs('MODEL'))
+const needsBaseUrl = computed(() => needs('BASE_URL'))
 
 // 当前生效的排最前,切换时不用满屏找。
 const sorted = computed(() =>
@@ -88,6 +104,8 @@ function resetForm() {
   editSite.value = ''
   presetName.value = null
   apiKey.value = ''
+  modelName.value = ''
+  baseUrl.value = ''
   configText.value = app.value === 'claude' ? JSON.stringify({ env: {} }, null, 2) : ''
   authText.value = app.value === 'claude' ? '' : '{}'
 }
@@ -131,18 +149,28 @@ function applyPreset(name: string | null) {
   editSite.value = p.websiteUrl
   configText.value = p.config
   authText.value = p.auth ?? ''
+  // 预设自带的模型名只是默认值,直接改这个框就换模型,不用动下面的正文。
+  modelName.value = p.model ?? ''
+  // 端点是跟着预设走的,换预设就别把上一家的地址留下;Key 是用户自己的,留着。
+  baseUrl.value = ''
 }
 
-// buildConfig 把编辑框拼成后端要的载荷,API Key 只在这里替换一次。
+// buildConfig 把编辑框拼成后端要的载荷,占位符只在这里替换一次。
 function buildConfig(): unknown {
-  const conf = fillKey(configText.value, apiKey.value)
+  const v = { key: apiKey.value, model: modelName.value, baseUrl: baseUrl.value }
+  const conf = fillTemplate(configText.value, v)
   if (app.value === 'claude') return JSON.parse(conf.trim() || '{}')
-  const auth = fillKey(authText.value, apiKey.value).trim()
+  const auth = fillTemplate(authText.value, v).trim()
   return { auth: auth ? JSON.parse(auth) : {}, config: conf }
 }
 async function save() {
   if (!editName.value.trim()) {
     message.warning('请填配置名')
+    return
+  }
+  // 端点没填就等于把 base_url 写空,配置直接是坏的 —— 拦在这里。
+  if (needsBaseUrl.value && !baseUrl.value.trim()) {
+    message.warning('请填接口地址')
     return
   }
   let config: unknown
@@ -306,9 +334,17 @@ onMounted(load)
           :placeholder="`选一个 ${activeApp.label} 供应商自动填好,也可以全手填`" @update:value="applyPreset" />
         <label>配置名</label>
         <n-input v-model:value="editName" placeholder="如 Kimi / 公司代理" />
+        <template v-if="needsBaseUrl">
+          <label>接口地址</label>
+          <n-input v-model:value="baseUrl" :placeholder="baseUrlHint" />
+        </template>
         <template v-if="needsKey">
           <label>API Key</label>
           <n-input v-model:value="apiKey" type="password" show-password-on="click" :placeholder="keyHint" />
+        </template>
+        <template v-if="needsModel">
+          <label>模型</label>
+          <n-input v-model:value="modelName" :placeholder="modelHint" />
         </template>
         <template v-if="app === 'claude'">
           <label>settings.json</label>
