@@ -13,7 +13,7 @@ import { ArrowBackOutline,
 	CloudUploadOutline, AddOutline, ArrowUpOutline, ArrowDownOutline,
 	SwapHorizontalOutline, CloseOutline, EllipsisVerticalOutline,
 	CopyOutline, ArrowForwardOutline, ClipboardOutline,
-	CheckboxOutline } from "@vicons/ionicons5"
+	CheckboxOutline, ArchiveOutline, FolderOpenOutline } from "@vicons/ionicons5"
 import { api, type FsEntry, type FsOp, type FsSearchResult } from "@/api/client"
 import { fileIcon, isArchivePath, isImagePath } from "@/utils/fileIcon"
 import { copyText } from "@/utils/clipboard"
@@ -324,6 +324,10 @@ function rowMenu(e: FsEntry): Array<DropdownOption | DropdownDividerOption> {
 	out.push({ key: "rename", label: "重命名", icon: icon(CreateOutline) })
 	out.push({ key: "copy", label: "复制到…", icon: icon(CopyOutline) })
 	out.push({ key: "move", label: "移动到…", icon: icon(ArrowForwardOutline) })
+	// 解压只对认得的压缩包给;压缩只对文件夹给 —— 单个文件单独压意义不大,
+	// 真要压就进选择模式勾上它,批量那条路本来就通。
+	if (!e.dir && isArchivePath(e.path)) out.push({ key: "extract", label: "解压", icon: icon(FolderOpenOutline) })
+	if (e.dir) out.push({ key: "zip", label: "压缩…", icon: icon(ArchiveOutline) })
 	out.push({ key: "sep-2", type: "divider" })
 	// 弹层 teleport 到 body,scoped 样式选不中,危险色只能内联。
 	out.push({
@@ -341,6 +345,8 @@ function onRowMenu(key: string | number, e: FsEntry) {
 	else if (key === "rename") openRename(e)
 	else if (key === "copy") openTransfer("copy", [e])
 	else if (key === "move") openTransfer("move", [e])
+	else if (key === "extract") extract(e)
+	else if (key === "zip") openZip([e])
 	else if (key === "delete") confirmDelete([e])
 }
 
@@ -420,6 +426,185 @@ async function submitTransfer() {
 		positiveText: "覆盖" + verb,
 		negativeText: "取消",
 		onPositiveClick: run,
+	})
+}
+// ---- 压缩 ----
+// 行菜单里只给文件夹,批量选择时在操作条上给。落点是当前目录,名字和格式可选。
+// 后端一次收下所有源(不像复制/移动那样一项一个请求):包只能一次写完,
+// 中途失败就整个不留,没有"压了一半"这种状态。
+//
+// 能压的格式比能解的少:bz2 只有解码器,7z/rar 没有能用的纯 Go 写入实现。
+// 后端认的是 dest 的后缀,所以这里选中的格式就是补在名字后面的那截后缀。
+const zipFormats = ["zip", "tar.gz", "tar.xz", "tar"] as const
+const zipShowing = ref(false)
+const zipItems = ref<FsEntry[]>([])
+const zipName = ref("")
+// 不随弹窗重置:连着压几个包时通常是同一种格式。
+const zipFormat = ref<(typeof zipFormats)[number]>("zip")
+const zipRunning = ref(false)
+const zipInput = ref<InstanceType<typeof NInput> | null>(null)
+const zipInvalid = computed(() => /[\\/]/.test(zipName.value))
+const zipItemNames = computed(() => names(zipItems.value.map((e) => e.name)))
+// 输入框里只放名字,后缀由格式决定 —— 名字和实际格式不会打架。
+const zipDest = computed(() => {
+	const n = stripArchiveExt(zipName.value.trim())
+	return n ? joinPath(cwd.value, n + "." + zipFormat.value) : ""
+})
+
+// 只去掉认得的包后缀:note.txt 原样留着(压出 note.txt.zip,和 macOS 一致),
+// old.tar.gz 改压成 zip 时不会变成 old.tar.gz.zip。双后缀要排在单后缀前面。
+const archiveExts = [
+	".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".tbz", ".txz",
+	".zip", ".tar", ".7z", ".rar", ".gz", ".bz2", ".xz",
+]
+function stripArchiveExt(name: string) {
+	const l = name.toLowerCase()
+	for (const ext of archiveExts) {
+		if (l.endsWith(ext) && name.length > ext.length) return name.slice(0, -ext.length)
+	}
+	return name
+}
+
+function openZip(items: FsEntry[]) {
+	if (!items.length || zipRunning.value) return
+	zipItems.value = [...items]
+	// 一项用它自己的名字,多项用当前目录名 —— 跟桌面文管的习惯一致。
+	zipName.value = items.length === 1
+		? items[0].name
+		: trimSlash(cwd.value).split("/").filter(Boolean).pop() || "archive"
+	zipShowing.value = true
+}
+
+function focusZip() {
+	zipInput.value?.focus()
+}
+
+function submitZip() {
+	const items = zipItems.value
+	const dest = zipDest.value
+	if (!items.length || !dest || zipInvalid.value || zipRunning.value) return
+	const name = dest.slice(dest.lastIndexOf("/") + 1)
+	zipShowing.value = false
+	const run = async () => {
+		zipRunning.value = true
+		loading.value = true
+		try {
+			await api.fsCompress(dest, items.map((e) => e.path))
+			message.success(`已压缩到「${name}」`)
+		} catch (e: any) {
+			message.error(e?.message || "压缩失败")
+		} finally {
+			zipRunning.value = false
+			loading.value = false
+		}
+		load(cwd.value)
+	}
+	// 包名撞上现有条目:同名文件会被换掉,同名文件夹后端根本写不进去。
+	const clash = entries.value.find((e) => e.name === name)
+	if (!clash) {
+		run()
+		return
+	}
+	if (clash.dir) {
+		message.error(`同名文件夹「${name}」已存在,换个包名`)
+		return
+	}
+	dialog.warning({
+		title: "目标已存在",
+		content: `当前目录里已有「${name}」,继续会覆盖它。`,
+		positiveText: "覆盖",
+		negativeText: "取消",
+		onPositiveClick: run,
+	})
+}
+
+// ---- 解压 ----
+// 解到同目录下一个以包名命名的文件夹里(note.tar.gz → note/),不直接铺在当前目录:
+// 包里若有几十个顶层文件,铺开就收不回来了。单文件压缩(note.txt.gz)例外,
+// 里面就一个文件,套一层反而多余 —— 和 gunzip 的行为一致。
+const extracting = ref(false)
+
+// 双后缀要整段去掉,否则 note.tar.gz 会解到 note.tar/ 里。
+function archiveBase(name: string) {
+	const lower = name.toLowerCase()
+	for (const s of [".tar.gz", ".tar.bz2", ".tar.xz"]) {
+		if (lower.endsWith(s)) return name.slice(0, -s.length)
+	}
+	const dot = name.lastIndexOf(".")
+	return dot > 0 ? name.slice(0, dot) : name
+}
+
+// .gz/.bz2/.xz 是"压一个文件",.tar.gz / .tgz 这些是"压一包文件"。
+function isSingleFileArchive(name: string) {
+	const l = name.toLowerCase()
+	if (/\.tar\.(gz|bz2|xz)$/.test(l)) return false
+	return /\.(gz|bz2|xz)$/.test(l)
+}
+
+// 单文件压缩解出来的名字:和后端 extractSingle 一致(去掉最后一段后缀,空则 data)。
+function singleTarget(name: string) {
+	const dot = name.lastIndexOf(".")
+	return (dot > 0 ? name.slice(0, dot) : "") || "data"
+}
+
+async function runExtract(e: FsEntry, dest: string, label: string) {
+	if (extracting.value) return
+	extracting.value = true
+	// 行菜单里没有按钮可以挂 loading,借列表那圈 spin 当进度提示。
+	loading.value = true
+	try {
+		await api.fsExtract(dest, e.path)
+		message.success(`已解压到「${label}」`)
+	} catch (err: any) {
+		message.error(err?.message || "解压失败")
+	} finally {
+		extracting.value = false
+		loading.value = false
+	}
+	// 失败也刷:解压不是原子的,可能已经落了一部分文件,列表得说实话。
+	load(cwd.value)
+}
+
+function extract(e: FsEntry) {
+	if (extracting.value) return
+	if (isSingleFileArchive(e.name)) {
+		const target = singleTarget(e.name)
+		const clash = entries.value.find((it) => it.name === target)
+		if (clash?.dir) {
+			message.error(`同名文件夹「${target}」已存在,请先重命名它`)
+			return
+		}
+		if (!clash) {
+			runExtract(e, cwd.value, target)
+			return
+		}
+		dialog.warning({
+			title: "文件已存在",
+			content: `解压会覆盖当前目录里的「${target}」。`,
+			positiveText: "覆盖",
+			negativeText: "取消",
+			onPositiveClick: () => runExtract(e, cwd.value, target),
+		})
+		return
+	}
+	const folder = archiveBase(e.name)
+	const dest = joinPath(cwd.value, folder)
+	const clash = entries.value.find((it) => it.name === folder)
+	// 同名文件挡在那儿:后端要在这个名字上建目录,只会报错,不如提前说清。
+	if (clash && !clash.dir) {
+		message.error(`同名文件「${folder}」已存在,请先重命名它`)
+		return
+	}
+	if (!clash) {
+		runExtract(e, dest, folder + "/")
+		return
+	}
+	dialog.warning({
+		title: "文件夹已存在",
+		content: `将解压到已有的「${folder}」里,里面的同名文件会被覆盖。`,
+		positiveText: "继续解压",
+		negativeText: "取消",
+		onPositiveClick: () => runExtract(e, dest, folder + "/"),
 	})
 }
 // ---- 上传 ----
@@ -709,6 +894,9 @@ function up() {
 				<n-button size="tiny" secondary :disabled="batchDisabled" @click="openTransfer('move', selectedEntries)">
 					<template #icon><n-icon :component="ArrowForwardOutline" /></template>移动
 				</n-button>
+				<n-button size="tiny" secondary :disabled="batchDisabled || zipRunning" @click="openZip(selectedEntries)">
+					<template #icon><n-icon :component="ArchiveOutline" /></template>压缩
+				</n-button>
 				<n-button size="tiny" type="error" secondary :disabled="batchDisabled" @click="confirmDelete(selectedEntries)">
 					<template #icon><n-icon :component="TrashOutline" /></template>删除
 				</n-button>
@@ -778,6 +966,25 @@ function up() {
 					<n-button @click="transferShowing = false">取消</n-button>
 					<n-button type="primary" :loading="transferChecking" :disabled="!transferTo || !!transferError"
 						@click="submitTransfer">{{ transferMode === 'copy' ? '复制' : '移动' }}</n-button>
+				</div>
+			</template>
+		</n-modal>
+		<!-- 压缩 -->
+		<n-modal v-model:show="zipShowing" preset="card" class="name-modal" title="压缩" @after-enter="focusZip">
+			<div class="transfer-src">{{ zipItems.length === 1
+				? zipItems[0].name
+				: `已选 ${zipItems.length} 项:${zipItemNames}` }}</div>
+			<n-radio-group v-model:value="zipFormat" size="small" class="zip-fmt">
+				<n-radio-button v-for="f in zipFormats" :key="f" :value="f">{{ f }}</n-radio-button>
+			</n-radio-group>
+			<n-input ref="zipInput" v-model:value="zipName" :status="zipInvalid ? 'error' : undefined"
+				placeholder="包名(后缀按格式自动补)" @keydown.enter="submitZip" />
+			<div v-if="zipInvalid" class="name-err">名称不能包含 / 或 \</div>
+			<div v-else class="transfer-to">{{ zipDest }}</div>
+			<template #footer>
+				<div class="modal-footer">
+					<n-button @click="zipShowing = false">取消</n-button>
+					<n-button type="primary" :disabled="!zipName.trim() || zipInvalid" @click="submitZip">压缩</n-button>
 				</div>
 			</template>
 		</n-modal>
@@ -895,6 +1102,7 @@ function up() {
 }
 .transfer-to.bad { color: var(--lr-danger); font-family: inherit; }
 .name-kind { margin-bottom: 10px; }
+.zip-fmt { margin-bottom: 10px; }
 .name-err { margin-top: 6px; color: var(--lr-danger); font-size: 12px; }
 .file-input { font-size: 13px; }
 .upload-list { margin-top: 8px; color: var(--lr-fg-muted); font-size: 12px; }

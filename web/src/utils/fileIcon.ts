@@ -127,7 +127,8 @@ const extMap: Record<string, FileIcon> = {
   'woff': { icon: Font, color: '#F06529' }, 'woff2': { icon: Font, color: '#F06529' },
   // 压缩包 / 二进制 / 证书
   'zip': ARCHIVE, 'tar': ARCHIVE, 'gz': ARCHIVE, 'tgz': ARCHIVE, 'bz2': ARCHIVE,
-  'xz': ARCHIVE, 'rar': ARCHIVE, '7z': ARCHIVE,
+  'tbz': ARCHIVE, 'tbz2': ARCHIVE, 'xz': ARCHIVE, 'txz': ARCHIVE,
+  'rar': ARCHIVE, '7z': ARCHIVE,
   'exe': { icon: Cube, color: '#8C9196' }, 'dll': { icon: Cube, color: '#8C9196' },
   'so': { icon: Cube, color: '#8C9196' }, 'wasm': { icon: Cube, color: '#654FF0' },
   'pem': { icon: Key, color: '#D4AF37' }, 'key': { icon: Key, color: '#D4AF37' },
@@ -138,7 +139,7 @@ const extMap: Record<string, FileIcon> = {
 // 图片扩展名单独导出:F2a 图片预览要靠它决定走 <img> 还是走文本编辑器。
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'svg'])
 // 压缩包同理:F2b 走条目列表而不是文本。tar.gz 只取最后一段扩展名 gz,已在集合里。
-const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', 'rar', '7z'])
+const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'tbz2', 'xz', 'txz', 'rar', '7z'])
 
 function basename(path: string): string {
   return path.split(/[/\\]/).filter(Boolean).pop() || path

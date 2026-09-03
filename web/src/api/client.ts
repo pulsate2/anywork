@@ -72,6 +72,9 @@ export const api = {
   fsReplace: (body: { files: string[]; q: string; replace: string; regex?: boolean; case?: boolean }) =>
     request<{ files: number; count: number }>('POST', '/api/fs/replace', body),
   fsExtract: (dest: string, archive: string) => request<{ ok: boolean }>('POST', '/api/fs/extract', { dest, archive }),
+  // 在服务器上压出一个包(fsArchiveUrl 那个是直接下载,不落盘)。
+  // 压成什么格式看 dest 的后缀:zip / tar / tar.gz / tar.xz。
+  fsCompress: (dest: string, paths: string[]) => request<{ ok: boolean }>('POST', '/api/fs/compress', { dest, paths }),
   fsArchiveList: (path: string, limit?: number) => {
     const qs = new URLSearchParams({ path })
     if (limit) qs.set('limit', String(limit))

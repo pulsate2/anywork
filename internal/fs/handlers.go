@@ -241,6 +241,24 @@ func (h *Handlers) ExtractArchive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// Compress 把 paths 打成一个包落盘到 dest,格式看 dest 的后缀。和 CreateArchive
+// 的区别是那个直接把包流给浏览器下载,这个是在服务器上生成一个文件。
+func (h *Handlers) Compress(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Dest  string   `json:"dest"`
+		Paths []string `json:"paths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := h.svc.CreateArchiveFile(body.Dest, body.Paths); err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (h *Handlers) httpErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	switch {

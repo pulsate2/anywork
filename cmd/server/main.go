@@ -213,6 +213,7 @@ func (a *App) routes() http.Handler {
 		pr.Get("/api/fs/archive", a.fs.CreateArchive)
 		pr.Get("/api/fs/archive/list", a.fs.ListArchive)
 		pr.Post("/api/fs/extract", a.fs.ExtractArchive)
+		pr.Post("/api/fs/compress", a.fs.Compress)
 
 		// Git(里程碑 4)。
 		pr.Get("/api/git/repo", a.git.RepoInfo)

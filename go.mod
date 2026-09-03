@@ -9,6 +9,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.1
 	github.com/jackc/pgx/v5 v5.7.1
 	github.com/nwaples/rardecode/v2 v2.4.1
+	github.com/ulikunitz/xz v0.5.12
 	golang.org/x/crypto v0.31.0
 	golang.org/x/sys v0.28.0
 	modernc.org/sqlite v1.34.1
@@ -33,7 +34,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/u-root/u-root v0.11.0 // indirect
-	github.com/ulikunitz/xz v0.5.12 // indirect
 	go4.org v0.0.0-20200411211856-f5505b9728dd // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
