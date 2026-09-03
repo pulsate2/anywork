@@ -8,16 +8,19 @@ import {
   NButton, NIcon, NModal, NList, NListItem,
   NTag, NEmpty, useMessage, NSelect, NForm, NFormItem, NInput,
 } from 'naive-ui'
-import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline } from '@vicons/ionicons5'
+import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline, StarOutline } from '@vicons/ionicons5'
 import { TermClient, type TermSummary } from '@/api/term'
 import { type Workspace } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
+import { useCommandStore } from '@/stores/commands'
 import { copyText, selectAllIn } from '@/utils/clipboard'
 import { useKeyboardInset } from '@/utils/keyboardInset'
 import TerminalKeyboard from '@/mobile/TerminalKeyboard.vue'
+import CommandFavorites from '@/components/CommandFavorites.vue'
 
 const message = useMessage()
 const store = useWorkspaceStore()
+const cmds = useCommandStore()
 // 软键盘遮挡高度。Chrome 默认不会因为键盘压缩 layout viewport,100dvh 的页面因此
 // 完全感知不到键盘,底部的键盘条被压在键盘下面。拿它当额外的底部内边距用:
 // 页面自己变矮 → 键盘条回到键盘上沿,终端跟着 fit。Via 那类会整页 resize 的浏览器
@@ -34,6 +37,7 @@ const sessions = ref<TermSummary[]>([])
 const activeId = ref<string | null>(null)
 const showSessionList = ref(false)
 const showNewModal = ref(false)
+const showCmdModal = ref(false)
 const workspaces = ref<Workspace[]>([])
 const selectedWs = ref<string | null>(null)
 const execShell = ref('')
@@ -126,7 +130,10 @@ function ensureTerm() {
   term.loadAddon(fitAddon)
   term.open(termEl.value!)
   // 软键盘/物理键盘的输入先过一遍键盘条的粘滞修饰符(Ctrl/Alt),再发给 PTY。
-  term.onData((d) => client.input(kbd.value?.applySticky(d) ?? d))
+  term.onData((d) => sendKeys(kbd.value?.applySticky(d) ?? d))
+  // 每来一次换行就把量到的输入起点作废。输出一行行流进来的时候光标一直在动,
+  // 上一次量的列号对新的一行毫无意义;作废掉,下次按键会在新提示符后重新量。
+  term.onLineFeed(() => resetTypedMark())
   // 物理键盘 resize 也在 resize observer 里处理。
   term.onResize(() => syncPtySize())
   applyTheme()
@@ -361,6 +368,7 @@ function createSession() {
   term?.reset()
   sentCols = 0
   sentRows = 0
+  resetTypedMark()
   pendingAttachSettle = true
   client.createSession(dir, execShell.value, term?.cols || 80, term?.rows || 24)
   showNewModal.value = false
@@ -377,6 +385,7 @@ function attachSession(sum: TermSummary) {
   activeId.value = sum.id
   sentCols = 0
   sentRows = 0
+  resetTypedMark()
   // 回放帧在 session 帧之前就会到,那批输出解析完要再稳定化一次(见 handleEvent)。
   pendingAttachSettle = true
   client.attach(sum.id)
@@ -401,6 +410,7 @@ function releaseActive() {
   pendingAttachSettle = false
   sentCols = 0
   sentRows = 0
+  resetTypedMark()
   clearSettle()
   term?.reset()
 }
@@ -419,11 +429,137 @@ function sessionShortName(s: TermSummary): string {
 async function pasteIntoTerm() {
   try {
     const text = await navigator.clipboard.readText()
-    if (text) client.input(text)
+    if (text) sendKeys(text)
     else message.info('剪贴板为空')
   } catch {
     message.warning('无法读取剪贴板(需用户手势且在安全上下文)')
   }
+}
+
+// ── 输入与命令历史 ────────────────────────────────────────────────────────────
+// 所有送往 PTY 的按键都从 sendKeys 过:物理/软键盘走 term.onData,键盘条走它的
+// on-key,粘贴和收藏面板的填入也走这里。回车那一刻顺手把这一行记进历史。
+
+// 这一行里「用户从第几列开始输入」,以及量它的时候光标落在缓冲区的哪一行。
+// -1 = 还没量过。行号一起记是必须的:只有量的时候那条逻辑行就是回车时的那条,
+// 列号才作数。否则 —— 输出正一行行流进来时用户按了键(Ctrl-C、随手乱按),量到的
+// 是某个输出行上的列;这个数留到后面真正的命令上,就会把提示符切进来(记成
+// "ot@host:~/x# ping ll")或者从中间截断(记成 "k")。两种脏记录同一个来源。
+let typedFrom = -1
+let typedRow = -1
+
+function resetTypedMark() {
+  typedFrom = -1
+  typedRow = -1
+}
+
+// 回车既可能是单独的 \r(键盘、键盘条),也可能夹在粘贴进来的一段文本里。
+function isEnter(data: string): boolean {
+  return data.includes('\r') || data.includes('\n')
+}
+
+function sendKeys(data: string) {
+  if (!isEnter(data)) {
+    // 在按键真正送出去之前量一次光标位置:此刻它还停在提示符末尾,那个列号就是
+    // 提示符的显示宽度。PS1 可以随便定,认不全,量一下比拿正则去猜可靠得多。
+    if (typedFrom < 0 && term) {
+      const buf = term.buffer.active
+      typedFrom = buf.cursorX
+      typedRow = buf.baseY + buf.cursorY
+    }
+    client.input(data)
+    return
+  }
+  const segs = data.split(/[\r\n]+/).filter((s) => s.trim())
+  // 单独的回车:内容在缓冲区里(shell 已经回显过),去那儿读。
+  if (!segs.length) captureCommand()
+  // 粘贴的一段自带回车:内容就在 data 里,缓冲区此刻还没回显,直接按它记。
+  // 只记单条 —— 多行粘贴那是一段文本(heredoc、配置文件),不是命令。
+  else if (segs.length === 1) cmds.pushHistory(segs[0])
+  resetTypedMark()
+  client.input(data)
+}
+
+// 键盘条的按键也从这里走。它自己那颗回车键不经过 term.onData,
+// 漏了它手机上就一条历史都记不到。
+function onKbdKey(k: string) {
+  sendKeys(k)
+}
+
+// captureCommand 在回车那一刻从缓冲区读出这一行的命令。读缓冲区而不是攒按键流,
+// 是因为缓冲区里是 shell 自己回显出来的最终结果 —— Tab 补全、↑ 调历史、退格改词
+// 全都已经算进去了。附带一个好处:没有回显的输入(密码、passphrase)在缓冲区里
+// 根本不存在,结构上就采不到,不用另外去猜哪一行是密码。
+function captureCommand() {
+  if (!term) return
+  // 备用屏 = 全屏程序(vim/less/top)在跑,那里的回车不是在敲命令。
+  if (term.buffer.active.type !== 'normal') return
+  cmds.pushHistory(currentInput(term))
+}
+
+// currentInput 拼出光标所在那条逻辑行里「用户输入的那一段」。
+function currentInput(t: Terminal): string {
+  const buf = t.buffer.active
+  // 往上收:isWrapped 表示这一行是上一行按行宽硬折下来的续行,一条长命令会占好几行。
+  let start = buf.baseY + buf.cursorY
+  while (start > 0 && buf.getLine(start)?.isWrapped) start--
+  // 量到的列号只在「量的时候和现在是同一条逻辑行」时才用。对不上就当没量过,
+  // 退回按提示符记号切 —— 宁可切不准被丢掉,也不要记一条带提示符的脏命令。
+  const useCol = typedFrom > 0 && typedRow === start
+  const rows: string[] = []
+  for (let y = start; y < buf.length; y++) {
+    const line = buf.getLine(y)
+    if (!line) break
+    if (y > start && !line.isWrapped) break
+    // 首行从 typedFrom 列切起,提示符就留在了外面。translateToString 按列取,
+    // 提示符里有宽字符(中文、部分符号)也不会错位。
+    rows.push(line.translateToString(false, y === start && useCol ? typedFrom : 0))
+  }
+  const text = rows.join('').replace(/\s+$/, '')
+  // 量到过输入起点就用它;没量到(这一行整个是粘贴进来的)才退回按提示符记号切。
+  return useCol ? text.trim() : stripPrompt(text)
+}
+
+// stripPrompt 从一整行里切掉提示符。提示符总以 "$ "/"# " 这类记号加一个空格收尾,
+// 取最早出现的那个,后面就是命令本体 —— 取最早而不是最晚,因为命令里带 "# 注释"、
+// "> 重定向" 很常见,提示符里带这些不常见。
+// 一个记号都找不到就当这行不是命令行(密码提示、程序自己的输出),返回空放过。
+const PROMPT_MARKS = ['$ ', '# ', '> ', '% ', '❯ ']
+function stripPrompt(line: string): string {
+  let at = -1
+  let len = 0
+  for (const m of PROMPT_MARKS) {
+    const i = line.indexOf(m)
+    if (i >= 0 && (at < 0 || i < at)) {
+      at = i
+      len = m.length
+    }
+  }
+  return at < 0 ? '' : line.slice(at + len).trim()
+}
+
+// 填入:只把命令送到输入行,不带回车。要跑起来还得自己按一下回车 ——
+// 这是远程机器,误触执行一条命令和填错一行不是一个量级的事。
+function fillCommand(cmd: string) {
+  if (!requireSession()) return
+  sendKeys(cmd)
+  term?.focus()
+}
+
+// 执行:填入 + 回车。这一条是我们自己发的,缓冲区里还没有回显,
+// 所以历史直接记账,不走 captureCommand 那条路。
+function runCommand(cmd: string) {
+  if (!requireSession()) return
+  cmds.pushHistory(cmd)
+  resetTypedMark()
+  client.input(cmd + '\r')
+  term?.focus()
+}
+
+function requireSession(): boolean {
+  if (activeId.value) return true
+  message.warning('先选择或新建一个会话')
+  return false
 }
 
 // dumpBuffer 把整个滚动缓冲区(含已滚出屏幕的历史)导成纯文本。
@@ -617,14 +753,20 @@ watch(fitSignal, () => applyTheme())
         <template #icon><n-icon :component="TerminalOutline" /></template>
         会话
       </n-button>
-      <div class="spacer"></div>
-      <n-button size="small" quaternary title="导出终端文本,可自己选取复制" @click="openCopyModal">
-        <template #icon><n-icon :component="CopyOutline" /></template>
-        复制
+      <!-- 收藏 / 复制 / 粘贴:只留图标。这排横向很挤,带字的话「新建」会被挤出去。
+           title + aria-label 补上说明,鼠标悬停和读屏都还知道是什么。 -->
+      <n-button class="term-ico" size="small" quaternary title="命令收藏" aria-label="命令收藏"
+        @click="showCmdModal = true">
+        <template #icon><n-icon :component="StarOutline" /></template>
       </n-button>
-      <n-button size="small" quaternary @click="pasteIntoTerm">
+      <div class="spacer"></div>
+      <n-button class="term-ico" size="small" quaternary aria-label="复制"
+        title="导出终端文本,可自己选取复制" @click="openCopyModal">
+        <template #icon><n-icon :component="CopyOutline" /></template>
+      </n-button>
+      <n-button class="term-ico" size="small" quaternary aria-label="粘贴"
+        title="把剪贴板内容粘到终端" @click="pasteIntoTerm">
         <template #icon><n-icon :component="ClipboardOutline" /></template>
-        粘贴
       </n-button>
       <n-button size="small" type="primary" @click="pickWorkspaceAndCreate">
         <template #icon><n-icon :component="AddOutline" /></template>
@@ -644,7 +786,10 @@ watch(fitSignal, () => applyTheme())
     </div>
 
     <!-- 移动键盘层 -->
-    <TerminalKeyboard ref="kbd" :on-key="(k: string) => client.input(k)" />
+    <TerminalKeyboard ref="kbd" :on-key="onKbdKey" />
+
+    <!-- 命令收藏 / 输入历史 -->
+    <CommandFavorites v-model:show="showCmdModal" @fill="fillCommand" @run="runCommand" />
 
     <!-- 会话列表抽屉 -->
     <n-modal v-model:show="showSessionList" preset="card" title="终端会话" style="width: 92%; max-width: 420px">
@@ -748,6 +893,8 @@ watch(fitSignal, () => applyTheme())
   margin-bottom: 6px;
 }
 .spacer { flex: 1; }
+/* 图标钮不留文字的位置,压到方形 */
+.term-ico { width: 34px; padding: 0; }
 .term-wrap {
   position: relative;
   flex: 1;
