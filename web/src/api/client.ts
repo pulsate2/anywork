@@ -55,7 +55,16 @@ export const api = {
   renameWorkspace: (id: string, name: string) =>
     request<{ ok: boolean }>('PUT', `/api/workspaces/${id}`, { name }),
   deleteWorkspace: (id: string) => request<{ ok: boolean }>('DELETE', `/api/workspaces/${id}`),
-  sysinfo: () => request<SysInfo>('GET', '/api/sysinfo'),
+  // procs 缺省 0 = 只要三张卡不要进程列表(首页概览用);sort=cpu|mem。
+  sysinfo: (opt?: { procs?: number; sort?: 'cpu' | 'mem' }) => {
+    const qs = new URLSearchParams()
+    if (opt?.procs) qs.set('procs', String(opt.procs))
+    if (opt?.sort) qs.set('sort', opt.sort)
+    const q = qs.toString()
+    return request<SysInfo>('GET', `/api/sysinfo${q ? `?${q}` : ''}`)
+  },
+  // 本机支持哪种会话资源限制,新建终端时决定显示哪些输入框。
+  termLimits: () => request<TermLimitSupport>('GET', '/api/term/limits'),
   // ---- 文件操作 ----
   fsList: (path: string) => request<FsEntry[]>('GET', `/api/fs/list?path=${encodeURIComponent(path)}`),
   fsRead: (path: string) => requestText(`/api/fs/read?path=${encodeURIComponent(path)}`),
@@ -246,10 +255,41 @@ export interface Workspace {
   createdAt: string
 }
 
+// ProcInfo 一个进程的占用。cpu 是占整机的百分比(与 SysInfo.cpu.percent 同一把尺子)。
+export interface ProcInfo {
+  pid: number
+  ppid: number
+  name: string
+  cmd: string
+  user: string
+  state: string
+  threads: number
+  cpu: number
+  memMB: number
+  memPct: number
+}
+
 export interface SysInfo {
   cpu: { load: number; cores: number; percent: number }
   memory: { totalMB: number; usedMB: number; freeMB: number; usedPct: number }
   disk: { totalGB: number; usedGB: number; freeGB: number; usedPct: number }
+  // 这批百分比是用多长的窗口算出来的(毫秒)。
+  sampleMs: number
+  // 本平台能不能列进程(非 Linux/Windows 一律不能)。
+  procSupported: boolean
+  // 裁剪前的进程总数。
+  procTotal: number
+  processes: ProcInfo[]
+}
+
+// TermLimitSupport 对应后端 terminal.Support。mode: cgroup2|rlimit|job|none。
+export interface TermLimitSupport {
+  memory: boolean
+  cpu: boolean
+  mode: string
+  detail: string
+  // cores 是"占整机 %"换算成核数的分母。
+  cores: number
 }
 
 

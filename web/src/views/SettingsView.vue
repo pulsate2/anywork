@@ -1,16 +1,94 @@
 <script setup lang="ts">
-// 设置:系统信息 + 备份(WebDAV)任务管理。
-import { ref, onMounted, computed } from 'vue'
+// 设置:系统信息(含任务管理器式进程列表)+ 备份(WebDAV)任务管理。
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { NButton, NInput, NInputNumber, NList, NListItem, NEmpty, NSpin, NModal,
-  NTag, NPopconfirm, useMessage, useDialog, NTabs, NTabPane, NSwitch, NSlider } from 'naive-ui'
+  NTag, NPopconfirm, useMessage, useDialog, NTabs, NTabPane, NSwitch, NSlider, NSelect,
+  NTooltip } from 'naive-ui'
 import { api, type SysInfo, type BackupJob, type BackupSnapshot, type PushStatus } from '@/api/client'
+import { useWorkspaceStore } from '@/stores/workspace'
+import DirTreePicker from '@/components/DirTreePicker.vue'
 
 const message = useMessage()
 const dialog = useDialog()
+const store = useWorkspaceStore()
 const tab = ref('backup')
 const sys = ref<SysInfo | null>(null)
 // percent 为 -1 表示平台不支持采集,进度条按 0 画。
 const cpuPct = computed(() => Math.max(0, Math.min(100, sys.value?.cpu.percent ?? 0)))
+
+// ---- 系统面板实时刷新 ----
+// 只在"系统"标签页可见时轮询:切走或页面进后台就停,不给服务器和手机电池添活。
+const SYS_KEY = 'lr.sys.'
+const procSort = ref<'cpu' | 'mem'>(localStorage.getItem(SYS_KEY + 'sort') === 'mem' ? 'mem' : 'cpu')
+const procLimit = ref(Number(localStorage.getItem(SYS_KEY + 'limit')) || 20)
+const sysInterval = ref(Number(localStorage.getItem(SYS_KEY + 'interval')) || 2000)
+const sysAuto = ref(localStorage.getItem(SYS_KEY + 'auto') !== '0')
+const sysErr = ref('')
+// 后端没进程可报时 processes 是 null,兜底成数组免得模板里 .length 崩掉。
+const procs = computed(() => sys.value?.processes ?? [])
+// busy 是并发闸门:上一次还没回来就不再发,慢网络下不会堆成一串请求。
+let sysBusy = false
+let sysTimer: number | null = null
+
+const intervalOptions = [
+  { label: '1 秒', value: 1000 },
+  { label: '2 秒', value: 2000 },
+  { label: '3 秒', value: 3000 },
+  { label: '5 秒', value: 5000 },
+  { label: '10 秒', value: 10000 },
+]
+const limitOptions = [10, 20, 50, 100].map(n => ({ label: `前 ${n} 条`, value: n }))
+
+function fmtMB(n: number): string {
+  if (n >= 1024) return (n / 1024).toFixed(2) + ' GB'
+  return n >= 10 ? n.toFixed(0) + ' MB' : n.toFixed(1) + ' MB'
+}
+
+async function pullSys(withProcs = true) {
+  if (sysBusy) return
+  sysBusy = true
+  try {
+    sys.value = await api.sysinfo({ procs: withProcs ? procLimit.value : 0, sort: procSort.value })
+    sysErr.value = ''
+  } catch (e: any) {
+    sysErr.value = e?.message || '采集失败'
+  } finally {
+    sysBusy = false
+  }
+}
+
+function stopSys() {
+  if (sysTimer !== null) { clearTimeout(sysTimer); sysTimer = null }
+}
+
+// 用 setTimeout 串起来而不是 setInterval:一次采集慢了,下一次从它结束时才开始算。
+function scheduleSys() {
+  stopSys()
+  if (tab.value !== 'sys' || !sysAuto.value || document.hidden) return
+  sysTimer = window.setTimeout(async () => {
+    await pullSys()
+    scheduleSys()
+  }, sysInterval.value)
+}
+
+function restartSys() {
+  stopSys()
+  if (tab.value !== 'sys') return
+  pullSys()
+  scheduleSys()
+}
+
+function onVisibility() {
+  if (document.hidden) stopSys()
+  else restartSys()
+}
+
+watch(tab, () => restartSys())
+watch(sysAuto, v => { localStorage.setItem(SYS_KEY + 'auto', v ? '1' : '0'); scheduleSys() })
+watch(sysInterval, v => { localStorage.setItem(SYS_KEY + 'interval', String(v)); scheduleSys() })
+// 排序和条数由服务端算,改了就立刻重取一次,不用等下一个周期。
+watch(procSort, v => { localStorage.setItem(SYS_KEY + 'sort', v); restartSys() })
+watch(procLimit, v => { localStorage.setItem(SYS_KEY + 'limit', String(v)); restartSys() })
 
 // ---- Web Push ----
 const pushStatus = ref<PushStatus | null>(null)
@@ -36,6 +114,12 @@ const editExcludes = ref('')
 const editRetention = ref(3)
 const editAutoRestore = ref(false)
 const editEnabled = ref(true)
+
+// 来源目录必须落在服务端根目录内(后端 dirAllowed 会直接拒),所以提示和树都以 root 为界。
+// root 就是 "/" 时那句边界说明是废话,省掉。
+const rootDir = computed(() => (store.root || '/').replace(/\/+$/, '') || '/')
+const srcNote = computed(() => (rootDir.value === '/' ? '' : `,须在 ${rootDir.value} 之内`))
+const srcPlaceholder = computed(() => (rootDir.value === '/' ? '/data/www' : rootDir.value + '/www'))
 
 function fmtBytes(n?: number): string {
   if (n == null) return '-'
@@ -63,7 +147,8 @@ async function loadSnaps(id: string) {
 
 async function load() {
   loadJobs()
-  try { sys.value = await api.sysinfo() } catch {}
+  // 概览三张卡先出来;进程列表等用户真的切到"系统"页再拉。
+  pullSys(false)
   try {
     const ps = await api.pushStatus()
     pushStatus.value = ps
@@ -256,7 +341,18 @@ function fmtTime(t?: string): string {
   return isNaN(d.getTime()) ? t : d.toLocaleString()
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  // 目录树和来源提示都以 root 为界。直接刷新在设置页时 store 还是空的(root 由首页
+  // 那次 load 填),这里补一次,免得树根显示成 "/"。已加载过就不再要一遍。
+  if (!store.loaded) store.load().catch(() => {})
+  document.addEventListener('visibilitychange', onVisibility)
+})
+
+onUnmounted(() => {
+  stopSys()
+  document.removeEventListener('visibilitychange', onVisibility)
+})
 </script>
 
 <template>
@@ -325,6 +421,18 @@ onMounted(load)
 
       <!-- 系统信息 -->
       <n-tab-pane name="sys" tab="系统">
+        <div class="sys-bar">
+          <label class="switch-row">
+            <n-switch v-model:value="sysAuto" size="small" /> 自动刷新
+          </label>
+          <n-select v-model:value="sysInterval" :options="intervalOptions" size="tiny"
+            :disabled="!sysAuto" style="width:88px" />
+          <n-button size="tiny" quaternary @click="restartSys">刷新</n-button>
+          <span class="sys-spacer" />
+          <span v-if="sysErr" class="sys-err">{{ sysErr }}</span>
+          <span v-else-if="sys" class="hint">采样窗口 {{ sys.sampleMs }}ms</span>
+        </div>
+
         <div v-if="sys" class="sys-grid">
           <div class="sys-card">
             <h4>CPU</h4>
@@ -347,6 +455,50 @@ onMounted(load)
           </div>
         </div>
         <n-empty v-else description="系统信息不可用" style="padding:30px" />
+
+        <!-- 任务管理器:占用最高的进程 -->
+        <div v-if="sys && !sys.procSupported" class="hint proc-note">当前平台不支持进程列表(仅 Linux / Windows 可用)。</div>
+        <div v-else-if="sys" class="proc-pane">
+          <div class="sys-bar">
+            <span class="proc-title">进程</span>
+            <n-button size="tiny" :type="procSort === 'cpu' ? 'primary' : 'default'"
+              :quaternary="procSort !== 'cpu'" @click="procSort = 'cpu'">按 CPU</n-button>
+            <n-button size="tiny" :type="procSort === 'mem' ? 'primary' : 'default'"
+              :quaternary="procSort !== 'mem'" @click="procSort = 'mem'">按内存</n-button>
+            <n-select v-model:value="procLimit" :options="limitOptions" size="tiny" style="width:96px" />
+            <span class="sys-spacer" />
+            <span class="hint">共 {{ sys.procTotal }} 个</span>
+          </div>
+          <div class="proc-table">
+            <div class="proc-row proc-head">
+              <span class="c-name">名称</span>
+              <span class="c-pid opt">PID</span>
+              <span class="c-user opt">用户</span>
+              <span class="c-thr opt">线程</span>
+              <span class="c-num">CPU</span>
+              <span class="c-num">内存</span>
+            </div>
+            <div v-for="p in procs" :key="p.pid" class="proc-row">
+              <!-- 命令行一行放不下,缩略显示;点一下弹出完整路径(手机没有 hover,
+                   所以用 click 而不是原生 title)。 -->
+              <n-tooltip trigger="click">
+                <template #trigger>
+                  <span class="c-name">
+                    <b>{{ p.name }}</b>
+                    <em>{{ p.cmd }}</em>
+                  </span>
+                </template>
+                <div class="proc-cmd">{{ p.cmd }}</div>
+              </n-tooltip>
+              <span class="c-pid opt">{{ p.pid }}</span>
+              <span class="c-user opt">{{ p.user || '-' }}</span>
+              <span class="c-thr opt">{{ p.threads || '-' }}</span>
+              <span class="c-num" :class="{ hot: p.cpu >= 50 }">{{ p.cpu.toFixed(1) }}%</span>
+              <span class="c-num">{{ fmtMB(p.memMB) }}<i>{{ p.memPct.toFixed(1) }}%</i></span>
+            </div>
+            <n-empty v-if="!procs.length" description="暂无进程数据" style="padding:20px" />
+          </div>
+        </div>
       </n-tab-pane>
 
       <!-- Web Push 通知 -->
@@ -373,8 +525,8 @@ onMounted(load)
       <div class="form">
         <label>名称</label>
         <n-input v-model:value="editName" placeholder="如 网站数据" />
-        <label>源目录(服务器绝对路径)</label>
-        <n-input v-model:value="editSource" placeholder="/data/www" />
+        <label>源目录(服务器绝对路径{{ srcNote }})</label>
+        <dir-tree-picker v-model="editSource" :placeholder="srcPlaceholder" />
         <label>WebDAV 地址</label>
         <n-input v-model:value="editUrl" placeholder="https://dav.example.com/remote.php/dav/files/user/backup" />
         <label>WebDAV 用户名 / 密码</label>
@@ -424,6 +576,48 @@ h2 { font-size: 20px; margin: 0 0 8px; }
 .bar { height: 8px; background: #eef0f4; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
 .bar-fill { height: 100%; background: var(--lr-primary, #2563eb); border-radius: 4px; }
 .sys-line { font-size: 12px; color: var(--lr-fg-muted); }
+.sys-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.sys-spacer { flex: 1; }
+.sys-err { color: #d03050; font-size: 12px; }
+.proc-note { display: block; margin-top: 14px; }
+.proc-pane { margin-top: 16px; }
+.proc-title { font-size: 13px; font-weight: 600; }
+.proc-table { border: 1px solid var(--lr-border, #eee); border-radius: 8px; overflow: hidden; }
+.proc-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px 96px 48px 62px 104px;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-top: 1px solid var(--lr-border, #f1f1f1);
+}
+.proc-row:first-child { border-top: none; }
+.proc-head { color: var(--lr-fg-muted); font-weight: 600; background: rgba(127, 127, 127, 0.06); }
+.c-name { min-width: 0; display: flex; flex-direction: column; cursor: pointer; }
+.c-name b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-name em {
+  font-style: normal; color: var(--lr-fg-muted); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 弹层里的完整命令行。teleport 出去的元素仍带 scoped 标记,这条能生效。
+   长路径没有空格可断,得允许硬折,否则弹层会被撑到屏幕外。 */
+.proc-cmd {
+  max-width: min(78vw, 420px);
+  font-size: 12px; line-height: 1.5;
+  word-break: break-all;
+}
+.proc-head .c-name { display: block; cursor: default; }
+.c-pid, .c-thr { color: var(--lr-fg-muted); font-family: monospace; }
+.c-user { color: var(--lr-fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-num { text-align: right; font-variant-numeric: tabular-nums; }
+.c-num i { font-style: normal; color: var(--lr-fg-muted); font-size: 11px; margin-left: 5px; }
+.c-num.hot { color: #d03050; font-weight: 600; }
+/* 窄屏(手机)只留名称 + 两个数字,PID/用户/线程折掉。 */
+@media (max-width: 640px) {
+  .proc-row { grid-template-columns: minmax(0, 1fr) 56px 92px; }
+  .proc-row .opt { display: none; }
+}
 .form { display: flex; flex-direction: column; gap: 8px; }
 .form label { font-size: 12px; color: var(--lr-fg-muted); }
 .row2 { display: flex; gap: 8px; align-items: center; }

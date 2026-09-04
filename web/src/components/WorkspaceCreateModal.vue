@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { NModal, NForm, NFormItem, NInput, NButton, NSwitch, useMessage } from 'naive-ui'
 import { api } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
@@ -10,6 +10,8 @@ const emit = defineEmits<{ created: [] }>()
 
 const message = useMessage()
 const store = useWorkspaceStore()
+// root 只有在它本身就是 "/" 时才带尾斜杠,直接拼会拼出 /root/anyworkprojects。
+const example = computed(() => store.root.replace(/\/+$/, '') + '/projects')
 const name = ref('')
 const path = ref('')
 const favorite = ref(false)
@@ -43,8 +45,7 @@ async function submit() {
         <n-input v-model:value="name" placeholder="如:我的项目" />
       </n-form-item>
       <n-form-item label="目录路径">
-        <dir-tree-picker v-model="path"
-          :placeholder="`绝对路径或相对 ${store.root},如 ${store.root}projects`" />
+        <dir-tree-picker v-model="path" :placeholder="`绝对路径或相对 ${store.root},如 ${example}`" />
       </n-form-item>
       <n-form-item label="收藏">
         <n-switch v-model:value="favorite" />

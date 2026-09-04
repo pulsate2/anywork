@@ -11,6 +11,16 @@ export interface TermSummary {
   createdAt: string
   dead: boolean
   exitCode: number
+  // 实际生效的资源上限,缺省/0 = 该项没限。limitMode 是所用机制(cgroup2/rlimit/job)。
+  memoryMB?: number
+  cpuPercent?: number
+  limitMode?: string
+}
+
+// TermLimits 新建会话时申请的上限,0 = 不限。
+export interface TermLimits {
+  memoryMB: number
+  cpuPercent: number
 }
 
 export type TermEvent =
@@ -117,8 +127,16 @@ export class TermClient {
     }
   }
 
-  createSession(dir: string, shell: string, cols: number, rows: number) {
-    this.send({ type: 'create', dir, shell, cols, rows })
+  createSession(dir: string, shell: string, cols: number, rows: number, limits?: TermLimits) {
+    this.send({
+      type: 'create',
+      dir,
+      shell,
+      cols,
+      rows,
+      memoryMB: limits?.memoryMB ?? 0,
+      cpuPercent: limits?.cpuPercent ?? 0,
+    })
   }
   attach(id: string) {
     this.current = id

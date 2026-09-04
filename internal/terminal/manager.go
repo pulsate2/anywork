@@ -55,8 +55,8 @@ func (m *Manager) allClients() []*Client {
 	return out
 }
 
-// Create 新建会话并启动。
-func (m *Manager) Create(dir, shell string, cols, rows int) (*Summary, error) {
+// Create 新建会话并启动。limits 为零值表示不限制资源。
+func (m *Manager) Create(dir, shell string, cols, rows int, limits Limits) (*Summary, error) {
 	if m.ReadOnly {
 		return nil, fmt.Errorf("只读模式")
 	}
@@ -77,7 +77,16 @@ func (m *Manager) Create(dir, shell string, cols, rows int) (*Summary, error) {
 
 	id := newID()
 	s := NewSession(id, dir, shell, sessionEnv(), cols, rows)
+	// 限额要在 start 之前建好:Linux 靠包装命令在 exec 前入组,晚一步 shell
+	// 的 rc 就已经跑在限制外了。建不起来直接失败 —— 用户明确要求了上限,
+	// 悄悄给一个不受限的会话是更坏的结果。
+	lim, err := newLimiter(id, limits.clamp())
+	if err != nil {
+		return nil, err
+	}
+	s.setLimiter(lim)
 	if err := s.start(); err != nil {
+		s.releaseLimits()
 		return nil, err
 	}
 
@@ -85,7 +94,8 @@ func (m *Manager) Create(dir, shell string, cols, rows int) (*Summary, error) {
 	m.sessions[id] = s
 	m.mu.Unlock()
 	go m.watchExit(s)
-	return &Summary{ID: id, Dir: s.dir}, nil
+	sum := s.Summary()
+	return &sum, nil
 }
 
 // sessionEnv 会话环境 = 服务进程环境,但强制 TERM=xterm:父进程的 TERM 可能缺失
@@ -112,6 +122,9 @@ func (m *Manager) watchExit(s *Session) {
 		c.sendText(frameTypeExit, exitMsg{Type: "exit", ID: s.id, ExitCode: code})
 	}
 	m.broadcastSessionList()
+	// 归还限额放在广播之后:删 cgroup 目录要等组里的进程收尾,不能让它拖着
+	// 前端收不到 exit。
+	s.releaseLimits()
 }
 
 // Attach 附加客户端到会话,返回会话与需要回放的缓冲。

@@ -4,6 +4,7 @@ package terminal
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"sync"
@@ -80,6 +81,12 @@ type Session struct {
 
 	createdAt  time.Time
 	cols, rows int
+
+	// 资源限制:limiter 是平台句柄(cgroup 目录 / Job 对象),limits/limitMode
+	// 是"实际生效"的部分 —— 请求了 CPU 但内核没有 cpu 控制器时这里就只剩内存。
+	limiter   limiter
+	limits    Limits
+	limitMode string
 }
 
 // NewSession 创建(尚未启动)的会话。调用方随后需调用 start()。
@@ -98,18 +105,49 @@ func NewSession(id, dir, shell string, env []string, cols, rows int) *Session {
 	}
 }
 
+// setLimiter 在 start() 之前挂上资源限制句柄。
+func (s *Session) setLimiter(h limiter) {
+	if h == nil {
+		return
+	}
+	s.limiter = h
+	s.limits, s.limitMode = h.applied()
+}
+
+// releaseLimits 进程退出后归还限额(删 cgroup 子组 / 关 Job 句柄)。
+func (s *Session) releaseLimits() {
+	if s.limiter != nil {
+		s.limiter.release()
+	}
+}
+
 // start 打开 PTY 并启动 shell,随后进入读循环。
 func (s *Session) start() error {
 	ptmx, err := pty.New()
 	if err != nil {
 		return err
 	}
-	cmd := ptmx.Command(s.shell)
+	// 有限制时执行的是包装命令(见 limits.go):它先把自己塞进 cgroup 再 exec shell,
+	// 这样 shell 的 rc 文件里拉起的东西也在限制内。
+	name, args := s.shell, []string(nil)
+	if s.limiter != nil {
+		name, args = s.limiter.wrap(s.shell)
+	}
+	cmd := ptmx.Command(name, args...)
 	cmd.Dir = s.dir
 	cmd.Env = s.env
 	if err := cmd.Start(); err != nil {
 		ptmx.Close()
 		return err
+	}
+	// Windows 只能启动后补挂(此时 shell 还没来得及执行任何命令);Linux 的
+	// wrap 已经搞定,这里是空操作。
+	if s.limiter != nil && cmd.Process != nil {
+		if err := s.limiter.attach(cmd.Process.Pid); err != nil {
+			cmd.Process.Kill()
+			ptmx.Close()
+			return fmt.Errorf("应用资源限制失败: %w", err)
+		}
 	}
 
 	s.ptmx = ptmx
@@ -281,12 +319,15 @@ func (s *Session) Summary() Summary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Summary{
-		ID:        s.id,
-		Dir:       s.dir,
-		Cols:      s.cols,
-		Rows:      s.rows,
-		CreatedAt: s.createdAt.UTC().Format(time.RFC3339),
-		Dead:      s.dead,
-		ExitCode:  s.exitCode,
+		ID:         s.id,
+		Dir:        s.dir,
+		Cols:       s.cols,
+		Rows:       s.rows,
+		CreatedAt:  s.createdAt.UTC().Format(time.RFC3339),
+		Dead:       s.dead,
+		ExitCode:   s.exitCode,
+		MemoryMB:   s.limits.MemoryMB,
+		CPUPercent: s.limits.CPUPercent,
+		LimitMode:  s.limitMode,
 	}
 }

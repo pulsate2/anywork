@@ -18,17 +18,16 @@ type inMsg struct {
 	Rows  int    `json:"rows,omitempty"`
 	Dir   string `json:"dir,omitempty"`
 	Shell string `json:"shell,omitempty"`
+	// 新建会话时申请的资源上限,0/缺省 = 不限。
+	MemoryMB   int `json:"memoryMB,omitempty"`
+	CPUPercent int `json:"cpuPercent,omitempty"`
 }
 
-// 会话状态帧。
+// 会话状态帧。Summary 内联展开,所以字段与会话列表里的每一项完全一致 ——
+// 前端一套渲染逻辑吃两种帧。
 type sessMsg struct {
-	Type     string `json:"type"` // session | sessionList
-	ID       string `json:"id"`
-	Dir      string `json:"dir"`
-	Cols     int    `json:"cols"`
-	Rows     int    `json:"rows"`
-	Dead     bool   `json:"dead"`
-	ExitCode int    `json:"exitCode"`
+	Type string `json:"type"` // session | sessionList
+	Summary
 	// List 不能用 omitempty:结束最后一个会话后列表为空,整个字段会被省略,
 	// 前端收到的 list 就是 undefined,渲染时直接崩。空列表必须序列化成 []。
 	List []Summary `json:"list"`
@@ -93,7 +92,8 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 
 		switch in.Type {
 		case "create":
-			sum, err := m.Create(in.Dir, in.Shell, in.Cols, in.Rows)
+			sum, err := m.Create(in.Dir, in.Shell, in.Cols, in.Rows,
+				Limits{MemoryMB: in.MemoryMB, CPUPercent: in.CPUPercent})
 			if err != nil {
 				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
 				continue
@@ -114,7 +114,7 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 			mu.Lock()
 			*curID = sum.ID
 			mu.Unlock()
-			c.sendText(frameTypeSession, sessMsg{Type: "session", ID: sum.ID, Dir: sum.Dir, Cols: sum.Cols, Rows: sum.Rows})
+			c.sendText(frameTypeSession, sessMsg{Type: "session", Summary: *sum})
 			// 广播创建事件给其它客户端,使会话列表实时更新。
 			m.broadcastSessionList()
 
@@ -136,7 +136,7 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 			mu.Lock()
 			*curID = in.SID
 			mu.Unlock()
-			c.sendText(frameTypeSession, sessMsg{Type: "session", ID: in.SID, Dir: s.dir, Cols: s.cols, Rows: s.rows, Dead: s.isDead(), ExitCode: s.ExitCode()})
+			c.sendText(frameTypeSession, sessMsg{Type: "session", Summary: s.Summary()})
 			// 若已死则不再等待输入,立即发 exit。
 			if s.isDead() {
 				c.sendText(frameTypeExit, exitMsg{Type: "exit", ID: in.SID, ExitCode: s.ExitCode()})

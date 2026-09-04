@@ -53,6 +53,11 @@ type Summary struct {
 	CreatedAt string `json:"createdAt"`
 	Dead      bool   `json:"dead"`
 	ExitCode  int    `json:"exitCode"`
+	// 以下是实际生效的资源限制,0 = 该项没限。LimitMode 是所用机制
+	// (cgroup2 / rlimit / job),前端拿它决定提示文案。
+	MemoryMB   int    `json:"memoryMB,omitempty"`
+	CPUPercent int    `json:"cpuPercent,omitempty"`
+	LimitMode  string `json:"limitMode,omitempty"`
 }
 
 // Client 封装一个 WS 连接:接收客户端命令,并接收广播帧。

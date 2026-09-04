@@ -36,6 +36,7 @@ import (
 	fsvc "lightremote/internal/fs"
 	gitsvc "lightremote/internal/git"
 	pushsvc "lightremote/internal/push"
+	"lightremote/internal/sysmon"
 	"lightremote/internal/terminal"
 	"lightremote/internal/util"
 )
@@ -111,6 +112,7 @@ func main() {
 		ai:           aiHandlers,
 		backupMgr:    backupsvc.New(database.DB, cfg.Root),
 		push:         pushHandlers,
+		sysmon:       sysmon.New(cfg.Root),
 	}
 	app.backup = backupsvc.NewHandlers(app.backupMgr)
 	// 交互式 git 认证:broker 把"需要凭据"推给浏览器弹窗,answer 回填后放行 push/pull。
@@ -181,6 +183,7 @@ type App struct {
 	backup       *backupsvc.Handlers
 	backupMgr    *backupsvc.Manager
 	push         *pushsvc.Handlers
+	sysmon       *sysmon.Monitor
 }
 
 func (a *App) routes() http.Handler {
@@ -199,6 +202,8 @@ func (a *App) routes() http.Handler {
 
 		// 终端长连接(PTY 多窗口 + 服务端滚动缓冲)。
 		pr.Get("/api/term", a.terminal.ServeWS)
+		// 本机能不能限内存/CPU、用什么机制限 —— 新建会话面板据此决定显示什么。
+		pr.Get("/api/term/limits", a.handleTermLimits)
 
 		// 工作区 CRUD(里程碑 1 落库,供后续使用)。
 		pr.Get("/api/workspaces", a.handleListWorkspaces)
@@ -437,8 +442,17 @@ func (a *App) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 
 // ---- sysinfo ----
 
+// handleTermLimits 会话资源限制的可用性(Linux cgroup v2 / Windows Job 对象)。
+func (a *App) handleTermLimits(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, terminal.LimitSupport())
+}
+
+// handleSysInfo 概览三张卡 + 可选进程列表。procs 缺省为 0 = 不要进程列表(首页只看
+// 三张卡时不必为看不见的列表付序列化开销);sort=mem|cpu 决定按谁排序取前 N 条。
 func (a *App) handleSysInfo(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, a.readSysInfo())
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("procs"))
+	writeJSON(w, http.StatusOK, a.sysmon.Snapshot(limit, q.Get("sort")))
 }
 
 // ---- SPA ----

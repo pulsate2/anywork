@@ -1,16 +1,16 @@
 <script setup lang="ts">
 // 终端视图:多窗口 PTY + 服务端滚动缓冲 + 移动键盘层。
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import {
   NButton, NIcon, NModal, NList, NListItem,
-  NTag, NEmpty, useMessage, NSelect, NForm, NFormItem, NInput,
+  NTag, NEmpty, useMessage, NSelect, NForm, NFormItem, NInput, NInputNumber, NSwitch, NSlider,
 } from 'naive-ui'
 import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline, StarOutline } from '@vicons/ionicons5'
 import { TermClient, type TermSummary } from '@/api/term'
-import { type Workspace } from '@/api/client'
+import { api, type Workspace, type TermLimitSupport } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useCommandStore } from '@/stores/commands'
 import { copyText, selectAllIn } from '@/utils/clipboard'
@@ -41,6 +41,43 @@ const showCmdModal = ref(false)
 const workspaces = ref<Workspace[]>([])
 const selectedWs = ref<string | null>(null)
 const execShell = ref('')
+
+// ---- 新会话的资源限制 ----
+// 能限什么由服务端说(Linux cgroup v2 / Windows Job 对象),前端只负责按它显示输入框:
+// 悄悄忽略用户填的上限比不提供这个功能更糟。上次填的值记在本地,常用配置不用重填。
+const LIM_KEY = 'lr.term.limit.'
+const limitSupport = ref<TermLimitSupport | null>(null)
+const limitOn = ref(localStorage.getItem(LIM_KEY + 'on') === '1')
+const limitMem = ref<number | null>(Number(localStorage.getItem(LIM_KEY + 'mem')) || 512)
+// 滑块的值不会是 null(输入框可以清空,滑块不行),类型上就不留这个口子。
+const limitCPU = ref<number>(Number(localStorage.getItem(LIM_KEY + 'cpu')) || 50)
+// CPU 填的是"占整机百分比",换成核数好判断 —— 8 核机器上填 25 就是 2 个核。
+const limitCoreHint = computed(() => {
+  const cores = limitSupport.value?.cores || 0
+  const pct = limitCPU.value || 0
+  if (cores <= 0 || pct <= 0) return ''
+  return `≈ ${(cores * pct / 100).toFixed(1)} / ${cores} 核`
+})
+
+watch(limitOn, v => localStorage.setItem(LIM_KEY + 'on', v ? '1' : '0'))
+watch(limitMem, v => { if (v) localStorage.setItem(LIM_KEY + 'mem', String(v)) })
+watch(limitCPU, v => { if (v) localStorage.setItem(LIM_KEY + 'cpu', String(v)) })
+
+// 只在第一次打开新建弹窗时问一次:没用过这个功能的人不该多付一次请求。
+async function ensureLimitSupport() {
+  if (limitSupport.value) return
+  try {
+    limitSupport.value = await api.termLimits()
+  } catch { /* 问不到就当不支持,不显示输入框 */ }
+}
+
+// 会话卡片上的限额标签。
+function limitTags(s: TermSummary): string[] {
+  const out: string[] = []
+  if (s.memoryMB) out.push(`内存 ${s.memoryMB} MB`)
+  if (s.cpuPercent) out.push(`CPU ${s.cpuPercent}%`)
+  return out
+}
 
 // 复制弹窗:手机上没法在 xterm 画布里拖选,只能把缓冲区文本倒进一个普通
 // DOM 元素,交给系统的长按选取。
@@ -357,6 +394,7 @@ async function connect() {
 function pickWorkspaceAndCreate() {
   selectedWs.value = store.currentId
   showNewModal.value = true
+  ensureLimitSupport()
 }
 
 function createSession() {
@@ -370,7 +408,13 @@ function createSession() {
   sentRows = 0
   resetTypedMark()
   pendingAttachSettle = true
-  client.createSession(dir, execShell.value, term?.cols || 80, term?.rows || 24)
+  // 只提交本机真能限的那一项:请求了做不到的限制,服务端会直接拒绝建会话。
+  const sup = limitSupport.value
+  const use = limitOn.value && sup && sup.mode !== 'none'
+  client.createSession(dir, execShell.value, term?.cols || 80, term?.rows || 24, {
+    memoryMB: use && sup!.memory ? (limitMem.value || 0) : 0,
+    cpuPercent: use && sup!.cpu ? (limitCPU.value || 0) : 0,
+  })
   showNewModal.value = false
   execShell.value = ''
 }
@@ -803,6 +847,9 @@ watch(fitSignal, () => applyTheme())
               <n-tag v-else size="small" type="success" :bordered="false">运行中</n-tag>
             </div>
             <div class="sess-dir">{{ s.dir }}</div>
+            <div v-if="limitTags(s).length" class="sess-lim">
+              <n-tag v-for="t in limitTags(s)" :key="t" size="tiny" type="warning" :bordered="false">{{ t }}</n-tag>
+            </div>
           </div>
           <template #suffix>
             <n-button class="sess-kill" size="tiny" quaternary type="error" @click.stop="killSession(s.id)">结束</n-button>
@@ -853,6 +900,31 @@ watch(fitSignal, () => applyTheme())
         </n-form-item>
         <n-form-item label="Shell(可选)">
           <n-input v-model:value="execShell" placeholder="Windows 默认 powershell,Unix 默认 $SHELL" />
+        </n-form-item>
+        <!-- 资源限制:本机支持什么由 /api/term/limits 说 -->
+        <n-form-item v-if="limitSupport" label="资源限制">
+          <div class="lim-box">
+            <label class="lim-switch">
+              <n-switch v-model:value="limitOn" size="small" :disabled="limitSupport.mode === 'none'" />
+              <span>限制这个会话的内存 / CPU</span>
+            </label>
+            <template v-if="limitOn && limitSupport.mode !== 'none'">
+              <div v-if="limitSupport.memory" class="lim-row">
+                <span class="lim-label">内存上限</span>
+                <n-input-number v-model:value="limitMem" size="small" :min="16" :max="1048576" :step="128"
+                  style="flex:1" placeholder="MB">
+                  <template #suffix>MB</template>
+                </n-input-number>
+              </div>
+              <div v-if="limitSupport.cpu" class="lim-row">
+                <span class="lim-label">CPU 上限</span>
+                <n-slider v-model:value="limitCPU" :min="5" :max="100" :step="5" style="flex:1" />
+                <span class="lim-val">{{ limitCPU }}%</span>
+              </div>
+              <div v-if="limitSupport.cpu && limitCoreHint" class="lim-hint">占整机百分比,{{ limitCoreHint }}</div>
+            </template>
+            <div class="lim-hint">{{ limitSupport.detail }}</div>
+          </div>
         </n-form-item>
       </n-form>
       <template #footer>
@@ -946,6 +1018,15 @@ watch(fitSignal, () => applyTheme())
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
+.sess-lim { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
+
+/* 新建会话里的资源限制 */
+.lim-box { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.lim-switch { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.lim-row { display: flex; align-items: center; gap: 8px; }
+.lim-label { font-size: 12px; color: var(--lr-fg-muted); width: 58px; flex: none; }
+.lim-val { font-size: 12px; width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
+.lim-hint { font-size: 11px; line-height: 1.5; color: var(--lr-fg-muted); }
 
 /* 复制弹窗 */
 .dump-modal { width: min(680px, calc(100vw - 20px)); }

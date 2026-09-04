@@ -52,6 +52,12 @@ body {
    边框/背景是绝对定位的 __border,仍占满 44px,外观不变。
    textarea 的 __textarea-el 是 height: 100% 撑满的,靠 stretch 才对,排除在外。 */
 .n-input:not(.n-input--textarea) { align-items: center; }
+/* 但输入框内部的按钮要排除在 44px 下限之外。n-input-number 的加减钮是 text 钮
+   (naive 给它 height: initial,自然高度就一个图标),被这条下限撑到 44px 后,装它的
+   __prefix/__suffix 跟着变 44px,__wrapper 也就被顶满 44px —— 上面那条 align-items:
+   center 没有余量可居中了,里头 28px 的 input-el 只能贴顶,于是又变回"没垂直居中"。
+   输入框本身已经有 44px 触控高度,里面的钮不必再各自凑一遍。 */
+.n-input .n-button { min-height: 0; }
 
 /* 导航条:移动端固定在底部,桌面端在下面的 @media 里竖成左侧栏 */
 .bottom-nav {
