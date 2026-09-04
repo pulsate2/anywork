@@ -46,11 +46,25 @@ const execShell = ref('')
 // 能限什么由服务端说(Linux cgroup v2 / Windows Job 对象),前端只负责按它显示输入框:
 // 悄悄忽略用户填的上限比不提供这个功能更糟。上次填的值记在本地,常用配置不用重填。
 const LIM_KEY = 'lr.term.limit.'
+const BASH_KEY = 'lr.term.bash'
 const limitSupport = ref<TermLimitSupport | null>(null)
 const limitOn = ref(localStorage.getItem(LIM_KEY + 'on') === '1')
 const limitMem = ref<number | null>(Number(localStorage.getItem(LIM_KEY + 'mem')) || 512)
 // 滑块的值不会是 null(输入框可以清空,滑块不行),类型上就不留这个口子。
 const limitCPU = ref<number>(Number(localStorage.getItem(LIM_KEY + 'cpu')) || 50)
+// 以 bash 启动。默认 $SHELL 常常是 sh/dash,补全和 [[ ]] 都没有;这是个偏好,记在本地。
+const useBash = ref(localStorage.getItem(BASH_KEY) === '1')
+watch(useBash, v => localStorage.setItem(BASH_KEY, v ? '1' : '0'))
+// 不支持的项只说一句话。原理那段(detail)太长,挪到 title 上,想看再看。
+const limitNote = computed(() => {
+  const s = limitSupport.value
+  if (!s) return ''
+  if (s.mode === 'none') return '本机不支持资源限制'
+  if (s.mode === 'rlimit') return '只能用 ulimit 限内存,CPU 不可用'
+  if (!s.memory) return '本机不支持内存限制'
+  if (!s.cpu) return '本机不支持 CPU 限制'
+  return ''
+})
 // CPU 填的是"占整机百分比",换成核数好判断 —— 8 核机器上填 25 就是 2 个核。
 const limitCoreHint = computed(() => {
   const cores = limitSupport.value?.cores || 0
@@ -107,6 +121,25 @@ let sentRows = 0
 // 不能再自动跳转,否则用户结束当前会话就会被塞进另一个会话。
 let autoAttachDone = false
 
+// ── 断线与重连 ────────────────────────────────────────────────────────────────
+// 手机切后台会被系统断网,回来时这条 WS 多半已经废了,而且常常是「半开」的:
+// readyState 还停在 OPEN,send() 也不报错,但帧再也到不了对端 —— 屏幕上就是
+// 敲什么都没反应。所以判活不看 readyState,只看发出去有没有回音(TermClient.probe)。
+// PTY 在服务端是独立于连接活着的(还带 1MB 回放缓冲),重连后 attach 回去屏幕会整屏补齐。
+// 一进页面就在连了(onMounted 里),初值给 connecting,免得先绿一下再变。
+const netState = ref<'ok' | 'connecting' | 'down'>('connecting')
+const netLabel = computed(() =>
+  netState.value === 'ok' ? '已连接' : netState.value === 'connecting' ? '连接中' : '已断开')
+let reconnectTimer: number | undefined
+let reconnectTries = 0
+// 连接尝试的代号。慢网下上一次 connect 可能还挂着(WS 建连能卡半分钟),回前台又发起
+// 了新的一次;用它把迟到的旧结果丢掉,免得旧的失败把新连上的状态又改回断开。
+let connEpoch = 0
+// 重连后先拿列表再决定 attach 谁:目标会话可能在断线那会儿已经退出并被回收。
+let resumeTarget: string | null = null
+// 组件已卸载:不再重连,也不再碰已经 dispose 的 term。
+let disposed = false
+
 function handleEvent(e: any) {
   switch (e.type) {
     case 'output':
@@ -130,6 +163,18 @@ function handleEvent(e: any) {
       break
     case 'sessionList':
       sessions.value = e.list
+      // 重连回来的那一份:目标会话还活着就接回去,没了就退到空状态并说一声,
+      // 不能顺手把用户塞进别的会话(那正是 autoAttachDone 要防的事)。
+      if (resumeTarget) {
+        const want = resumeTarget
+        resumeTarget = null
+        if ((e.list as TermSummary[]).some((s) => s.id === want && !s.dead)) attachById(want)
+        else {
+          releaseActive()
+          message.warning('原会话已结束')
+        }
+        break
+      }
       if (!autoAttachDone && !activeId.value) {
         autoAttachDone = true
         // 服务端已按创建时间倒序,第一个活着的就是最新会话。
@@ -146,6 +191,10 @@ function handleEvent(e: any) {
       message.error(e.message)
       break
     case 'close':
+      // activeId 有意保留:屏幕上还是那个会话的内容,重连后 attach 回去接着用。
+      if (disposed) break
+      netState.value = 'down'
+      scheduleReconnect()
       break
   }
 }
@@ -382,13 +431,99 @@ function onTermTouchMove(e: TouchEvent) {
   term.scrollLines(lines)
 }
 
-async function connect() {
+// 建立连接。首次进页面和之后每一次重连都走这里,区别只在失败要不要弹提示:
+// 刚进页面得说明终端为什么是空的,后台自动重连失败则不该一遍遍弹 toast。
+async function connect(notify = false) {
+  if (disposed) return
+  clearReconnect()
+  const epoch = ++connEpoch
+  netState.value = 'connecting'
+  reconnectTries++
   try {
     await client.connect()
-    client.list()
   } catch (e: any) {
-    message.error(e.message || '连接失败')
+    if (disposed || epoch !== connEpoch) return
+    netState.value = 'down'
+    if (notify) message.error(e?.message || '连接失败')
+    scheduleReconnect()
+    return
   }
+  if (disposed || epoch !== connEpoch) return
+  reconnectTries = 0
+  netState.value = 'ok'
+  // 不直接 attach 回 activeId:那个会话可能在断线期间已经退出并被回收,
+  // attach 失败只会回一句笼统的 error,分不清是哪种情况。先要列表,在 handleEvent 里判。
+  resumeTarget = activeId.value
+  client.list()
+}
+
+function clearReconnect() {
+  if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+  reconnectTimer = undefined
+}
+
+// 退避重连:0.5s 起翻倍,封顶 8s。页面不可见时不排 —— 手机后台里定时器本来就被冻着,
+// 网也是断的,白试;回到前台由 onResume 立刻重连一次。
+function scheduleReconnect() {
+  if (disposed || reconnectTimer !== undefined || document.hidden) return
+  const wait = Math.min(8000, 500 * 2 ** Math.min(reconnectTries, 4))
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = undefined
+    connect()
+  }, wait)
+}
+
+// 回到前台 / 系统报网络恢复。两件事都得做:
+//  ① 连接:后台那会儿多半被断了,可能还是半开的,所以用 probe 探一次而不是看 readyState;
+//  ② 重绘:页面不可见时 xterm 的 IntersectionObserver 会把渲染整个暂停,回来后要逼它
+//     整屏重画一次,否则画面就停在切走那一刻(见 unstickRenderer 的注释)。
+// 有些 WebView / iOS 从后台回来只报 focus 不报 visibilitychange,所以两个事件都听;
+// 1 秒内只当一次,免得桌面上来回切窗口把探针刷起来。
+let resumeAt = 0
+async function onResume() {
+  if (disposed || document.hidden) return
+  const now = Date.now()
+  if (now - resumeAt < 1000) return
+  resumeAt = now
+  scheduleSettle()
+  const ok = await client.probe()
+  if (disposed || document.hidden) return
+  if (!ok) {
+    connect()
+    return
+  }
+  // 连接本来就没断(短暂切走):服务端的附加关系还在,不用重新 attach,刷一下列表就行。
+  netState.value = 'ok'
+  client.list()
+}
+
+// 断开期间的按键提示。三秒内只说一次:一次断线用户可能连按十几下。
+let offlineWarnAt = 0
+function warnOffline() {
+  const now = Date.now()
+  if (now - offlineWarnAt < 3000) return
+  offlineWarnAt = now
+  message.warning('连接已断开,正在重连')
+}
+
+// 按键时顺手探一次活。半开连接下 send 不报错、readyState 也是 OPEN,只有"发了没回音"
+// 能证明它废了 —— 而用户正盯着屏幕等回显,这时候发现最有用。最多 10s 一次。
+let keyProbeAt = 0
+function probeAfterKey() {
+  const now = Date.now()
+  if (now - keyProbeAt < 10000) return
+  keyProbeAt = now
+  client.probe().then((ok) => {
+    if (ok || disposed || netState.value === 'connecting') return
+    warnOffline()
+    connect()
+  })
+}
+
+// 会话列表:断线时列表是断线前的旧数据,顺手重连一次(状态圆点变红后用户多半会点这里)。
+function openSessions() {
+  showSessionList.value = true
+  if (!client.connected && netState.value !== 'connecting') connect()
 }
 
 function pickWorkspaceAndCreate() {
@@ -398,10 +533,18 @@ function pickWorkspaceAndCreate() {
 }
 
 function createSession() {
+  // 断线时 create 帧会被静默丢掉,弹窗一关什么也没发生 —— 先把连接找回来。
+  if (!client.connected) {
+    warnOffline()
+    if (netState.value !== 'connecting') connect()
+    return
+  }
   // 没有工作区也要能开终端:退回 root 目录。
   const ws = workspaces.value.find((w) => w.id === selectedWs.value)
   const dir = ws?.path ?? store.root
   if (ws) store.select(ws.id)
+  // 新建了就不再接回原会话。
+  resumeTarget = null
   // 切换前整屏重置:新会话从空回放开始,避免上个会话的残留输出盖在新终端上。
   term?.reset()
   sentCols = 0
@@ -411,11 +554,12 @@ function createSession() {
   // 只提交本机真能限的那一项:请求了做不到的限制,服务端会直接拒绝建会话。
   const sup = limitSupport.value
   const use = limitOn.value && sup && sup.mode !== 'none'
-  client.createSession(dir, execShell.value, term?.cols || 80, term?.rows || 24, {
+  client.createSession(dir, useBash.value ? 'bash' : execShell.value, term?.cols || 80, term?.rows || 24, {
     memoryMB: use && sup!.memory ? (limitMem.value || 0) : 0,
     cpuPercent: use && sup!.cpu ? (limitCPU.value || 0) : 0,
   })
   showNewModal.value = false
+  // execShell 是一次性的(填了个别路径就用一次),useBash 是记住的偏好,不清。
   execShell.value = ''
 }
 
@@ -424,18 +568,26 @@ function attachSession(sum: TermSummary) {
     message.warning('该会话已结束,请新建')
     return
   }
+  attachById(sum.id)
+  showSessionList.value = false
+}
+
+// attachById 只管附加这个动作本身。重连回来时手上只有一个 id(会话对象是断线前的旧数据),
+// 活没活着由刚拿到的列表判,这里不再判一遍。
+function attachById(id: string) {
+  // 用户自己选了会话,重连那份"接回原会话"的意图就作废了,否则列表一到会把他拽回去。
+  resumeTarget = null
   // 切换前整屏重置,避免上一个会话的内容残留(clear() 会留下当前提示行)。
   term?.reset()
-  activeId.value = sum.id
+  activeId.value = id
   sentCols = 0
   sentRows = 0
   resetTypedMark()
   // 回放帧在 session 帧之前就会到,那批输出解析完要再稳定化一次(见 handleEvent)。
   pendingAttachSettle = true
-  client.attach(sum.id)
+  client.attach(id)
   // 回放是按会话原来的行列生成的,尺寸先对上,程序收到 SIGWINCH 才会照现在的屏幕重画。
   syncPtySize(true)
-  showSessionList.value = false
 }
 
 function killSession(id: string) {
@@ -450,6 +602,7 @@ function killSession(id: string) {
 // 用 reset() 而不是 clear():clear() 会保留当前提示行,它会留在空状态遮罩后面。
 function releaseActive() {
   client.detach()
+  resumeTarget = null
   activeId.value = null
   pendingAttachSettle = false
   sentCols = 0
@@ -503,6 +656,13 @@ function isEnter(data: string): boolean {
 }
 
 function sendKeys(data: string) {
+  // 连接断了就别假装收下:这条路上 send() 是静默丢弃的,用户只会看到"敲了没反应"。
+  if (!client.connected) {
+    warnOffline()
+    if (netState.value !== 'connecting') connect()
+    return
+  }
+  probeAfterKey()
   if (!isEnter(data)) {
     // 在按键真正送出去之前量一次光标位置:此刻它还停在提示符末尾,那个列号就是
     // 提示符的显示宽度。PS1 可以随便定,认不全,量一下比拿正则去猜可靠得多。
@@ -772,14 +932,23 @@ onMounted(async () => {
   await nextTick()
   attemptFit()
   setUpResize()
-  await connect()
+  // 手机切后台被断网,回来时要靠这几个事件把连接和画面都拉回来(见 onResume)。
+  document.addEventListener('visibilitychange', onResume)
+  window.addEventListener('focus', onResume)
+  window.addEventListener('online', onResume)
+  await connect(true)
   loadWorkspaces()
 })
 
 onUnmounted(() => {
+  disposed = true
   resizeObserver?.disconnect()
   window.visualViewport?.removeEventListener('resize', onVisualViewport)
   window.visualViewport?.removeEventListener('scroll', onVisualViewport)
+  document.removeEventListener('visibilitychange', onResume)
+  window.removeEventListener('focus', onResume)
+  window.removeEventListener('online', onResume)
+  clearReconnect()
   clearSettle()
   client.close()
   term?.dispose()
@@ -793,9 +962,12 @@ watch(fitSignal, () => applyTheme())
   <div class="page-content terminal-page" :class="{ 'kb-open': kbInset > 0 }">
     <!-- 顶部操作栏 -->
     <div class="term-toolbar">
-      <n-button size="small" quaternary @click="showSessionList = true">
+      <n-button class="term-sess" size="small" quaternary @click="openSessions">
         <template #icon><n-icon :component="TerminalOutline" /></template>
         会话
+        <!-- 连接状态圆点:绿=已连接,黄=连接中,红=已断开。8px 的绿和黄在小屏上不好分辨,
+             所以颜色之外还有 title/aria-label,连接中另加一点呼吸动效当第二个信号。 -->
+        <span class="net-dot" :class="netState" role="img" :aria-label="netLabel" :title="netLabel"></span>
       </n-button>
       <!-- 收藏 / 复制 / 粘贴:只留图标。这排横向很挤,带字的话「新建」会被挤出去。
            title + aria-label 补上说明,鼠标悬停和读屏都还知道是什么。 -->
@@ -899,7 +1071,16 @@ watch(fitSignal, () => applyTheme())
           />
         </n-form-item>
         <n-form-item label="Shell(可选)">
-          <n-input v-model:value="execShell" placeholder="Windows 默认 powershell,Unix 默认 $SHELL" />
+          <div class="lim-box">
+            <!-- $SHELL 在不少机器上是 sh/dash,补全和 [[ ]] 都没有;开着就固定用 bash。
+                 开关优先于下面的输入框,所以顺手把它禁掉,免得填了却不生效。 -->
+            <label class="lim-switch">
+              <n-switch v-model:value="useBash" size="small" />
+              <span>以 bash 启动</span>
+            </label>
+            <n-input v-model:value="execShell" :disabled="useBash"
+              placeholder="Windows 默认 powershell,Unix 默认 $SHELL" />
+          </div>
         </n-form-item>
         <!-- 资源限制:本机支持什么由 /api/term/limits 说 -->
         <n-form-item v-if="limitSupport" label="资源限制">
@@ -923,7 +1104,7 @@ watch(fitSignal, () => applyTheme())
               </div>
               <div v-if="limitSupport.cpu && limitCoreHint" class="lim-hint">占整机百分比,{{ limitCoreHint }}</div>
             </template>
-            <div class="lim-hint">{{ limitSupport.detail }}</div>
+            <div v-if="limitNote" class="lim-hint" :title="limitSupport.detail">{{ limitNote }}</div>
           </div>
         </n-form-item>
       </n-form>
@@ -967,6 +1148,30 @@ watch(fitSignal, () => applyTheme())
 .spacer { flex: 1; }
 /* 图标钮不留文字的位置,压到方形 */
 .term-ico { width: 34px; padding: 0; }
+/* 连接状态圆点,贴在「会话」钮的右下角。.n-button 本身是 position: relative,
+   但别指望组件库的实现细节,这里自己声明一次。 */
+.term-sess { position: relative; }
+.net-dot {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  /* 一圈灰描边:钮被按下/悬停时底色会变,圆点得跟它分开。用中性灰,浅深主题通吃。 */
+  box-shadow: 0 0 0 1.5px rgba(127, 127, 127, .25);
+  background: var(--lr-fg-muted);
+  pointer-events: none;
+}
+.net-dot.ok { background: var(--lr-ok); }
+.net-dot.connecting { background: var(--lr-warn); animation: net-pulse 1.1s ease-in-out infinite; }
+.net-dot.down { background: var(--lr-danger); }
+@keyframes net-pulse {
+  50% { opacity: .3; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .net-dot.connecting { animation: none; }
+}
 .term-wrap {
   position: relative;
   flex: 1;

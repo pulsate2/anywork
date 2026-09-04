@@ -36,6 +36,8 @@ export class TermClient {
   private ws: WebSocket | null = null
   private onEvent: (e: TermEvent) => void
   private current: string | null = null
+  // 等着"随便来一帧"的探针回调,见 probe()。
+  private probeWaiters = new Set<(ok: boolean) => void>()
 
   constructor(onEvent: (e: TermEvent) => void) {
     this.onEvent = onEvent
@@ -50,6 +52,9 @@ export class TermClient {
   }
 
   connect(): Promise<void> {
+    // 重连时先把旧 socket 摘掉:它的 onclose 是异步来的,晚一步就会把新连接刚建好的
+    // 状态又清成断开。
+    this.close()
     return new Promise((resolve, reject) => {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = new WebSocket(`${proto}//${location.host}/api/term`)
@@ -62,20 +67,54 @@ export class TermClient {
         resolve()
       }
       ws.onclose = () => {
+        // 只有还是"当前"那条连接才算数:上一条被替换掉的 socket 关闭与外界无关。
+        if (this.ws !== ws) return
+        this.ws = null
         this.current = null
+        this.flushProbes(false)
         this.onEvent({ type: 'close' })
       }
-      ws.onerror = (ev) => {
+      ws.onerror = () => {
         reject(new Error('终端连接失败'))
+        if (this.ws !== ws) return
         this.onEvent({ type: 'error', message: '终端连接失败' })
       }
-      ws.onmessage = (ev) => this.handleMessage(ev.data)
+      ws.onmessage = (ev) => {
+        this.flushProbes(true)
+        this.handleMessage(ev.data)
+      }
     })
   }
 
   close() {
-    this.ws?.close()
+    const ws = this.ws
     this.ws = null
+    this.current = null
+    this.flushProbes(false)
+    ws?.close()
+  }
+
+  // probe 发一个只读的 list 帧当探针,等任意回帧。
+  // 手机切后台被断网后,socket 常常停在半开状态:readyState 还是 OPEN,send() 也不报错,
+  // 但帧再也到不了对端 —— 表现就是终端毫无反应。只能靠"发出去有没有回音"来判定。
+  // 返回 false 表示这条连接已经不通(或本来就没连上),该重连了。
+  probe(timeoutMs = 3000): Promise<boolean> {
+    if (!this.connected) return Promise.resolve(false)
+    return new Promise<boolean>((resolve) => {
+      const waiter = (ok: boolean) => {
+        clearTimeout(timer)
+        this.probeWaiters.delete(waiter)
+        resolve(ok)
+      }
+      const timer = setTimeout(() => waiter(false), timeoutMs)
+      this.probeWaiters.add(waiter)
+      this.list()
+    })
+  }
+
+  private flushProbes(ok: boolean) {
+    if (!this.probeWaiters.size) return
+    for (const w of [...this.probeWaiters]) w(ok)
   }
 
   // 服务端 readLoop 只接受"纯 JSON 文本帧"(二进制帧直接丢弃,也不吃类型前缀字节),

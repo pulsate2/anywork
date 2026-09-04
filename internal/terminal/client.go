@@ -60,6 +60,19 @@ type Summary struct {
 	LimitMode  string `json:"limitMode,omitempty"`
 }
 
+// 保活与写超时。
+// 手机切后台被系统断网时,TCP 常常直接变成黑洞:写得进内核缓冲(不报错),读永远不返回。
+// 所以这两个超时都不是可选的:
+//   - ping 必须有自己的超时并在失败时作废整条连接,否则 conn.Read 会一直挂着,
+//     这条连接和它附加的会话永远不被回收 —— 手机每切一次后台就留一份。
+//   - 写必须有超时,否则一个黑洞连接会把广播卡在它身上(见 watchExit / broadcastSessionList
+//     里的同步 sendText 循环),别的客户端连"会话已退出"都收不到。
+const (
+	pingInterval = 30 * time.Second
+	pingTimeout  = 10 * time.Second
+	writeTimeout = 10 * time.Second
+)
+
 // Client 封装一个 WS 连接:接收客户端命令,并接收广播帧。
 type Client struct {
 	conn *websocket.Conn
@@ -121,19 +134,28 @@ func (c *Client) sendText(t byte, v any) {
 	buf := make([]byte, 1+len(b))
 	buf[0] = t
 	copy(buf[1:], b)
-	c.conn.Write(context.Background(), websocket.MessageText, buf)
+	// 带超时:调用方是同步的广播循环,不能被一个没在收的连接卡住(见上面的常量注释)。
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+	c.conn.Write(ctx, websocket.MessageText, buf)
 }
 
-// pingTicker 定期发 ping 保活。
-func (c *Client) pingTicker(ctx context.Context) {
-	t := time.NewTicker(30 * time.Second)
+// pingTicker 定期发 ping 保活,同时兼作"对端还在不在"的探测。
+// ping 超时说明这条连接已经废了(典型是手机被断网):作废整条连接,让 readLoop 退出、
+// 会话把它摘掉;前端那边会自己重连回来(见 web/src/api/term.ts 的 probe/重连)。
+func (c *Client) pingTicker(ctx context.Context, cancel context.CancelFunc) {
+	t := time.NewTicker(pingInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := c.conn.Ping(ctx); err != nil {
+			pctx, pcancel := context.WithTimeout(ctx, pingTimeout)
+			err := c.conn.Ping(pctx)
+			pcancel()
+			if err != nil {
+				cancel()
 				return
 			}
 		}

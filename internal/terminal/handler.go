@@ -57,7 +57,7 @@ func (m *Manager) ServeWS(w http.ResponseWriter, r *http.Request) {
 	m.AddClient(c)
 	defer m.RemoveClient(c)
 	go c.writeLoop(ctx)
-	go c.pingTicker(ctx)
+	go c.pingTicker(ctx, cancel)
 
 	var (
 		mu    sync.Mutex

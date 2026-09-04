@@ -8,6 +8,9 @@
   --lr-fg-muted: #6b7280;
   --lr-accent: #2563eb;
   --lr-danger: #dc2626;
+  /* 状态色(连接状态圆点这类指示器)。和上面几个一样,浅色用 600、深色用 500 那一档。 */
+  --lr-ok: #16a34a;
+  --lr-warn: #d97706;
 
   /* 布局 */
   --lr-radius: 10px;
@@ -26,6 +29,8 @@
     --lr-fg-muted: #9ca3af;
     --lr-accent: #3b82f6;
     --lr-danger: #ef4444;
+    --lr-ok: #22c55e;
+    --lr-warn: #f59e0b;
   }
 }
 
