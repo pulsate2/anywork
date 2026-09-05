@@ -82,11 +82,14 @@ func readCPUTimes() cpuTimes {
 	return cpuTimes{busy: total - idle, total: total, ok: true}
 }
 
-func readMemory() Memory {
+// readMemory 一次 /proc/meminfo 同时得出物理内存与 swap —— 两组数就在同一个文件里,
+// 分两次读只是多一次系统调用外加两份可能不一致的快照。
+func readMemory() (Memory, Swap) {
 	var m Memory
+	var s Swap
 	b, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return m
+		return m, s
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		fields := strings.Fields(line)
@@ -99,16 +102,15 @@ func readMemory() Memory {
 			m.TotalMB = val / 1024
 		case "MemAvailable:":
 			m.FreeMB = val / 1024
+		case "SwapTotal:":
+			s.TotalMB = val / 1024
+		case "SwapFree:":
+			s.FreeMB = val / 1024
 		}
 	}
-	if m.TotalMB > 0 {
-		if m.FreeMB >= m.TotalMB {
-			m.FreeMB = m.TotalMB
-		}
-		m.UsedMB = m.TotalMB - m.FreeMB
-		m.UsedPct = int(m.UsedMB * 100 / m.TotalMB)
-	}
-	return m
+	m.FreeMB, m.UsedMB, m.UsedPct = memUsage(m.TotalMB, m.FreeMB)
+	s.FreeMB, s.UsedMB, s.UsedPct = memUsage(s.TotalMB, s.FreeMB)
+	return m, s
 }
 
 func readDisk(path string) Disk {
@@ -178,12 +180,15 @@ func readProcStat(pid int) (rawProc, bool) {
 	return p, true
 }
 
-// enrich 补全要显示的那几条:完整命令行 + 属主。
+// enrich 补全要显示的那几条:完整命令行 + 属主,顺带用 argv[0] 纠正名字。
 func enrich(p *Process) {
 	dir := "/proc/" + strconv.Itoa(p.PID)
 	if b, err := os.ReadFile(dir + "/cmdline"); err == nil && len(b) > 0 {
 		// cmdline 用 NUL 分隔参数,末尾还有一个。
-		p.Cmd = strings.TrimSpace(strings.ReplaceAll(strings.TrimRight(string(b), "\x00"), "\x00", " "))
+		args := strings.TrimRight(string(b), "\x00")
+		p.Cmd = strings.TrimSpace(strings.ReplaceAll(args, "\x00", " "))
+		argv0, _, _ := strings.Cut(args, "\x00")
+		p.Name = procName(p.Name, argv0)
 	}
 	if p.Cmd == "" {
 		// 内核线程没有命令行,按 top 的习惯用方括号标出来。
@@ -194,6 +199,31 @@ func enrich(p *Process) {
 			p.User = userName(st.Uid)
 		}
 	}
+}
+
+// procName 定下进程表里显示的名字。
+//
+// stat 里的 comm 是**主线程**的名字,而线程名进程自己想怎么改就怎么改:Node.js 把主
+// 线程叫 MainThread,于是一排 node 程序(vite、codex……)在进程表里全叫 MainThread,
+// 谁是谁完全看不出来。这种对不上的情况就改用 argv[0] 的基名。
+//
+// 反过来,comm 出现在 argv[0] 里时保留 comm:那要么是被 comm 的 15 字上限截断
+// (systemd-journal ← systemd-journald),要么是 argv[0] 自己带了前缀后缀或干脆被改写
+// ("-bash" 表示登录 shell、"@dbus-daemon" 是 systemd 的写法、"sshd: root@pts/0" 是
+// 服务自己写的状态串),这些情况 comm 反而更干净。注意要拿整个 argv[0] 去比而不是它
+// 的基名 —— 状态串里也可能有斜杠,按基名切会剩下 "0" 这种碎片。
+func procName(comm, argv0 string) string {
+	base := argv0
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	if comm == "" {
+		return base
+	}
+	if base == "" || strings.Contains(argv0, comm) {
+		return comm
+	}
+	return base
 }
 
 // userName uid → 用户名。同一批进程里 uid 高度重复,查一次记住。

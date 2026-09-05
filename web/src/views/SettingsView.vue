@@ -15,6 +15,8 @@ const tab = ref('backup')
 const sys = ref<SysInfo | null>(null)
 // percent 为 -1 表示平台不支持采集,进度条按 0 画。
 const cpuPct = computed(() => Math.max(0, Math.min(100, sys.value?.cpu.percent ?? 0)))
+// swap 可能整体缺失(机器没配 / 老版本后端没这个字段),进度条按 0 画。
+const swapPct = computed(() => Math.max(0, Math.min(100, sys.value?.swap?.usedPct ?? 0)))
 
 // ---- 系统面板实时刷新 ----
 // 只在"系统"标签页可见时轮询:切走或页面进后台就停,不给服务器和手机电池添活。
@@ -147,7 +149,7 @@ async function loadSnaps(id: string) {
 
 async function load() {
   loadJobs()
-  // 概览三张卡先出来;进程列表等用户真的切到"系统"页再拉。
+  // 概览卡先出来;进程列表等用户真的切到"系统"页再拉。
   pullSys(false)
   try {
     const ps = await api.pushStatus()
@@ -449,6 +451,16 @@ onUnmounted(() => {
             <div class="sys-line">{{ sys.memory.usedMB }} MB / {{ sys.memory.totalMB }} MB ({{ sys.memory.usedPct }}%)</div>
           </div>
           <div class="sys-card">
+            <h4>Swap</h4>
+            <div class="bar"><div class="bar-fill" :style="{ width: swapPct + '%' }" /></div>
+            <!-- 没配 swap 时说明"未启用":有没有交换区本身就是要看的信息,
+                 显示成 0 MB / 0 MB 会让人以为是采集失败。 -->
+            <div v-if="sys.swap?.totalMB" class="sys-line">
+              {{ sys.swap.usedMB }} MB / {{ sys.swap.totalMB }} MB ({{ sys.swap.usedPct }}%)
+            </div>
+            <div v-else class="sys-line">未启用</div>
+          </div>
+          <div class="sys-card">
             <h4>磁盘</h4>
             <div class="bar"><div class="bar-fill" :style="{ width: Math.min(100, sys.disk.usedPct) + '%' }" /></div>
             <div class="sys-line">{{ sys.disk.usedGB }} GB / {{ sys.disk.totalGB }} GB ({{ sys.disk.usedPct }}%)</div>
@@ -570,7 +582,9 @@ h2 { font-size: 20px; margin: 0 0 8px; }
 .snap-name { font-family: monospace; }
 .snap-size { color: var(--lr-fg-muted); font-size: 12px; }
 .snap-dl { font-size: 13px; color: var(--lr-primary, #2563eb); }
-.sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+/* 加上 Swap 是四张卡了。min 从 200 收到 150:手机上排成 2×2,不然四张竖着堆
+   要划半屏才看到进程表。 */
+.sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .sys-card { border: 1px solid var(--lr-border, #eee); border-radius: 8px; padding: 12px; }
 .sys-card h4 { margin: 0 0 8px; font-size: 14px; }
 .bar { height: 8px; background: #eef0f4; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }

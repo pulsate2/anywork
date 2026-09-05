@@ -447,8 +447,8 @@ func (a *App) handleTermLimits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, terminal.LimitSupport())
 }
 
-// handleSysInfo 概览三张卡 + 可选进程列表。procs 缺省为 0 = 不要进程列表(首页只看
-// 三张卡时不必为看不见的列表付序列化开销);sort=mem|cpu 决定按谁排序取前 N 条。
+// handleSysInfo 概览卡(CPU/内存/Swap/磁盘)+ 可选进程列表。procs 缺省为 0 = 不要进程
+// 列表(首页只看概览时不必为看不见的列表付序列化开销);sort=mem|cpu 决定按谁排序取前 N 条。
 func (a *App) handleSysInfo(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("procs"))

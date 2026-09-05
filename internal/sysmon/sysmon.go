@@ -1,4 +1,4 @@
-// Package sysmon 采集机器概览(CPU/内存/磁盘)与进程列表,供设置页的"系统"面板
+// Package sysmon 采集机器概览(CPU/内存/Swap/磁盘)与进程列表,供设置页的"系统"面板
 // 实时刷新使用。采集实现按平台分文件(sysmon_linux/windows/other)。
 //
 // 这里是有状态的:所有 CPU 百分比都必须由两次采样的差值算出,单次快照拿不到。
@@ -26,6 +26,7 @@ const (
 type Info struct {
 	CPU    CPU    `json:"cpu"`
 	Memory Memory `json:"memory"`
+	Swap   Swap   `json:"swap"`
 	Disk   Disk   `json:"disk"`
 }
 
@@ -43,6 +44,28 @@ type Memory struct {
 	UsedMB  uint64 `json:"usedMB"`
 	FreeMB  uint64 `json:"freeMB"`
 	UsedPct int    `json:"usedPct"`
+}
+
+// Swap 交换区。没配 swap 的机器(以及容器里常见的 swapaccount=0)整体为 0,
+// 前端据此显示"未启用"而不是一条永远 0% 的进度条 —— 有没有 swap 本身就是要看的信息。
+type Swap struct {
+	TotalMB uint64 `json:"totalMB"`
+	UsedMB  uint64 `json:"usedMB"`
+	FreeMB  uint64 `json:"freeMB"`
+	UsedPct int    `json:"usedPct"`
+}
+
+// memUsage 由总量和可用量补出「可用、已用、已用百分比」。可用量先截到总量以内:
+// MemAvailable 偶尔会略大于 MemTotal,不截会减出一个下溢的天文数字。
+func memUsage(total, free uint64) (uint64, uint64, int) {
+	if total == 0 {
+		return 0, 0, 0
+	}
+	if free > total {
+		free = total
+	}
+	used := total - free
+	return free, used, int(used * 100 / total)
 }
 
 type Disk struct {
@@ -67,7 +90,7 @@ type Process struct {
 	MemPct  float64 `json:"memPct"`
 }
 
-// Snapshot 一次采样结果。Info 内联展开,所以 JSON 顶层就是 cpu/memory/disk。
+// Snapshot 一次采样结果。Info 内联展开,所以 JSON 顶层就是 cpu/memory/swap/disk。
 type Snapshot struct {
 	Info
 	// SampleMs 这批百分比是用多长的时间窗算出来的。
@@ -122,7 +145,7 @@ type rawProc struct {
 	start     uint64
 }
 
-// Snapshot 采一次。procLimit<=0 表示不需要进程列表(首页只要三张卡)。
+// Snapshot 采一次。procLimit<=0 表示不需要进程列表(首页只要概览卡)。
 // sortBy: "mem" 按内存,其余按 CPU。
 func (m *Monitor) Snapshot(procLimit int, sortBy string) Snapshot {
 	if procLimit > maxProcs {
@@ -143,10 +166,12 @@ func (m *Monitor) Snapshot(procLimit int, sortBy string) Snapshot {
 	m.prev = cur
 
 	win := cur.at.Sub(prev.at)
+	mem, swap := readMemory()
 	snap := Snapshot{
 		Info: Info{
 			CPU:    CPU{Load: readLoad(), Cores: cores(), Percent: cpuPercent(prev.cpu, cur.cpu)},
-			Memory: readMemory(),
+			Memory: mem,
+			Swap:   swap,
 			Disk:   readDisk(m.root),
 		},
 		SampleMs:      win.Milliseconds(),

@@ -23,6 +23,13 @@ func TestSnapshotShape(t *testing.T) {
 	if snap.Memory.UsedPct < 0 || snap.Memory.UsedPct > 100 {
 		t.Errorf("Memory.UsedPct 越界: %d", snap.Memory.UsedPct)
 	}
+	// Swap 可以整体为 0(机器没配 swap / 容器里关了统计),但填了总量就得自洽。
+	if snap.Swap.UsedPct < 0 || snap.Swap.UsedPct > 100 {
+		t.Errorf("Swap.UsedPct 越界: %d", snap.Swap.UsedPct)
+	}
+	if snap.Swap.UsedMB+snap.Swap.FreeMB != snap.Swap.TotalMB {
+		t.Errorf("Swap 已用+空闲 != 总量: %+v", snap.Swap)
+	}
 	if !procSupported {
 		if len(snap.Processes) != 0 {
 			t.Errorf("平台不支持进程列表却返回了 %d 条", len(snap.Processes))
@@ -79,6 +86,20 @@ func TestSnapshotNoProcs(t *testing.T) {
 	}
 	if procSupported && snap.ProcTotal == 0 {
 		t.Error("ProcTotal 应始终填充(它是下一次差值的基线)")
+	}
+}
+
+// TestMemUsage 总量为 0(没配 swap)不能除零;可用量反超总量也不能下溢。
+func TestMemUsage(t *testing.T) {
+	if free, used, pct := memUsage(0, 0); free != 0 || used != 0 || pct != 0 {
+		t.Errorf("总量 0 应全零,得到 %d/%d/%d", free, used, pct)
+	}
+	if free, used, pct := memUsage(1000, 250); free != 250 || used != 750 || pct != 75 {
+		t.Errorf("750/1000 应算出 75%%,得到 %d/%d/%d", free, used, pct)
+	}
+	// MemAvailable 偶尔略大于 MemTotal:截到总量,已用为 0,而不是下溢成天文数字。
+	if free, used, pct := memUsage(1000, 1200); free != 1000 || used != 0 || pct != 0 {
+		t.Errorf("可用量超总量应截断,得到 %d/%d/%d", free, used, pct)
 	}
 }
 

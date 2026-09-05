@@ -63,25 +63,45 @@ type memoryStatusEx struct {
 	AvailExtendedVirtual uint64
 }
 
-func readMemory() Memory {
+// readMemory 物理内存 + 页面文件(swap 的 Windows 对应物)。
+//
+// MEMORYSTATUSEX 里的 TotalPageFile/AvailPageFile 并不是"页面文件大小",而是提交
+// 限额(物理内存 + 所有页面文件)与还能提交的量。所以页面文件本身要减掉物理内存
+// 那一份;已用量同理,用总提交量减去物理已用量估出来。这是任务管理器"已提交"
+// 那一栏的同一套算术,取不到就退化成 0(前端显示"未启用")。
+func readMemory() (Memory, Swap) {
 	var st memoryStatusEx
 	st.Length = uint32(unsafe.Sizeof(st))
 	r, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&st)))
 	if r == 0 {
-		return Memory{}
+		return Memory{}, Swap{}
 	}
 	m := Memory{
 		TotalMB: st.TotalPhys / (1 << 20),
 		FreeMB:  st.AvailPhys / (1 << 20),
 	}
-	if m.TotalMB > 0 {
-		if m.FreeMB > m.TotalMB {
-			m.FreeMB = m.TotalMB
-		}
-		m.UsedMB = m.TotalMB - m.FreeMB
-		m.UsedPct = int(m.UsedMB * 100 / m.TotalMB)
+	m.FreeMB, m.UsedMB, m.UsedPct = memUsage(m.TotalMB, m.FreeMB)
+
+	var s Swap
+	if st.TotalPageFile > st.TotalPhys {
+		s.TotalMB = (st.TotalPageFile - st.TotalPhys) / (1 << 20)
 	}
-	return m
+	// 已提交总量减去物理已用量 ≈ 落在页面文件里的那部分。
+	committed := sub(st.TotalPageFile, st.AvailPageFile)
+	inPageFileMB := sub(committed, sub(st.TotalPhys, st.AvailPhys)) / (1 << 20)
+	if inPageFileMB > s.TotalMB {
+		inPageFileMB = s.TotalMB
+	}
+	s.FreeMB, s.UsedMB, s.UsedPct = memUsage(s.TotalMB, s.TotalMB-inPageFileMB)
+	return m, s
+}
+
+// sub 不下溢的减法(两个计数分别采自不同瞬间时,后者可能反超前者)。
+func sub(a, b uint64) uint64 {
+	if a < b {
+		return 0
+	}
+	return a - b
 }
 
 // readDisk 统计 path 所在卷的容量(root 可能在任意盘)。

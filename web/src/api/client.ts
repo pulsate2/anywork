@@ -55,7 +55,7 @@ export const api = {
   renameWorkspace: (id: string, name: string) =>
     request<{ ok: boolean }>('PUT', `/api/workspaces/${id}`, { name }),
   deleteWorkspace: (id: string) => request<{ ok: boolean }>('DELETE', `/api/workspaces/${id}`),
-  // procs 缺省 0 = 只要三张卡不要进程列表(首页概览用);sort=cpu|mem。
+  // procs 缺省 0 = 只要概览卡不要进程列表(首页概览用);sort=cpu|mem。
   sysinfo: (opt?: { procs?: number; sort?: 'cpu' | 'mem' }) => {
     const qs = new URLSearchParams()
     if (opt?.procs) qs.set('procs', String(opt.procs))
@@ -272,6 +272,8 @@ export interface ProcInfo {
 export interface SysInfo {
   cpu: { load: number; cores: number; percent: number }
   memory: { totalMB: number; usedMB: number; freeMB: number; usedPct: number }
+  // swap 交换区(Windows 上是页面文件)。没配 swap 时整体为 0。
+  swap: { totalMB: number; usedMB: number; freeMB: number; usedPct: number }
   disk: { totalGB: number; usedGB: number; freeGB: number; usedPct: number }
   // 这批百分比是用多长的窗口算出来的(毫秒)。
   sampleMs: number
