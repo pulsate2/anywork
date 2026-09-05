@@ -934,7 +934,7 @@ watch(() => store.currentPath, (p) => {
   flex: none; width: 20px; white-space: pre;
   font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
 }
-.git-xy.add { color: #16a34a; }
+.git-xy.add { color: var(--lr-diff-add); }
 .git-xy.danger { color: var(--lr-danger); }
 /* rtl 让长路径优先露出尾部(文件名),溢出省略号落在开头 */
 .git-path {
@@ -976,8 +976,9 @@ watch(() => store.currentPath, (p) => {
   font-family: ui-monospace, monospace; font-size: 12px;
   overflow-wrap: anywhere;
 }
-.diff-add { flex: none; color: #16a34a; font-size: 12px; }
-.diff-del { flex: none; color: var(--lr-danger); font-size: 12px; }
+/* +N/-N 用和差异行同一套令牌,列表和二级页对得上;粗体是给色觉障碍的第二道线索 */
+.diff-add { flex: none; color: var(--lr-diff-add); font-size: 12px; font-weight: 600; }
+.diff-del { flex: none; color: var(--lr-diff-del); font-size: 12px; font-weight: 600; }
 /* 一级文件列表行:点整行进二级页。 */
 .diff-file.list-row {
   border: 1px solid rgba(127, 127, 127, 0.2);
@@ -1000,7 +1001,7 @@ watch(() => store.currentPath, (p) => {
   padding: 6px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.14);
 }
 .branch-main { display: flex; align-items: center; gap: 6px; min-width: 0; cursor: pointer; }
-.branch-cur { flex: none; color: #16a34a; }
+.branch-cur { flex: none; color: var(--lr-diff-add); }
 .branch-name {
   font-family: ui-monospace, monospace; font-size: 13px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

@@ -11,11 +11,36 @@
   /* 状态色(连接状态圆点这类指示器)。和上面几个一样,浅色用 600、深色用 500 那一档。 */
   --lr-ok: #16a34a;
   --lr-warn: #d97706;
+  /* Git 差异配色:红绿严格用参考稿的原值,不做调整。
+     参考稿是一张固定浅底的卡(白 ctx + #24292f 深字),所以这一套不跟深浅主题翻转 ——
+     深色主题下差异卡同样是浅底,#ccffcc / #ffcccc 才还是参考稿里那个颜色。 */
+  --lr-diff-surface: #ffffff;
+  --lr-diff-head: #f6f8fa;
+  --lr-diff-border: #d0d7de;
+  --lr-diff-code: #24292f;
+  --lr-diff-no: #8c959f;
+  --lr-diff-add-bg: #ccffcc;
+  --lr-diff-add-gutter: #aaffaa;
+  --lr-diff-del-bg: #ffcccc;
+  --lr-diff-del-gutter: #ffaaaa;
+  --lr-diff-del-fg: #b71c1c;
+  --lr-diff-hunk-bg: #ddf4ff;
+  --lr-diff-hunk-fg: #0969da;
+  /* 卡外的小字(一级列表的 +N/-N、git status 的状态码、当前分支)。这些压在页面底色上,
+     底色跟主题翻转,所以这两个跟着主题走:红取参考稿的 #b71c1c,绿参考稿没给前景色
+     (它的加行是深字 + 浅绿底),取同族的 #1a7f37。 */
+  --lr-diff-add: #1a7f37;
+  --lr-diff-del: #b71c1c;
 
   /* 布局 */
   --lr-radius: 10px;
   --lr-touch: 44px; /* 触控目标下限 */
   --lr-sidebar: 168px; /* 桌面端左侧导航宽度,页面留白要减掉它 */
+  /* 页面留白抽成变量:吸顶元素要用等量负外边距把它抵掉,背景才能横向铺满整行 ——
+     否则滚动时内容会从左右两条缝里透着过去。桌面端在下面的 @media 里改写这三个值。 */
+  --lr-page-pad: 12px;
+  --lr-page-pad-left: 12px;
+  --lr-page-pad-bottom: calc(72px + env(safe-area-inset-bottom));
 
   /* 断点 */
   --lr-breakpoint-mobile: 768px;
@@ -31,6 +56,10 @@
     --lr-danger: #ef4444;
     --lr-ok: #22c55e;
     --lr-warn: #f59e0b;
+    /* 差异卡自身的红绿严格照参考稿,不随主题翻转(见上面的说明),所以这里不覆盖。
+       只有卡外压在深页底上的那两个小字要换亮档:#b71c1c 压在 #0f1115 上只有 2.88:1。 */
+    --lr-diff-add: #4ade80;
+    --lr-diff-del: #fca5a5;
   }
 }
 
@@ -96,8 +125,9 @@ body {
 
 /* 主内容区(给底部导航留空间) */
 .page-content {
-  padding: 12px;
-  padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  padding: var(--lr-page-pad);
+  padding-left: var(--lr-page-pad-left);
+  padding-bottom: var(--lr-page-pad-bottom);
   min-height: 100%;
 }
 
@@ -124,5 +154,10 @@ body {
     font-size: 14px;
   }
   .bottom-nav .nav-item.active { background: rgba(127,127,127,.12); }
-  .page-content { padding: 20px; padding-left: calc(var(--lr-sidebar) + 20px); }
+  /* 桌面端留白改到变量上,吸顶元素的负外边距会跟着变,不用各自再写一遍媒体查询 */
+  :root {
+    --lr-page-pad: 20px;
+    --lr-page-pad-left: calc(var(--lr-sidebar) + 20px);
+    --lr-page-pad-bottom: 20px;
+  }
 }
