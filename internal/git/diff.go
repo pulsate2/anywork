@@ -31,6 +31,16 @@ func (s *Service) Diff(p, scope, file, ref string) (string, error) {
 	default: // worktree
 		args = []string{"diff"}
 	}
+	// 空仓库上 HEAD 还没出生,显式写 HEAD 的那条会 fatal。用空树顶替:"和 HEAD 比"
+	// 变成"和什么都没有比",第一批文件于是整篇显示成新增,而不是一句报错。
+	// (--cached 不用管:git 自己在没有 HEAD 时就是拿空树比的。)
+	if scope == "head" && !s.hasCommits(info.Root) {
+		et, err := s.emptyTree(info.Root)
+		if err != nil {
+			return "", err
+		}
+		args = []string{"diff", et}
+	}
 	if file != "" {
 		args = append(args, "--", cleanRelPath(file))
 	}

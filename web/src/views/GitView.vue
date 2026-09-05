@@ -13,8 +13,8 @@ import {
   ArrowUndoOutline, SyncOutline, GitNetworkOutline, SaveOutline,
 } from '@vicons/ionicons5'
 import {
-  api, type GitStatus, type GitEntry, type GitCommit, type GitRepo,
-  type GitBranch, type GitBranchList, type GitRemote, type RestoreMode,
+  api, ApiError, GIT_NO_IDENTITY, GIT_ALREADY_REPO, type GitStatus, type GitEntry, type GitCommit, type GitRepo,
+  type GitBranch, type GitBranchList, type GitRemote, type RestoreMode, type GitIdentity,
 } from '@/api/client'
 import { GitAuthClient } from '@/api/gitAuth'
 import { useWorkspaceStore } from '@/stores/workspace'
@@ -109,18 +109,115 @@ async function cancelAsk() {
     await api.gitAuthAnswer(askToken.value)
   } catch { /* ignore */ }
 }
+
+// ---- 提交身份(user.name / user.email)----
+// git 没身份就不肯提交,它给的解法是去敲 git config —— 这里没有终端可敲,所以后端在
+// 提交/回滚之前先问一句,拼不出身份就回 428,前端弹这个框让人填,填完把刚才那步重放。
+// 只写当前仓库的 .git/config:同一台机器上不同仓库用不同身份是常事,替用户改全局
+// 等于动了他所有仓库的默认值。
+const idModal = ref(false)
+const idName = ref('')
+const idEmail = ref('')
+const idSaving = ref(false)
+const idInherited = ref(false)
+// 填完身份后要重放的那一步(提交 / 回滚某个提交)。
+let idRetry: (() => Promise<void>) | null = null
+
+// 提交弹窗里显示"这次会署谁的名",顺带给一个改的入口 —— 否则填错一次(比如邮箱打错)
+// 之后就只能回终端敲 git config 了。null = 还没读到/读失败,那一行就不显示。
+const commitIdent = ref<GitIdentity | null>(null)
+
+const idValid = computed(() => {
+  const e = idEmail.value.trim()
+  return !!idName.value.trim() && e.includes('@') && !e.includes(' ')
+})
+
+// 428 之外的错误照常往外抛,交给各自的 catch 报错。
+function isNoIdentity(e: unknown) {
+  return e instanceof ApiError && e.status === GIT_NO_IDENTITY
+}
+
+function openCommit() {
+  commitModal.value = true
+  // 不 await:提交信息立刻就能开始打,身份那行晚一点出来无妨。
+  api.gitIdentity(repoPath.value)
+    .then((id) => { commitIdent.value = id })
+    .catch(() => { commitIdent.value = null })
+}
+
+// 弹身份框。retry 是补好身份后要重放的动作(从提交/回滚被 428 挡下来时传);
+// 不传就是用户自己点"修改"来改身份的,保存完就结束。
+// 输入框预填当前生效值:多半是继承来的那份(比如全局设了名字但没设邮箱),
+// 用户只要补上缺的一格就行,不用两个都重打一遍。
+async function askIdentity(retry?: () => Promise<void>) {
+  idRetry = retry ?? null
+  idName.value = ''
+  idEmail.value = ''
+  idInherited.value = false
+  try {
+    const id = await api.gitIdentity(repoPath.value)
+    commitIdent.value = id
+    idName.value = id.name
+    idEmail.value = id.email
+    idInherited.value = !id.localName && !id.localEmail && !!(id.name || id.email)
+  } catch { /* 读不到就让用户从空白填起 */ }
+  idModal.value = true
+}
+
+async function saveIdentity() {
+  if (!idValid.value) return
+  idSaving.value = true
+  try {
+    const id = await api.gitSetIdentity(repoPath.value, idName.value, idEmail.value)
+    commitIdent.value = id
+    idModal.value = false
+    message.success('已保存到当前仓库')
+    const retry = idRetry
+    idRetry = null
+    // 写进去了但 git 还是拼不出身份(极少见:服务进程里 GIT_COMMITTER_NAME 之类被设成了空串,
+    // 环境变量优先于配置)。这时重放只会再弹一次这个框,不如直接说清楚。
+    if (!id.ok) {
+      message.warning('身份已写入,但 Git 仍无法用它提交,请检查服务进程的 GIT_* 环境变量')
+      return
+    }
+    if (retry) await retry()
+  } catch (e: any) {
+    message.error(e?.message || '保存失败')
+  } finally {
+    idSaving.value = false
+  }
+}
+
+function cancelIdentity() {
+  idModal.value = false
+  idRetry = null
+}
+
 async function load() {
   loading.value = true
   try {
-    const [r, st, log] = await Promise.all([
+    // 仍然一次并发发三个请求(开屏只花一个往返),但用 allSettled 而不是 all:目录不是
+    // 仓库时 status/log 一律 400,用 all 的话这两条失败会盖掉 repo 那条的正常结果,
+    // 只能一起归到"加载失败"。而"还不是仓库"是个正常状态 —— 空状态里那个初始化按钮
+    // 正是为它准备的,得先把这一种和"路径本身有问题"分开,才敢把按钮显出来。
+    const [r, st, log] = await Promise.allSettled([
       api.gitRepo(repoPath.value),
       api.gitStatus(repoPath.value),
       api.gitLog(repoPath.value, LOG_PAGE),
     ])
-    repo.value = r
-    status.value = st
-    commits.value = log
-    logMore.value = log.length >= LOG_PAGE
+    if (r.status === 'rejected') throw r.reason
+    repo.value = r.value
+    if (!r.value.repo) {
+      status.value = null
+      commits.value = []
+      logMore.value = false
+      return
+    }
+    if (st.status === 'rejected') throw st.reason
+    if (log.status === 'rejected') throw log.reason
+    status.value = st.value
+    commits.value = log.value
+    logMore.value = log.value.length >= LOG_PAGE
   } catch (e: any) {
     repo.value = null
     message.error(e?.message || 'Git 加载失败')
@@ -135,6 +232,51 @@ async function reload() {
   const log = await api.gitLog(repoPath.value, LOG_PAGE)
   commits.value = log
   logMore.value = log.length >= LOG_PAGE
+}
+
+// ---- 初始化仓库(git init)----
+// 当前工作区还不是仓库时,空状态里给一个按钮:否则想开始用版本控制就得先去终端敲一遍
+// git init,而这个页面存在的意义本来就是不用开终端。
+//
+// 动手前先确认一句。两个原因:一是这个按钮作用在哪个目录并不写在按钮上(它是当前工作区的
+// 路径,不是文件页里正在浏览的位置),弹窗里点名说清楚;二是 init 之后这个目录下的一切
+// 都归这个仓库管,不是随手点错也无所谓的操作。
+const initing = ref(false)
+
+function askInit() {
+  dialog.warning({
+    title: '初始化 Git 仓库',
+    content: `将在「${repo.value?.short || repoPath.value}」执行 git init,`
+      + '此后该目录下的文件都由这个仓库管理(初始分支名跟随服务器的 init.defaultBranch)。',
+    positiveText: '初始化',
+    negativeText: '取消',
+    onPositiveClick: doInit,
+  })
+}
+
+async function doInit() {
+  initing.value = true
+  try {
+    const r = await api.gitInit(repoPath.value)
+    message.success(`已初始化,当前分支 ${r.branch || '未知'}`)
+    // 重新走一遍 load:空仓库的 status/log 都能正常返回,拉完这个空状态就换成正常界面。
+    await load()
+  } catch (e: any) {
+    // 409:这个目录(或它的某个上级)已经是仓库了 —— 说明屏幕上这个空状态是过期的,
+    // 报错没意义,重新加载一次就能看到仓库。
+    if (e instanceof ApiError && e.status === GIT_ALREADY_REPO) {
+      message.info('这个目录已经在一个 Git 仓库里了')
+      await load()
+      return
+    }
+    if (e instanceof ApiError && e.status === 403) {
+      message.error('服务以只读模式启动,不能初始化仓库')
+      return
+    }
+    message.error(e?.message || '初始化失败')
+  } finally {
+    initing.value = false
+  }
 }
 
 async function loadMoreLog() {
@@ -221,18 +363,25 @@ function revertCommit(c: GitCommit) {
     content: `将生成一个反向提交来抵消 ${c.short}(${c.subject}),原提交仍留在历史里。`,
     positiveText: '回滚',
     negativeText: '取消',
-    onPositiveClick: async () => {
-      try {
-        const res = await api.gitRevert(repoPath.value, 'revert', c.hash)
-        message.success('已回滚')
-        if (res.out.trim()) dialog.info({ title: '回滚结果', content: res.out })
-        await reload()
-      } catch (e: any) {
-        message.error(e?.message || '回滚失败,可能有冲突需要先解决')
-        await reload()
-      }
-    },
+    onPositiveClick: () => runRevert(c),
   })
+}
+
+// 单独抽出来是为了能在补完身份后原样重放一次(revert 也要提交,同样缺身份就做不了)。
+async function runRevert(c: GitCommit) {
+  try {
+    const res = await api.gitRevert(repoPath.value, 'revert', c.hash)
+    message.success('已回滚')
+    if (res.out.trim()) dialog.info({ title: '回滚结果', content: res.out })
+    await reload()
+  } catch (e: any) {
+    if (isNoIdentity(e)) {
+      await askIdentity(() => runRevert(c))
+      return
+    }
+    message.error(e?.message || '回滚失败,可能有冲突需要先解决')
+    await reload()
+  }
 }
 
 function abortRevert() {
@@ -324,6 +473,11 @@ async function doCommit() {
     message.success('已提交')
     await reload()
   } catch (e: any) {
+    // 缺身份:留着提交信息和这个弹窗别关,填完身份直接重放提交,用户不用重打一遍。
+    if (isNoIdentity(e)) {
+      await askIdentity(doCommit)
+      return
+    }
     message.error(e?.message || '提交失败')
   }
 }
@@ -520,8 +674,12 @@ async function createBranch() {
     await api.gitBranch(repoPath.value, 'create', name, branchStart.value.trim() || undefined)
     branchName.value = ''
     branchStart.value = ''
-    message.success('已创建分支')
+    // 还没有提交时,后端是把当前那个"还没出生"的分支改了名(分支在没有提交时无处可指),
+    // 所以这里说的是改名而不是新建 —— 免得用户回头在列表里找那个"新分支"却什么都看不到。
+    message.success(status.value?.initial ? `已改用分支 ${name}` : '已创建分支')
     branches.value = await api.gitBranches(repoPath.value)
+    // 空仓库那条会换掉当前分支,顶部那个分支标签得跟着变。
+    await reload()
   } catch (e: any) {
     message.error(e?.message || '创建失败')
   }
@@ -586,6 +744,8 @@ onUnmounted(() => askClient.close())
 // 跟随工作区切换。
 watch(() => store.currentPath, (p) => {
   repoPath.value = p
+  // 身份是跟着仓库走的,换了仓库先清掉,别把上一个仓库的署名显示在这一个上。
+  commitIdent.value = null
   load()
 })
 </script>
@@ -603,7 +763,7 @@ watch(() => store.currentPath, (p) => {
           <template #icon><n-icon :component="GitCompareOutline" /></template>
         </n-button>
         <n-button quaternary size="small" :disabled="!repo?.repo" title="提交" aria-label="提交"
-          @click="commitModal = true">
+          @click="openCommit">
           <template #icon><n-icon :component="GitCommitOutline" /></template>
         </n-button>
         <n-button quaternary size="small" :disabled="!repo?.repo" title="推送" aria-label="推送" @click="openPush">
@@ -628,7 +788,17 @@ watch(() => store.currentPath, (p) => {
     </div>
 
     <n-spin :show="loading">
-      <n-empty v-if="!repo?.repo" description="当前工作区不是 Git 仓库" style="padding: 40px" />
+      <!-- 不是仓库:把"初始化"放在这句提示下面,省掉"先去终端敲 git init"这一步。
+           按钮只在确实拿到了 repo=false 时给:repo 为 null 说明连仓库信息都没问出来
+           (路径不存在、越界),那种情况 init 同样做不成,给了只是让人白点一次。 -->
+      <n-empty v-if="!repo?.repo" description="当前工作区不是 Git 仓库" class="git-empty">
+        <template #extra>
+          <n-button v-if="repo && !loading" size="small" type="primary" :loading="initing" @click="askInit">
+            <template #icon><n-icon :component="GitBranchOutline" /></template>
+            初始化 Git 仓库
+          </n-button>
+        </template>
+      </n-empty>
       <template v-else>
         <div class="git-meta">
           <n-tag size="small" :bordered="false" :type="status?.detached ? 'warning' : 'info'">
@@ -795,6 +965,21 @@ watch(() => store.currentPath, (p) => {
         当前共有 {{ status ? status.unstaged.length + status.untracked.length : 0 }} 个未暂存/未跟踪文件
         会一并提交{{ commitStageAll ? '。取消勾选则只提交已暂存的改动。' : '。' }}
       </div>
+      <!-- 署名先摆出来:提交进历史之后就改不动了,填错一次总比事后重写历史好。
+           身份不全时这里就是提前预警,不用等点了提交才被 428 挡回来。 -->
+      <div v-if="commitIdent" class="commit-ident">
+        <span class="git-hint" :class="{ 'ident-missing': !commitIdent.ok }">
+          <template v-if="commitIdent.ok">
+            署名 {{ commitIdent.name }} &lt;{{ commitIdent.email }}&gt;
+            <template v-if="!commitIdent.localName && !commitIdent.localEmail">(继承全局)</template>
+          </template>
+          <template v-else>还没设置提交身份,提交前需要先填姓名和邮箱</template>
+        </span>
+        <n-button size="tiny" :quaternary="commitIdent.ok" :type="commitIdent.ok ? undefined : 'warning'"
+          @click="askIdentity()">
+          {{ commitIdent.ok ? '修改' : '设置' }}
+        </n-button>
+      </div>
       <template #footer>
         <div class="modal-footer">
           <n-button @click="commitModal = false">取消</n-button>
@@ -847,12 +1032,54 @@ watch(() => store.currentPath, (p) => {
       </template>
     </n-modal>
 
+    <!-- 提交身份:git 拼不出 user.name/user.email 时挡在提交/回滚前面。
+         只写当前仓库,所以文案要把"作用范围"说清楚,别让人以为动了全局。 -->
+    <n-modal v-model:show="idModal" preset="card" title="设置提交身份" :mask-closable="false"
+      :closable="false" style="width: 92%; max-width: 460px">
+      <div class="git-hint">
+        Git 还不知道这次提交该署谁的名。填好后只写入
+        <b>当前仓库</b>({{ repo?.short || repoPath }})的 .git/config,不影响其他仓库。
+      </div>
+      <n-form label-placement="top" :show-feedback="false">
+        <n-form-item label="姓名">
+          <n-input v-model:value="idName" placeholder="提交里显示的名字" @keydown.enter="saveIdentity" />
+        </n-form-item>
+        <n-form-item label="邮箱">
+          <!-- inputmode 要走 input-props 才落到真正的 <input> 上(直接写在 n-input 上
+               只会挂到外层 div),手机上靠它把键盘换成带 @ 的那套。 -->
+          <n-input v-model:value="idEmail" placeholder="you@example.com"
+            :input-props="{ inputmode: 'email', autocapitalize: 'off', spellcheck: false }"
+            @keydown.enter="saveIdentity" />
+        </n-form-item>
+      </n-form>
+      <div v-if="idInherited" class="git-hint">
+        上面填的是从全局配置继承来的值,保存后会成为本仓库自己的设置。
+      </div>
+      <div class="git-hint">姓名和邮箱会写进提交历史,之后改不动了。</div>
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="cancelIdentity">取消</n-button>
+          <n-button type="primary" :disabled="!idValid" :loading="idSaving" @click="saveIdentity">
+            保存并继续
+          </n-button>
+        </div>
+      </template>
+    </n-modal>
+
     <!-- 分支:新建/切换/删除 -->
     <n-modal v-model:show="showBranch" preset="card" title="分支" style="width: 92%; max-width: 560px">
       <div class="branch-new">
         <n-input v-model:value="branchName" size="small" placeholder="新分支名" />
         <n-input v-model:value="branchStart" size="small" placeholder="起点(可选)" />
-        <n-button size="small" type="primary" :disabled="!branchName.trim()" @click="createBranch">新建</n-button>
+        <n-button size="small" type="primary" :disabled="!branchName.trim()" @click="createBranch">
+          {{ status?.initial ? '改名' : '新建' }}
+        </n-button>
+      </div>
+      <!-- 还没有提交时分支无处可指:此时"新建"只能是把当前这个空分支改个名,说明一句,
+           否则用户会以为多了一个分支而下面的列表却始终是空的。 -->
+      <div v-if="status?.initial" class="git-hint">
+        还没有提交,分支列表要等第一次提交之后才有内容;现在填名字是把当前分支
+        「{{ status?.branch || repo?.branch }}」改名。
       </div>
       <div v-if="branches" class="branch-sect">
         <div class="branch-title">本地</div>
@@ -918,6 +1145,7 @@ watch(() => store.currentPath, (p) => {
 .git-ws { color: var(--lr-fg-muted); font-size: 12px; margin-top: 2px; }
 /* 7 个图标钮在窄屏(360px)上放不下一行,让它换行并靠右收边。 */
 .git-toolbar { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px; }
+.git-empty { padding: 40px 0; }
 .git-meta { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
 .git-sub {
   color: var(--lr-fg-muted); font-size: 12px;
@@ -948,6 +1176,14 @@ watch(() => store.currentPath, (p) => {
 /* 提交弹窗的"暂存所有"开关行:给 checkbox 一点呼吸,不与提示文案挤在一起 */
 .commit-stage { margin-top: 10px; }
 .git-hint { color: var(--lr-fg-muted); font-size: 12px; margin-top: 8px; }
+/* 署名那行:文字长了要能折行,"修改"按钮不跟着挤。min-width: 0 是让 flex 项真的允许换行。
+   对齐用 center 而不是 baseline:全局给 .n-button 压了 44px 触控下限,按 baseline 排会让
+   这行 12px 的小字跟着 44px 的钮跑偏(同一个坑在 .git-meta 那行也是用 center 解决的)。
+   间距提到外层,免得内层 .git-hint 的 margin-top 只把文字往下推一截。 */
+.commit-ident { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.commit-ident .git-hint { flex: 1; min-width: 0; margin-top: 0; word-break: break-all; }
+/* 身份缺失是个待办而不是错误,用强调色把这行从灰色的提示里提出来就够了。 */
+.commit-ident .ident-missing { color: var(--lr-danger); }
 .log-line { display: flex; align-items: center; gap: 8px; }
 .log-row { display: flex; align-items: baseline; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
 .log-hash { flex: none; font-family: ui-monospace, monospace; font-size: 12px; color: var(--lr-accent); }

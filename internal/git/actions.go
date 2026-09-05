@@ -1,6 +1,45 @@
 package git
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
+
+// Init 在这个目录上 git init,返回初始化之后的仓库信息。
+//
+// 只在"当前工作区不是仓库"时用得上,前端把按钮放在那句提示中间。之所以在服务端也拦一道
+// info.Repo:目录本身或它的某个祖先已经是仓库时再 init,git 会照做,结果是一个**嵌套**
+// 仓库 —— 从此这个目录里的改动归内层那个管,外层看不见,而这两层的存在只能靠 .git 的
+// 位置分辨,是个很难自己发现的坑。所以已经在仓库里就直接拒绝,不给 git 这个机会。
+//
+// 不传目录参数给 git,而是把它当工作目录(run 的 dir):初始分支名也不指定,跟着这台
+// 机器的 init.defaultBranch 走 —— 在终端里敲 git init 得到什么,这个按钮就给什么。
+func (s *Service) Init(p string) (RepoInfo, error) {
+	if err := s.allowWrite(); err != nil {
+		return RepoInfo{}, err
+	}
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	if info.Repo {
+		return RepoInfo{}, errAlreadyRepo
+	}
+	// ResolveToRepo 对文件路径会退到它所在的目录,那样 init 出来的仓库位置和用户
+	// 点的东西不是一个,这里明确要求是目录。
+	fi, err := os.Stat(info.Dir)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	if !fi.IsDir() {
+		return RepoInfo{}, errInitNotDir
+	}
+	if _, err := s.run(info.Dir, nil, "init", "-q"); err != nil {
+		return RepoInfo{}, err
+	}
+	// 重新解析一遍:分支名和仓库根由 git 定,照抄它的结果而不是自己拼。
+	return s.ResolveToRepo(p)
+}
 
 // StageAdd 把 paths 加入暂存(index)。
 func (s *Service) StageAdd(p string, paths []string) error {
@@ -58,6 +97,11 @@ func (s *Service) Commit(p, message string, addAll bool) (string, error) {
 	}
 	if strings.TrimSpace(message) == "" {
 		return "", errEmptyMessage
+	}
+	// 身份要在动手之前问:add -A 已经改了暂存区,等 git commit 自己报
+	// "Please tell me who you are" 就得让用户面对一个"提交失败但文件已经暂存"的局面。
+	if !s.identityOK(info.Root) {
+		return "", ErrNoIdentity
 	}
 	if addAll {
 		if _, err := s.run(info.Root, nil, "add", "-A"); err != nil {
@@ -205,6 +249,13 @@ func (s *Service) remoteOpRun(root string, args ...string) (string, error) {
 
 // Branch 分支操作。op: create|delete|switch|track。track 用于远端分支
 // (origin/feat),会建立同名本地分支并跟踪它。
+//
+// 空仓库(还没有任何提交)要单独绕一下:那时候 .git/HEAD 里虽然写着分支名,
+// refs/heads/ 下却是空的,git branch main 会去解析当前分支当起点,于是报
+// "fatal: not a valid object name: 'master'" —— 一句话里两个分支名,看着像 bug。
+// 分支在没有提交时本就无处可指,唯一说得通的做法是把当前那个还没出生的分支改名
+// (git branch -m,git 自己 init 完改默认分支名也是这么干的),结果正是用户想要的:
+// 第一次提交就落在 main 上。
 func (s *Service) Branch(p, op, name, start string) (string, error) {
 	if err := s.allowWrite(); err != nil {
 		return "", err
@@ -218,6 +269,15 @@ func (s *Service) Branch(p, op, name, start string) (string, error) {
 	}
 	if err := checkRefArgs(name, start); err != nil {
 		return "", err
+	}
+	// 起点是用户明确给的引用时不必绕:那时候 git 不去碰 HEAD,fetch 完在空仓库上
+	// branch main origin/main 是能直接成的。
+	if start == "" && (op == "create" || op == "switch") && !s.hasCommits(info.Root) {
+		if name == info.Branch {
+			// 已经叫这个名字了(git branch -m 到同名会静默成功,但那样等于什么都没说)。
+			return "", errBranchExists
+		}
+		return s.run(info.Root, nil, "branch", "-m", name)
 	}
 	var args []string
 	switch op {
@@ -359,6 +419,17 @@ func (s *Service) Restore(p string, paths []string, mode string) (string, error)
 		args = []string{"restore", "--"}
 	case "all":
 		args = []string{"restore", "--staged", "--worktree", "--"}
+		// 空仓库上 restore --staged 会 fatal: could not resolve HEAD —— 它要拿 HEAD
+		// 当还原源。这时候"回到 HEAD"的本意就是"回到什么都没有",用空树当源正好表达这个,
+		// 效果是把刚 add 进去的新文件从暂存区和工作区一起清掉(和有 HEAD 时对新文件的
+		// 行为一致)。
+		if !s.hasCommits(info.Root) {
+			et, err := s.emptyTree(info.Root)
+			if err != nil {
+				return "", err
+			}
+			args = []string{"restore", "--source=" + et, "--staged", "--worktree", "--"}
+		}
 	case "untracked":
 		args = []string{"clean", "-fd", "--"}
 	default:
@@ -391,6 +462,12 @@ func (s *Service) Revert(p, op, hash string) (string, error) {
 	h, err := normCommitArg(hash)
 	if err != nil {
 		return "", err
+	}
+	// revert 缺身份的后果比 commit 重:git 会先把反向改动应用到工作区,再在提交那步
+	// 失败,于是工作区留着一堆脏文件而 REVERT_HEAD 又没建立 —— 补好身份重试会撞上
+	// "your local changes would be overwritten by revert",abort 也无从下手。所以先问。
+	if !s.identityOK(info.Root) {
+		return "", ErrNoIdentity
 	}
 	// hooksPath 的用意见 Commit:revert 同样会产生提交,钩子可能要交互而卡住命令。
 	args := []string{"-c", "core.hooksPath=.git/lightremote-no-hooks", "revert", "--no-edit"}

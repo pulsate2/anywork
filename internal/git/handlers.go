@@ -25,6 +25,24 @@ func (h *Handlers) RepoInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
+// Init 在当前目录上 git init。只读模式下被 allowWrite 拒掉(403),
+// 目录已经在仓库里回 409。
+func (h *Handlers) Init(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	info, err := h.svc.Init(body.Path)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 	st, err := h.svc.Status(r.URL.Query().Get("path"))
 	if err != nil {
@@ -137,6 +155,36 @@ func (h *Handlers) Commit(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"out": out})
 }
+
+// Identity 读取当前仓库的提交身份(含"git 现在能不能提交"的判断)。
+func (h *Handlers) Identity(w http.ResponseWriter, r *http.Request) {
+	id, err := h.svc.Identity(r.URL.Query().Get("path"))
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, id)
+}
+
+// SetIdentity 把提交身份写进这一个仓库的 .git/config(不动全局)。
+func (h *Handlers) SetIdentity(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path  string `json:"path"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	id, err := h.svc.SetIdentity(body.Path, body.Name, body.Email)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, id)
+}
+
 func (h *Handlers) Push(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path        string `json:"path"`

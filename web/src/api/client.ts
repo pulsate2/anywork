@@ -50,7 +50,9 @@ export const api = {
   me: () => request<{ readonly: boolean; root: string }>('GET', '/api/me'),
   health: () => request<{ status: string; now: string }>('GET', '/api/health'),
   workspaces: () => request<Workspace[]>('GET', '/api/workspaces'),
-  createWorkspace: (w: { name: string; path: string; favorite?: boolean }) =>
+  // create=true 表示"目录不存在就一并建出来"。缺省不带,让后端先回 428,
+  // 前端问过用户之后再带着它重放同一个请求。
+  createWorkspace: (w: { name: string; path: string; favorite?: boolean; create?: boolean }) =>
     request<{ ok: boolean; id: string }>('POST', '/api/workspaces', w),
   renameWorkspace: (id: string, name: string) =>
     request<{ ok: boolean }>('PUT', `/api/workspaces/${id}`, { name }),
@@ -106,6 +108,8 @@ export const api = {
   fsInlineUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}&inline=1`,
   // ---- Git ----
   gitRepo: (path: string) => request<GitRepo>('GET', `/api/git/repo?path=${encodeURIComponent(path)}`),
+  // 在这个目录上 git init。返回初始化之后的仓库信息(分支名由 git 定),可直接顶替 gitRepo 的结果。
+  gitInit: (path: string) => request<GitRepo>('POST', '/api/git/init', { path }),
   gitStatus: (path: string) => request<GitStatus>('GET', `/api/git/status?path=${encodeURIComponent(path)}`),
   gitDiff: (path: string, scope: string, file?: string, ref?: string) =>
     requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}`),
@@ -120,6 +124,10 @@ export const api = {
   },
   gitBranches: (path: string) => request<GitBranchList>('GET', `/api/git/branches?path=${encodeURIComponent(path)}`),
   gitRemotes: (path: string) => request<GitRemote[]>('GET', `/api/git/remotes?path=${encodeURIComponent(path)}`),
+  // 提交身份。GET 读(含"git 现在能不能提交"的 ok);POST 只写这一个仓库的 .git/config。
+  gitIdentity: (path: string) => request<GitIdentity>('GET', `/api/git/identity?path=${encodeURIComponent(path)}`),
+  gitSetIdentity: (path: string, name: string, email: string) =>
+    request<GitIdentity>('POST', '/api/git/identity', { path, name, email }),
   gitStage: (path: string, files: string[], reset?: boolean) =>
     request<{ ok: boolean }>('POST', `/api/git/stage?op=${reset ? 'reset' : 'add'}`, { path, files }),
   gitCommit: (path: string, message: string, addAll: boolean) =>
@@ -260,6 +268,11 @@ export interface Workspace {
   createdAt: string
 }
 
+// 新建工作区时"目录不存在、但可以建"的状态码。和 GIT_NO_IDENTITY 同一个 428 约定:
+// 补齐前置条件(这里是建目录)之后把刚才那个请求原样重放。"存在但不是目录"是 400,
+// 因为那个重试也没用。
+export const WORKSPACE_DIR_MISSING = 428
+
 // ProcInfo 一个进程的占用。cpu 是占整机的百分比(与 SysInfo.cpu.percent 同一把尺子)。
 export interface ProcInfo {
   pid: number
@@ -368,6 +381,24 @@ export interface GitRemote {
   name: string
   url: string
 }
+
+// GitIdentity 提交身份。name/email 是生效值(仓库级没写就是继承来的),
+// localName/localEmail 只看本仓库的 .git/config —— 据此告诉用户这份身份是不是自己设的。
+// ok = git 现在拼得出提交身份,拼不出就提交不了。
+export interface GitIdentity {
+  name: string
+  email: string
+  ok: boolean
+  localName: string
+  localEmail: string
+}
+
+// 提交/回滚遇上"没配身份"时后端回的状态码,前端据此弹身份框而不是报错。
+export const GIT_NO_IDENTITY = 428
+
+// git init 时"这个目录已经在一个仓库里了"的状态码。和 400 分开是为了让前端能说
+// "刷新就能看到仓库"而不是"操作失败" —— 屏幕上那个"不是仓库"的空状态过期了而已。
+export const GIT_ALREADY_REPO = 409
 
 // 远端管理的操作,与后端 Service.RemoteOp 的 op 一一对应。
 export type RemoteOp = 'add' | 'remove' | 'rename' | 'set-url'

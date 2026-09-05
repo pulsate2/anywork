@@ -227,12 +227,15 @@ func (a *App) routes() http.Handler {
 
 		// Git(里程碑 4)。
 		pr.Get("/api/git/repo", a.git.RepoInfo)
+		pr.Post("/api/git/init", a.git.Init)
 		pr.Get("/api/git/status", a.git.Status)
 		pr.Get("/api/git/diff", a.git.Diff)
 		pr.Get("/api/git/show", a.git.Show)
 		pr.Get("/api/git/log", a.git.Log)
 		pr.Get("/api/git/branches", a.git.Branches)
 		pr.Get("/api/git/remotes", a.git.Remotes)
+		pr.Get("/api/git/identity", a.git.Identity)
+		pr.Post("/api/git/identity", a.git.SetIdentity)
 		pr.Post("/api/git/stage", a.git.Stage)
 		pr.Post("/api/git/commit", a.git.Commit)
 		pr.Post("/api/git/push", a.git.Push)
@@ -364,6 +367,9 @@ func (a *App) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		Path      string `json:"path"`
 		Favorite  bool   `json:"favorite"`
 		SortOrder int    `json:"sortOrder"`
+		// Create=true 表示"目录不存在就顺手建出来"。默认 false:第一次请求先让后端
+		// 回 428,前端问过用户之后才带着这个标志原样重放,不替人凭空造目录。
+		Create bool `json:"create"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -379,8 +385,34 @@ func (a *App) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path outside root", http.StatusBadRequest)
 		return
 	}
-	if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+	// "目录不存在"和"存在但不是目录"必须分开说:前者问用户一句就能补救,后者怎么重试
+	// 都没用。合成一个 400 的话前端只能一律弹"创建失败",用户还得自己去猜是哪一种。
+	fi, statErr := os.Stat(abs)
+	switch {
+	case statErr == nil && !fi.IsDir():
 		http.Error(w, "path is not a directory", http.StatusBadRequest)
+		return
+	case errors.Is(statErr, os.ErrNotExist):
+		if a.cfg.ReadOnly {
+			// 只读模式下这个目录建不出来,归到 400:直接给结论,别让前端再问一遍"要建吗"。
+			http.Error(w, "readonly mode: directory does not exist", http.StatusBadRequest)
+			return
+		}
+		if !body.Create {
+			// 428:和提交身份那处同一套约定 —— 补齐前置条件后把这个请求原样重放。
+			// 不在这里默默建目录:路径敲错一个字母就会凭空多出一个空目录。
+			http.Error(w, "directory does not exist", http.StatusPreconditionRequired)
+			return
+		}
+		// 走 fs 服务而不是直接 MkdirAll:root 边界检查和只读闸门都在它那儿。
+		if err := a.fsSvc.MkDir(abs); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		log.Printf("新建工作区: 创建目录 %s (来自 %s)", filepath.ToSlash(abs), clientIP(r))
+	case statErr != nil:
+		// ENOTDIR(路径中间某段是文件)之类:目录建不出来,也不该提议去建。
+		http.Error(w, statErr.Error(), http.StatusBadRequest)
 		return
 	}
 	// 统一存正斜杠形式的绝对路径(前端/fs/git/terminal 都能直接吃)。

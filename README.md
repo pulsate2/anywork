@@ -74,7 +74,7 @@ docker run -d \
 - [x] **骨架**:Go server + 单密码鉴权 + Vue3/NaiveUI 壳 + PWA(Dockerfile + SQLite 接入)
 - [x] **终端**:PTY + 多窗口 + 移动键盘层(可显隐)+ 终端全屏(返回键 / 长按 Esc 退出)+ 服务端环形缓冲持久化
 - [x] **文件管理**:列表/读写/上传下载/搜索/压缩解压
-- [x] **Git**:状态/diff/提交/推送/分支/提交树/stash/worktree
+- [x] **Git**:初始化仓库(非仓库时空状态里一键 `git init`)/状态/diff/提交/推送/分支/提交树/stash/worktree + 提交身份弹窗(只写当前仓库)
 - [x] **AI 配置档案**:预设 + 克隆 + 导入导出 + 当前档案徽标 + 新终端注入 env
 - [x] **备份**:WebDAV 数据层 + cron 调度 + tar.gz 流式快照 + 启动自动恢复 + 排除 + 轮转保留
 - [x] **打磨**:系统面板(CPU/内存/Swap/磁盘 + 进程表结束进程)、只读模式、**Web Push 通知**(VAPID + RFC 8291 aes128gcm 加密 + 终端命令完成推送)

@@ -51,7 +51,15 @@ var ErrNotRepo = errors.New("not a git repository")
 // 用包级哨兵而非临时 errors.New,让 httpErr 能 errors.Is 出来映射成 403。
 var ErrReadOnly = errors.New("readonly mode")
 
+// ErrNoIdentity 表示这个仓库现在拼不出提交身份(user.name / user.email)。
+// 映射成 428 Precondition Required —— 前端见到这个码就弹身份框,填完重放刚才那步。
+var ErrNoIdentity = errors.New("git identity not configured")
+
 var (
+	errBadIdentity        = errors.New("invalid name or email")
+	errAlreadyRepo        = errors.New("already a git repository")
+	errInitNotDir         = errors.New("path is not a directory")
+	errBranchExists       = errors.New("already on a branch with that name")
 	errEmptyMessage       = errors.New("commit message required")
 	errUnknownBranchOp    = errors.New("unknown branch op")
 	errUnknownStashOp     = errors.New("unknown stash op")
@@ -198,6 +206,25 @@ func (s *Service) Repo(p string, args ...string) (string, error) {
 		return "", ErrNotRepo
 	}
 	return s.run(info.Root, nil, args...)
+}
+
+// hasCommits 判断这个仓库有没有提交(HEAD 是不是还"未出生")。
+// 刚 init 出来的仓库是 git 里少见的"有分支名、没有 HEAD"状态:分支名存在于
+// .git/HEAD 的符号引用里,但 refs/heads/ 下什么都没有。凡是要拿 HEAD 当对象用的
+// 命令(branch <name>、restore --staged、diff HEAD)在这种仓库上都会直接 fatal,
+// 所以这些地方得先问一句。
+func (s *Service) hasCommits(root string) bool {
+	_, err := s.run(root, nil, "rev-parse", "--verify", "-q", "HEAD")
+	return err == nil
+}
+
+// emptyTree 返回这个仓库的空树对象 ID,用来在没有提交时充当 HEAD 的替身 ——
+// "和 HEAD 比"于是变成"和什么都没有比",diff/restore 想表达的意思恰好没变。
+// 不写死那个著名的 4b825dc…:它只是 sha1 仓库的空树,--object-format=sha256
+// 的仓库是另一个值。
+// 不给 stdin,exec 会把 /dev/null 接上去,git 立刻读到 EOF,得到的就是空树。
+func (s *Service) emptyTree(root string) (string, error) {
+	return s.run(root, nil, "hash-object", "-t", "tree", "--stdin")
 }
 
 func currentBranch(root string) string {

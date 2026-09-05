@@ -157,6 +157,8 @@ CREATE TABLE backup_jobs (
 
 一个"工作区" = 一个目录 + 名称 + 收藏。终端在这里打开、Git 针对这个仓库、文件管理器以此为根。移动端少敲路径。首次进入是工作区列表。
 
+新建时目录不存在**不直接失败也不默默创建**:后端回 428,前端问一句「目录不存在,要现在创建吗」,答应了才带 `create:true` 把同一个请求原样重放(缺失的上级目录一并建出,走 fs 服务因此仍受 root 边界与只读闸门约束)。默默创建的问题是路径敲错一个字母就凭空多出一个空目录;而"路径存在但是个文件"「上级某段是文件」只读模式下缺目录这三种仍是 400 —— 它们重试或者代建都解决不了,不该弹那个框。
+
 ### 5.1 终端(核心难点在移动端)
 
 **多窗口与持久化**
@@ -195,11 +197,14 @@ REST API,全部**流式**,大文件不整读进内存:
 ### 5.3 Git(走 git CLI,不用 go-git)
 
 - **状态**:`git status --porcelain=v1 -b`,分组(已暂存/未暂存/未跟踪)。
+- **初始化**:当前工作区不是仓库时,Git 页那句"不是 Git 仓库"下面直接给一个「初始化 Git 仓库」按钮(`git init -q`,以该目录为工作目录,**不指定初始分支名**,跟随服务器的 `init.defaultBranch` —— 在终端里敲 `git init` 得到什么,这个按钮就给什么),否则想开始用版本控制还得先去开一个终端。服务端会在 init 之前拒掉"已经在仓库里"(回 409,前端据此说"刷新就能看到"而不是"操作失败"):git 对嵌套 `git init` 是照做不报错的,结果是这个目录的改动归内层仓库管、外层看不见,而两层的存在只能靠 `.git` 的位置分辨,是个很难自己发现的坑。路径是文件则回 400(仓库会建到它所在的目录去,和用户点的不是一个东西);目录不存在照常报错,不替用户建目录 —— 那是新建工作区那步的事。刚 init 出来的空仓库是"有仓库但没有 HEAD"的少见状态,`status`(`## No commits yet on ...` → `initial`)和 `log --all`(空输出,退出码 0)都已经能正常返回,初始化完直接刷新成常规界面。
 - **Diff**:`git diff` / `--cached` / `HEAD`,unified 原文 + 前端轻量着色。
 - **提交/推送**:逐文件 add → 提交信息 → commit → push(复用系统凭据/ssh-agent)。
+- **提交身份**:git 缺 `user.name`/`user.email` 时会直接拒绝提交并让人去敲 `git config` —— 服务端没有终端可敲,所以在 commit/revert **动手之前**先用 `git var GIT_AUTHOR_IDENT` 的退出码问一句(和 git 自己走同一套判据,含它的自动推断),拼不出就回 428 让前端弹框,填完把刚才那一步原样重放;提交弹窗里也常驻一行当前署名 + 「修改」入口,因为写进历史的署名事后改不动。写入一律只写 `git config --local`(**当前仓库的 `.git/config`**):一台机器上不同仓库用不同身份是常事,替用户改全局等于动了他所有仓库的默认值。之所以要在 revert 前面也拦一道:git 会先把反向改动铺到工作区、再在提交那步失败,留下一个脏工作区而 `REVERT_HEAD` 又没建立,补完身份重试会撞 "your local changes would be overwritten by revert"。
 - **提交树**:`git log --graph --oneline --all` 解析成节点,移动端折叠式树。
 - **worktree**:`add / list / remove`。
 - 补充:分支切换/新建/删除、stash。
+- **空仓库(还没有第一次提交)**:git 里少见的"有分支名、没有 HEAD"状态 —— `.git/HEAD` 指着一个 `refs/heads/` 下并不存在的引用,凡是把 HEAD 当对象用的命令都会直接 fatal,而这正是点完「初始化 Git 仓库」之后的第一站,所以三处入口各自绕了一下:①**新建分支**:`git branch main` 会去解析当前分支当起点,报 `fatal: not a valid object name: 'master'`(错误里那个分支名用户根本没提过,光看提示猜不到是"还没有提交")—— 分支在没有提交时本就无处可指,改走 `git branch -m` 把那个还没出生的分支改名(git 自己改默认分支名也是这么干的),第一次提交就落在用户要的分支上;弹窗里按钮相应变成「改名」并说明一句,改成当前已有的名字回 400(`-m` 到同名会静默成功,那样会提示"已创建"而什么都没发生)。用户明确给了起点(如 fetch 完从 `origin/main` 开分支)时不绕,那时 git 不碰 HEAD。②**撤回已暂存**(`restore --staged --worktree`)要拿 HEAD 当还原源 → 用**空树**当源(`git hash-object -t tree --stdin` 现取,不写死 `4b825dc…`:sha256 仓库的空树是另一个值),"回到 HEAD"于是变成"回到什么都没有",效果和有 HEAD 时撤回一个新增文件一致。③**看"和 HEAD 的差异"**(`diff HEAD`)同样换空树,第一批文件整篇显示成新增;`diff --cached` 不用管,git 自己在没有 HEAD 时就是拿空树比的。
 
 ### 5.4 AI 配置档案(Claude / Codex 切换)
 
@@ -397,12 +402,13 @@ ENTRYPOINT ["lightremote"]
 |---|---|---|
 | POST | `/api/login` / `/api/logout` | 认证 |
 | GET | `/api/health` | 健康检查 |
-| GET/POST/PUT/DELETE | `/api/workspaces` | 工作区 CRUD |
+| GET/POST/PUT/DELETE | `/api/workspaces` | 工作区 CRUD(POST 时目录不存在回 428,带 `create:true` 重放即创建) |
 | WS | `/api/term` | 终端长连接(协议见 5.1) |
 | GET/POST/PUT/DELETE | `/api/fs/...` | 文件操作(流式) |
 | GET | `/api/fs/search` | 搜索 |
 | GET/POST | `/api/fs/archive` | 压缩/解压 |
 | GET/POST | `/api/git/...` | 状态/diff/提交/推送/树/worktree |
+| POST | `/api/git/init` | 在当前工作区 `git init`(已在仓库里回 409;只读模式 403) |
 | GET/POST/PUT/DELETE | `/api/ai/profiles` | AI 档案 CRUD、克隆、导入导出、active |
 | GET/POST/PUT/DELETE | `/api/backup/jobs` | 备份任务 CRUD |
 | POST | `/api/backup/jobs/:id/run` | 立即备份 |
