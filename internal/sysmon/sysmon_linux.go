@@ -3,6 +3,8 @@
 package sysmon
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/user"
 	"strconv"
@@ -224,6 +226,25 @@ func procName(comm, argv0 string) string {
 		return comm
 	}
 	return base
+}
+
+// killProc 给单个进程发信号。SIGTERM 可被目标捕获用于清理,SIGKILL 由内核执行、
+// 无法拦截。errno 映射成包级错误,让 handler 能分出 404 / 403。
+func killProc(pid int, force bool) error {
+	sig := syscall.SIGTERM
+	if force {
+		sig = syscall.SIGKILL
+	}
+	switch err := syscall.Kill(pid, sig); {
+	case err == nil:
+		return nil
+	case errors.Is(err, syscall.ESRCH):
+		return fmt.Errorf("%w: %d", ErrNoSuchProc, pid)
+	case errors.Is(err, syscall.EPERM):
+		return fmt.Errorf("%w: 无权结束 pid %d", ErrKillDenied, pid)
+	default:
+		return err
+	}
 }
 
 // userName uid → 用户名。同一批进程里 uid 高度重复,查一次记住。

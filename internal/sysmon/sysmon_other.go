@@ -18,3 +18,7 @@ func readMemory() (Memory, Swap) { return Memory{}, Swap{} }
 func readDisk(string) Disk       { return Disk{} }
 func readProcs() []rawProc       { return nil }
 func enrich(p *Process)          { _ = p }
+
+// killProc 采集不到进程列表,也就没有"结束进程"可言。Monitor.Kill 在 procSupported
+// 为 false 时就已经返回了,这里只是让各平台的函数集齐。
+func killProc(int, bool) error { return ErrKillUnsupported }

@@ -408,6 +408,7 @@ ENTRYPOINT ["lightremote"]
 | POST | `/api/backup/jobs/:id/restore` | 恢复(危险,确认) |
 | GET/DELETE | `/api/backup/jobs/:id/snapshots` | 快照历史 / 删除(实时 PROPFIND 远程目录,无 DB 查询) |
 | GET | `/api/sysinfo` | 系统信息 |
+| POST | `/api/sysinfo/kill` | 结束进程(危险,确认;只读模式拒绝) |
 | WS | `/api/events` | 全局事件推送(调度状态、任务完成) |
 
 ---

@@ -112,7 +112,7 @@ func main() {
 		ai:           aiHandlers,
 		backupMgr:    backupsvc.New(database.DB, cfg.Root),
 		push:         pushHandlers,
-		sysmon:       sysmon.New(cfg.Root),
+		sysmon:       sysmon.New(cfg.Root, cfg.ReadOnly),
 	}
 	app.backup = backupsvc.NewHandlers(app.backupMgr)
 	// 交互式 git 认证:broker 把"需要凭据"推给浏览器弹窗,answer 回填后放行 push/pull。
@@ -273,8 +273,9 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/push/unsubscribe", a.push.Unsubscribe)
 		pr.Post("/api/push/test", a.push.Test)
 
-		// 系统信息(只读,低成本)。
+		// 系统信息(采集只读,低成本);结束进程是写操作,只读模式下被 sysmon 拒掉。
 		pr.Get("/api/sysinfo", a.handleSysInfo)
+		pr.Post("/api/sysinfo/kill", a.handleKillProc)
 	})
 
 	// ---- 静态资源(SPA 前端)----
@@ -453,6 +454,37 @@ func (a *App) handleSysInfo(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("procs"))
 	writeJSON(w, http.StatusOK, a.sysmon.Snapshot(limit, q.Get("sort")))
+}
+
+// handleKillProc 结束进程表里的一条。name 是前端把当前显示的名字带回来做的护栏
+// (pid 复用时拒绝),force 决定 SIGTERM 还是 SIGKILL。
+func (a *App) handleKillProc(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PID   int    `json:"pid"`
+		Name  string `json:"name"`
+		Force bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := a.sysmon.Kill(body.PID, body.Name, body.Force); err != nil {
+		code := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, sysmon.ErrReadOnly), errors.Is(err, sysmon.ErrKillDenied):
+			code = http.StatusForbidden
+		case errors.Is(err, sysmon.ErrNoSuchProc):
+			code = http.StatusNotFound
+		case errors.Is(err, sysmon.ErrBadPID):
+			code = http.StatusBadRequest
+		case errors.Is(err, sysmon.ErrKillUnsupported):
+			code = http.StatusNotImplemented
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	log.Printf("结束进程: pid=%d name=%q force=%v (来自 %s)", body.PID, body.Name, body.Force, clientIP(r))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ---- SPA ----

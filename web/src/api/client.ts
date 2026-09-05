@@ -63,6 +63,11 @@ export const api = {
     const q = qs.toString()
     return request<SysInfo>('GET', `/api/sysinfo${q ? `?${q}` : ''}`)
   },
+  // 结束一个进程。name 带上表里当前显示的名字,后端据此拒绝 pid 已被复用的情况;
+  // force=true 走 SIGKILL(Windows 上无论如何都是强杀)。
+  killProc: (pid: number, name: string, force: boolean) =>
+    request<{ ok: boolean }>('POST', '/api/sysinfo/kill', { pid, name, force }),
+
   // 本机支持哪种会话资源限制,新建终端时决定显示哪些输入框。
   termLimits: () => request<TermLimitSupport>('GET', '/api/term/limits'),
   // ---- 文件操作 ----
@@ -279,6 +284,10 @@ export interface SysInfo {
   sampleMs: number
   // 本平台能不能列进程(非 Linux/Windows 一律不能)。
   procSupported: boolean
+  // 结束进程按钮可不可用:平台支持 + 服务不在只读模式。
+  canKill: boolean
+  // 结束进程只有强杀一条路(Windows),此时不提供"强制"选项,改在确认框里说明。
+  killForceOnly: boolean
   // 裁剪前的进程总数。
   procTotal: number
   processes: ProcInfo[]

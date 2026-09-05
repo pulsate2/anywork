@@ -1,14 +1,17 @@
 package sysmon
 
 import (
+	"errors"
 	"os"
+	"os/exec"
+	"runtime"
 	"testing"
 )
 
 // TestSnapshotShape 采集一次并检查形状:百分比在范围内、进程列表条数受 limit 约束、
 // 排序真的按请求的键降序。数值本身随机器变化,只能验证不变量。
 func TestSnapshotShape(t *testing.T) {
-	m := New("")
+	m := New("", false)
 	snap := m.Snapshot(10, "cpu")
 
 	if snap.ProcSupported != procSupported {
@@ -80,12 +83,27 @@ func TestSnapshotShape(t *testing.T) {
 
 // TestSnapshotNoProcs procLimit<=0 时不返回进程列表,但总数仍要报。
 func TestSnapshotNoProcs(t *testing.T) {
-	snap := New("").Snapshot(0, "")
+	snap := New("", false).Snapshot(0, "")
 	if len(snap.Processes) != 0 {
 		t.Errorf("procLimit=0 却返回 %d 条", len(snap.Processes))
 	}
 	if procSupported && snap.ProcTotal == 0 {
 		t.Error("ProcTotal 应始终填充(它是下一次差值的基线)")
+	}
+}
+
+// TestSnapshotCanKill 前端靠 canKill 决定画不画结束按钮,所以它必须与 Kill 真正的
+// 判断一致 —— 报 true 却拒绝执行(或反之)就是让用户白点一次。
+func TestSnapshotCanKill(t *testing.T) {
+	if got := New("", false).Snapshot(0, "").CanKill; got != procSupported {
+		t.Errorf("可写模式下 CanKill = %v,平台支持是 %v", got, procSupported)
+	}
+	// 只读模式无论平台一律不给按钮。
+	if New("", true).Snapshot(0, "").CanKill {
+		t.Error("只读模式 CanKill 应为 false")
+	}
+	if got, want := New("", false).Snapshot(0, "").KillForceOnly, runtime.GOOS == "windows"; got != want {
+		t.Errorf("KillForceOnly = %v,期望 %v", got, want)
 	}
 }
 
@@ -100,6 +118,75 @@ func TestMemUsage(t *testing.T) {
 	// MemAvailable 偶尔略大于 MemTotal:截到总量,已用为 0,而不是下溢成天文数字。
 	if free, used, pct := memUsage(1000, 1200); free != 1000 || used != 0 || pct != 0 {
 		t.Errorf("可用量超总量应截断,得到 %d/%d/%d", free, used, pct)
+	}
+}
+
+// TestKillGuards Kill 在真的发信号之前就该拒掉的那几种输入。这些分支与平台无关,
+// 必须在所有平台上都成立 —— 尤其"不许杀自己",它错一次就是整个服务下线。
+func TestKillGuards(t *testing.T) {
+	m := New("", false)
+	cases := []struct {
+		name string
+		pid  int
+		want error
+	}{
+		{"pid 0", 0, ErrBadPID},
+		{"负 pid(-pid 在 kill(2) 里是整个进程组)", -1234, ErrBadPID},
+		{"1 号进程", 1, ErrBadPID},
+		{"本服务自己", os.Getpid(), ErrBadPID},
+	}
+	for _, c := range cases {
+		if err := m.Kill(c.pid, "", false); !errors.Is(err, c.want) {
+			t.Errorf("%s: Kill(%d) = %v, 期望 %v", c.name, c.pid, err, c.want)
+		}
+	}
+	// 只读模式下连合法 pid 也不许动,且这一关要排在其他检查之前。
+	ro := New("", true)
+	if err := ro.Kill(os.Getpid(), "", false); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("只读模式应返回 ErrReadOnly,得到 %v", err)
+	}
+}
+
+// TestKillNameMismatch 名字对不上就拒绝 —— 这条护栏防的是 pid 被复用后杀错进程。
+func TestKillNameMismatch(t *testing.T) {
+	if !procSupported {
+		t.Skip("本平台不列进程")
+	}
+	// 拿本进程的父进程当靶子:它一定存在,而且名字不会是下面这个。
+	err := New("", false).Kill(os.Getppid(), "绝不可能是这个名字", false)
+	if !errors.Is(err, ErrBadPID) {
+		t.Errorf("名字不符应返回 ErrBadPID,得到 %v", err)
+	}
+}
+
+// TestKillTerminatesChild 真的杀两个自己起的子进程,SIGTERM 与 SIGKILL 各走一遍 ——
+// 默认按钮走的是 SIGTERM 那条路,只测 force 等于没测到主路径。
+func TestKillTerminatesChild(t *testing.T) {
+	if !procSupported {
+		t.Skip("本平台不支持结束进程")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("这段用的是 POSIX sleep")
+	}
+	for _, force := range []bool{false, true} {
+		cmd := exec.Command("sleep", "600")
+		if err := cmd.Start(); err != nil {
+			t.Skipf("起不了子进程: %v", err)
+		}
+		pid := cmd.Process.Pid
+
+		if err := New("", false).Kill(pid, "", force); err != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			t.Fatalf("force=%v: Kill(%d) = %v", force, pid, err)
+		}
+		// Wait 返回即证明进程已死(被信号打死时它返回 "signal: ..." 错误,
+		// 这里只关心它不再运行,不关心怎么死的)。
+		_, _ = cmd.Process.Wait()
+		// 回收之后 pid 已不存在,再杀一次应报"进程不存在"。
+		if err := New("", false).Kill(pid, "", force); !errors.Is(err, ErrNoSuchProc) {
+			t.Errorf("force=%v: 已回收的子进程应报 ErrNoSuchProc,得到 %v", force, err)
+		}
 	}
 }
 

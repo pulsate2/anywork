@@ -4,7 +4,7 @@ import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { NButton, NInput, NInputNumber, NList, NListItem, NEmpty, NSpin, NModal,
   NTag, NPopconfirm, useMessage, useDialog, NTabs, NTabPane, NSwitch, NSlider, NSelect,
   NTooltip } from 'naive-ui'
-import { api, type SysInfo, type BackupJob, type BackupSnapshot, type PushStatus } from '@/api/client'
+import { api, type SysInfo, type ProcInfo, type BackupJob, type BackupSnapshot, type PushStatus } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
 import DirTreePicker from '@/components/DirTreePicker.vue'
 
@@ -28,9 +28,16 @@ const sysAuto = ref(localStorage.getItem(SYS_KEY + 'auto') !== '0')
 const sysErr = ref('')
 // 后端没进程可报时 processes 是 null,兜底成数组免得模板里 .length 崩掉。
 const procs = computed(() => sys.value?.processes ?? [])
+// killOpen 是"结束进程"确认气泡开在哪一行(pid),null = 没开。它同时是轮询的闸门,
+// 所以声明在这里而不是下面的结束进程小节:表格每两秒按占用重排一次,气泡开着时
+// 手指底下的行会换成别的进程 —— 对不可撤销的操作来说那是会杀错人的。
+const killOpen = ref<number | null>(null)
 // busy 是并发闸门:上一次还没回来就不再发,慢网络下不会堆成一串请求。
 let sysBusy = false
 let sysTimer: number | null = null
+// killTimer 是结束进程后那次补刷。存起来是为了在离开页面时能取消掉:定时器里的
+// restartSys 会重新排下一次轮询,组件都卸载了还在打接口。
+let killTimer: number | null = null
 
 const intervalOptions = [
   { label: '1 秒', value: 1000 },
@@ -61,12 +68,16 @@ async function pullSys(withProcs = true) {
 
 function stopSys() {
   if (sysTimer !== null) { clearTimeout(sysTimer); sysTimer = null }
+  if (killTimer !== null) { clearTimeout(killTimer); killTimer = null }
 }
 
 // 用 setTimeout 串起来而不是 setInterval:一次采集慢了,下一次从它结束时才开始算。
 function scheduleSys() {
   stopSys()
   if (tab.value !== 'sys' || !sysAuto.value || document.hidden) return
+  // 结束进程的确认气泡开着时不排下一次:这个判断放在这里而不是只在打开时 stopSys(),
+  // 因为打开的瞬间可能正有一次采集在途,它回来后会自己再排一次,把刚停下的轮询接上。
+  if (killOpen.value !== null) return
   sysTimer = window.setTimeout(async () => {
     await pullSys()
     scheduleSys()
@@ -91,6 +102,60 @@ watch(sysInterval, v => { localStorage.setItem(SYS_KEY + 'interval', String(v));
 // 排序和条数由服务端算,改了就立刻重取一次,不用等下一个周期。
 watch(procSort, v => { localStorage.setItem(SYS_KEY + 'sort', v); restartSys() })
 watch(procLimit, v => { localStorage.setItem(SYS_KEY + 'limit', String(v)); restartSys() })
+
+// ---- 结束进程 ----
+// killing 是正在发请求的那个 pid,只用来在按钮上转圈。
+const killing = ref<number | null>(null)
+// Windows 上没有"礼貌地请你退出",TerminateProcess 是唯一的路,所以不给强杀选项,
+// 改在确认框里说清后果。
+const forceOnly = computed(() => !!sys.value?.killForceOnly)
+
+function killTip(p: ProcInfo): string {
+  const who = `${p.name} (pid ${p.pid})`
+  if (forceOnly.value) return `强制结束 ${who}?进程没有保存或清理的机会。`
+  return `结束 ${who}?"结束"先发 SIGTERM 让它自己退出,"强制"直接抹掉。`
+}
+
+// onKillShow 只认自己那一行的关闭事件。点开 A 时,B 的"点到外面了"也会触发一次关闭,
+// 而两个回调的先后顺序不定 —— 不加这道判断,B 的关闭可能落在 A 的打开之后,把刚开的气泡关掉。
+function onKillShow(pid: number, show: boolean) {
+  if (show) {
+    killOpen.value = pid
+    stopSys()
+  } else if (killOpen.value === pid) {
+    killOpen.value = null
+    scheduleSys()
+  }
+}
+
+// 气泡开着的那一行有可能被一次"在途"的采集刷掉(进程退出了,或掉出了前 N 条)。
+// 行一卸载,组件就再也不会发关闭事件,killOpen 会卡住不放 —— 而它是轮询的闸门,
+// 卡住就等于面板永久停止刷新。所以这里兜一道:目标行没了就自己松闸。
+watch(procs, list => {
+  if (killOpen.value !== null && !list.some(p => p.pid === killOpen.value)) {
+    killOpen.value = null
+    scheduleSys()
+  }
+})
+
+async function doKill(p: ProcInfo, force: boolean) {
+  onKillShow(p.pid, false)
+  killing.value = p.pid
+  try {
+    // 把表里显示的名字一起传回去:从渲染到点击之间目标可能已经退出、pid 被复用,
+    // 后端对不上名字就拒绝,免得杀错进程。
+    await api.killProc(p.pid, p.name, force)
+    message.success(force ? `已强制结束 ${p.name}` : `已请求结束 ${p.name}`)
+  } catch (e: any) {
+    // 后端把原因写在响应正文里(权限不足 / 进程不存在 / pid 被复用 / 只读模式),照搬即可。
+    message.error(e?.message || '结束进程失败')
+  } finally {
+    killing.value = null
+  }
+  // SIGTERM 到进程真的消失之间有个清理窗口,立刻重取往往还能看到它;失败时也要刷,
+  // 因为"进程不存在"这类报错本身就说明表是旧的。
+  killTimer = window.setTimeout(() => { killTimer = null; restartSys() }, 400)
+}
 
 // ---- Web Push ----
 const pushStatus = ref<PushStatus | null>(null)
@@ -481,7 +546,7 @@ onUnmounted(() => {
             <span class="sys-spacer" />
             <span class="hint">共 {{ sys.procTotal }} 个</span>
           </div>
-          <div class="proc-table">
+          <div class="proc-table" :class="{ 'has-act': sys.canKill }">
             <div class="proc-row proc-head">
               <span class="c-name">名称</span>
               <span class="c-pid opt">PID</span>
@@ -489,6 +554,7 @@ onUnmounted(() => {
               <span class="c-thr opt">线程</span>
               <span class="c-num">CPU</span>
               <span class="c-num">内存</span>
+              <span v-if="sys.canKill" class="c-act">操作</span>
             </div>
             <div v-for="p in procs" :key="p.pid" class="proc-row">
               <!-- 命令行一行放不下,缩略显示;点一下弹出完整路径(手机没有 hover,
@@ -507,6 +573,26 @@ onUnmounted(() => {
               <span class="c-thr opt">{{ p.threads || '-' }}</span>
               <span class="c-num" :class="{ hot: p.cpu >= 50 }">{{ p.cpu.toFixed(1) }}%</span>
               <span class="c-num">{{ fmtMB(p.memMB) }}<i>{{ p.memPct.toFixed(1) }}%</i></span>
+              <!-- 结束进程不可撤销,所以必须先确认。强杀藏在确认框里当第二个按钮:
+                   常规结束(SIGTERM)才是默认,免得手一抖就把别人的活儿掐断。
+                   气泡开着期间轮询暂停,否则表格会在手指底下重排。 -->
+              <span v-if="sys.canKill" class="c-act">
+                <n-popconfirm :show="killOpen === p.pid" placement="left-end"
+                  @update:show="(v: boolean) => onKillShow(p.pid, v)">
+                  <template #trigger>
+                    <n-button class="kill-btn" size="tiny" quaternary type="error"
+                      :loading="killing === p.pid" :disabled="killing !== null">结束</n-button>
+                  </template>
+                  <template #action>
+                    <n-button size="tiny" quaternary @click="onKillShow(p.pid, false)">取消</n-button>
+                    <n-button size="tiny" :type="forceOnly ? 'error' : 'primary'" @click="doKill(p, forceOnly)">
+                      {{ forceOnly ? '强制结束' : '结束' }}
+                    </n-button>
+                    <n-button v-if="!forceOnly" size="tiny" type="error" @click="doKill(p, true)">强制</n-button>
+                  </template>
+                  <div class="kill-tip">{{ killTip(p) }}</div>
+                </n-popconfirm>
+              </span>
             </div>
             <n-empty v-if="!procs.length" description="暂无进程数据" style="padding:20px" />
           </div>
@@ -607,6 +693,9 @@ h2 { font-size: 20px; margin: 0 0 8px; }
   border-top: 1px solid var(--lr-border, #f1f1f1);
 }
 .proc-row:first-child { border-top: none; }
+/* 多一列给"结束"按钮。只在按钮真的画出来时加(只读模式/不支持的平台没有这一列),
+   不然表头和数据行会差一格。 */
+.proc-table.has-act .proc-row { grid-template-columns: minmax(0, 1fr) 64px 96px 48px 62px 104px 52px; }
 .proc-head { color: var(--lr-fg-muted); font-weight: 600; background: rgba(127, 127, 127, 0.06); }
 .c-name { min-width: 0; display: flex; flex-direction: column; cursor: pointer; }
 .c-name b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -627,9 +716,16 @@ h2 { font-size: 20px; margin: 0 0 8px; }
 .c-num { text-align: right; font-variant-numeric: tabular-nums; }
 .c-num i { font-style: normal; color: var(--lr-fg-muted); font-size: 11px; margin-left: 5px; }
 .c-num.hot { color: #d03050; font-weight: 600; }
+.c-act { text-align: right; }
+/* 全局给 .n-button 的 44px 触控下限会把进程行撑成两倍高,一屏就少看好几个进程。
+   这里按本仓库其他密排列表的惯例用 28px;点错也只是弹确认框,不会直接杀。 */
+.kill-btn { min-height: 28px; height: 28px; padding: 0 6px; }
+/* 确认气泡里的说明文字。进程名可能很长,给个上限免得把气泡撑出屏幕。 */
+.kill-tip { max-width: min(70vw, 300px); font-size: 12px; line-height: 1.5; word-break: break-all; }
 /* 窄屏(手机)只留名称 + 两个数字,PID/用户/线程折掉。 */
 @media (max-width: 640px) {
   .proc-row { grid-template-columns: minmax(0, 1fr) 56px 92px; }
+  .proc-table.has-act .proc-row { grid-template-columns: minmax(0, 1fr) 50px 84px 48px; }
   .proc-row .opt { display: none; }
 }
 .form { display: flex; flex-direction: column; gap: 8px; }

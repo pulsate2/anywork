@@ -1,5 +1,5 @@
 // Package sysmon 采集机器概览(CPU/内存/Swap/磁盘)与进程列表,供设置页的"系统"面板
-// 实时刷新使用。采集实现按平台分文件(sysmon_linux/windows/other)。
+// 实时刷新使用,并支持结束指定进程。采集实现按平台分文件(sysmon_linux/windows/other)。
 //
 // 这里是有状态的:所有 CPU 百分比都必须由两次采样的差值算出,单次快照拿不到。
 // Monitor 因此记住上一次采样,前端每隔一两秒来问一次时,直接用"上次→这次"这段
@@ -7,6 +7,10 @@
 package sysmon
 
 import (
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -97,6 +101,12 @@ type Snapshot struct {
 	SampleMs int64 `json:"sampleMs"`
 	// ProcSupported 本平台是否支持进程列表。
 	ProcSupported bool `json:"procSupported"`
+	// CanKill 这台机器上"结束进程"按钮能不能用(平台支持 + 非只读模式)。前端据此
+	// 决定画不画按钮 —— 让用户点一下才收到 403 是最差的交代方式。
+	CanKill bool `json:"canKill"`
+	// KillForceOnly 结束进程只有强杀一条路(Windows:服务进程发不出 Ctrl+C/WM_CLOSE)。
+	// 为真时前端不提供"强制结束"选项,而是在确认框里说明目标没有清理机会。
+	KillForceOnly bool `json:"killForceOnly"`
 	// ProcTotal 进程总数(裁剪前)。
 	ProcTotal int `json:"procTotal"`
 	// Processes 已按 sortBy 排序并裁剪到 limit 条。
@@ -107,16 +117,18 @@ type Snapshot struct {
 type Monitor struct {
 	// root 磁盘容量统计的落点(工作根目录所在的卷)。
 	root string
+	// readOnly 对应 --readonly:采集照常(它是只读的),但不许结束进程。
+	readOnly bool
 
 	mu   sync.Mutex
 	prev sample
 }
 
-func New(root string) *Monitor {
+func New(root string, readOnly bool) *Monitor {
 	if root == "" {
 		root = defaultDiskPath
 	}
-	return &Monitor{root: root}
+	return &Monitor{root: root, readOnly: readOnly}
 }
 
 // sample 一次原始采集。所有 tick 单位随平台,只参与同平台内的减法。
@@ -176,6 +188,8 @@ func (m *Monitor) Snapshot(procLimit int, sortBy string) Snapshot {
 		},
 		SampleMs:      win.Milliseconds(),
 		ProcSupported: procSupported,
+		CanKill:       procSupported && !m.readOnly,
+		KillForceOnly: runtime.GOOS == "windows",
 		ProcTotal:     len(cur.procs),
 		Processes:     []Process{},
 	}
@@ -283,4 +297,71 @@ func round1(v float64) float64 {
 		return 0
 	}
 	return float64(int64(v*10+0.5)) / 10
+}
+
+// 结束进程可能失败的几种情形,handler 据此给出 4xx 而不是一律 500。
+var (
+	// ErrBadPID pid 不是正数、指向 1 号进程或本服务自己,或者与前端声明的名字对不上。
+	ErrBadPID = errors.New("非法 pid")
+	// ErrNoSuchProc 进程不存在(很可能在你点按钮之前就退了)。
+	ErrNoSuchProc = errors.New("进程不存在")
+	// ErrKillDenied 权限不够。服务以普通用户跑、目标属于别人时就是这个。
+	ErrKillDenied = errors.New("权限不足")
+	// ErrKillUnsupported 本平台没实现结束进程。
+	ErrKillUnsupported = errors.New("当前平台不支持结束进程")
+	// ErrReadOnly 只读模式下不许结束进程。
+	ErrReadOnly = errors.New("只读模式")
+)
+
+// Kill 结束一个进程。force=false 发 SIGTERM,让目标自己清理退出;force=true 发 SIGKILL,
+// 内核直接抹掉,谁都拦不住(Windows 上两者都是 TerminateProcess,见 killProc)。
+//
+// 只发给单个进程,不碰进程组:进程表列的是进程,点哪条就结束哪条。顺带带走一整组是
+// 用户没要求的额外杀伤 —— pid 恰好是某个会话的组长时,那是一整棵树。
+//
+// name 是可选的护栏:传了就要求它与目标此刻的名字一致。进程表是秒级轮询的快照,从渲染
+// 到点击之间目标可能已经退出、pid 被内核复用给了别的进程,那时按 pid 杀就是杀错人。
+// 前端把当前显示的名字一起传回来,对不上就说明这条已经不是原来那个进程了。同名进程之间
+// 仍然分不开(一排 node 就是这样),所以这是"挡住明显搞错了",不是精确身份校验。
+func (m *Monitor) Kill(pid int, name string, force bool) error {
+	if m.readOnly {
+		return ErrReadOnly
+	}
+	if pid <= 0 || pid == 1 {
+		// 1 号是 init/systemd,杀掉整台机器就没了。
+		return fmt.Errorf("%w: %d", ErrBadPID, pid)
+	}
+	if pid == os.Getpid() {
+		// 杀自己等于让整个工作台下线,连"操作失败"的提示都发不回去。
+		return fmt.Errorf("%w: %d 是本服务自己", ErrBadPID, pid)
+	}
+	if !procSupported {
+		return ErrKillUnsupported
+	}
+	if name != "" {
+		cur, ok := procNameNow(pid)
+		if !ok {
+			return fmt.Errorf("%w: %d", ErrNoSuchProc, pid)
+		}
+		if cur != name {
+			return fmt.Errorf("%w: pid %d 现在是 %q 而不是 %q,进程表已过期,请刷新后重试",
+				ErrBadPID, pid, cur, name)
+		}
+	}
+	return killProc(pid, force)
+}
+
+// procNameNow 取 pid 此刻的显示名。走的是和进程表完全相同的代码路径(readProcs +
+// enrich),所以两边的名字一定可比 —— 换成"直接读一下名字"的捷径,就会在某个平台上
+// 与列表里显示的不一致,护栏反过来变成误报。
+func procNameNow(pid int) (string, bool) {
+	for _, rp := range readProcs() {
+		if rp.pid != pid {
+			continue
+		}
+		p := Process{PID: rp.pid, PPID: rp.ppid, Name: rp.name}
+		enrich(&p)
+		return p.Name, true
+	}
+	return "", false
 }

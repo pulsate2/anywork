@@ -3,6 +3,8 @@
 package sysmon
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"unsafe"
@@ -102,6 +104,34 @@ func sub(a, b uint64) uint64 {
 		return 0
 	}
 	return a - b
+}
+
+// killProc 结束单个进程。Windows 没有"礼貌地请你退出"这种通用机制 —— 控制台程序能收
+// Ctrl+C 事件,GUI 程序要收 WM_CLOSE 消息,两条路都要求发起方与目标共处一个控制台或桌面,
+// 服务进程给不出。所以 force 无论真假都是 TerminateProcess:目标没有清理的机会,
+// 这一点前端的确认框里要写清楚。
+func killProc(pid int, force bool) error {
+	_ = force
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		switch {
+		case errors.Is(err, windows.ERROR_INVALID_PARAMETER):
+			// 进程不存在时 OpenProcess 报的就是这个,不是 not found。
+			return fmt.Errorf("%w: %d", ErrNoSuchProc, pid)
+		case errors.Is(err, windows.ERROR_ACCESS_DENIED):
+			return fmt.Errorf("%w: 无权结束 pid %d", ErrKillDenied, pid)
+		}
+		return err
+	}
+	defer windows.CloseHandle(h)
+	// 退出码 1:约定俗成的"被外部终止",与正常退出的 0 区分开。
+	if err := windows.TerminateProcess(h, 1); err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return fmt.Errorf("%w: 无权结束 pid %d", ErrKillDenied, pid)
+		}
+		return err
+	}
+	return nil
 }
 
 // readDisk 统计 path 所在卷的容量(root 可能在任意盘)。
