@@ -1,12 +1,19 @@
 <script setup lang="ts">
 // 移动端终端键盘层:手机虚拟键盘不送 Ctrl/Alt/Esc/Tab/方向键,
 // 这里用粘滞键 + 底部工具条补全。物理键盘场景自动隐藏。
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { NIcon } from 'naive-ui'
 import { BackspaceOutline, ReturnDownForwardOutline } from '@vicons/ionicons5'
+import { isTouchDevice } from '@/utils/touch'
 
 const props = defineProps<{
   onKey: (key: string) => void
+  // 顶部工具栏的显隐开关。缺省(undefined)= 显示,组件单独用的时候不用传。
+  // 它只是在触控判定之上再叠一道:非触控设备本来就不该有这条,给了 true 也不显示。
+  visible?: boolean
+  // 长按 Esc 的回调。给终端页当「退出全屏」用:全屏时顶栏是收起的,那颗全屏钮点不到,
+  // 手机上又没有物理 Esc,这条键盘条是唯一一直在手边的东西。缺省不传就没有这个行为。
+  onEscHold?: () => void
 }>()
 
 // 粘滞修饰符:Ctrl / Alt / Shift。点一下激活,点下一个键后自动清除。
@@ -70,6 +77,26 @@ function holdStop() {
   if (holdRepeat !== null) { clearInterval(holdRepeat); holdRepeat = null }
 }
 
+// ---- 长按 Esc ----
+// Esc 自己必须在按下那一刻就发出去:它是终端里最常按的键之一(vim、readline 的 vi 模式),
+// 压半秒再发等于「按了没反应」。所以长按不是「改判」而是「追加」——先照常发 Esc,
+// 手指到点还没松就再触发一次退出全屏。代价是退出全屏时终端多收一个 Esc,而 Esc 在 shell 里
+// 是空操作,在 vim 里也只是回到普通模式,比让最常用的键变迟钝划算。
+// 阈值取 500ms,和 Android 系统的长按判定一致,肌肉记忆对得上。
+const ESC_HOLD_MS = 500
+let escTimer: ReturnType<typeof setTimeout> | null = null
+
+function escDown(e: PointerEvent) {
+  key(e, '\x1b')
+  escStop()
+  if (!props.onEscHold) return
+  escTimer = setTimeout(() => { escTimer = null; props.onEscHold?.() }, ESC_HOLD_MS)
+}
+
+function escStop() {
+  if (escTimer !== null) { clearTimeout(escTimer); escTimer = null }
+}
+
 // 可带修饰符参数的 CSI 序列终止字符:↑↓→← / Home / End。
 const CSI_FINALS = 'ABCDHF'
 
@@ -117,10 +144,11 @@ function ctrlTransform(seq: string): string {
 const showSymbols = ref(false)
 const symbols = ['~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '-', '=', '[', ']', '{', '}', '|', '\\', ':', ';', '"', "'", '<', '>', ',', '.', '/', '?']
 
-const isTouch = ref(false)
-function detectTouch() {
-  isTouch.value = 'ontouchstart' in window || navigator.maxTouchPoints > 0
-}
+// 触控判定在 setup 里一次取定,不放 onMounted:放那里的话首帧先不渲染键盘条、挂载后
+// 再冒出来,终端会白多 fit 一次。判定与窗口尺寸无关,没有需要重算的时机。
+const isTouch = isTouchDevice()
+// 真正要不要画:触控设备 + 没被用户收起来。
+const shown = computed(() => isTouch && props.visible !== false)
 
 // ---- 松手 ----
 // 统一挂在 window 上而不是每个按钮上:手指/鼠标在别处松开时按钮自己收不到 pointerup,
@@ -129,16 +157,29 @@ const barEl = ref<HTMLDivElement>()
 
 function releaseAll() {
   holdStop()
+  escStop()
   barEl.value?.querySelectorAll('.is-down').forEach((el) => el.classList.remove('is-down'))
 }
 
+// 收起时把状态清干净。粘滞键是「亮着的灯」,而 applySticky 仍在给系统软键盘的按键做
+// 变换(见它上面那段)—— 条一收,灯就看不见了,留着一个 Ctrl 会让下一个字母莫名变成
+// 控制码。连发定时器同理:条已经不在了,手指也收不到 pointerup。
+watch(shown, (on) => {
+  if (on) return
+  stickyCtrl.value = false
+  stickyAlt.value = false
+  stickyShift.value = false
+  showSymbols.value = false
+  releaseAll()
+})
+
 onMounted(() => {
-  detectTouch()
   window.addEventListener('pointerup', releaseAll)
   window.addEventListener('pointercancel', releaseAll)
 })
 onUnmounted(() => {
   holdStop()
+  escStop()
   window.removeEventListener('pointerup', releaseAll)
   window.removeEventListener('pointercancel', releaseAll)
 })
@@ -150,7 +191,7 @@ defineExpose({ applySticky })
   <!-- touchstart.prevent 在根上兜一道:彻底掐掉这次手势的默认动作(合成 click、
        双击缩放、以及「点一下已聚焦的编辑框就重新弹输入法」那条路)。按键动作本身
        在 pointerdown 里做完了,不依赖 click —— 见 script 里 key() 上面那段。 -->
-  <div v-if="isTouch" ref="barEl" class="term-kbd" @touchstart.prevent @mousedown.prevent>
+  <div v-if="shown" ref="barEl" class="term-kbd" @touchstart.prevent @mousedown.prevent>
     <div v-if="showSymbols" class="kbd-grid symbols">
       <button v-for="s in symbols" :key="s" class="kbd" @pointerdown.prevent="key($event, s)">{{ s }}</button>
     </div>
@@ -158,7 +199,9 @@ defineExpose({ applySticky })
     <!-- 7 列均分网格,按 DOM 顺序自动填两行。方向键不额外占块:
          ↑ 落在上排第 6 格,←↓→ 落在下排第 5~7 格,倒 T 形由网格位置自然形成。 -->
     <div class="kbd-grid keys">
-      <button class="kbd" @pointerdown.prevent="key($event, '\x1b')">Esc</button>
+      <!-- Esc:按下即发,按住不放再额外触发 onEscHold(终端页拿它退出全屏)。 -->
+      <button class="kbd" :title="onEscHold ? 'Esc(长按退出全屏)' : 'Esc'"
+        @pointerdown.prevent="escDown($event)">Esc</button>
       <button class="kbd" @pointerdown.prevent="key($event, '\t')">Tab</button>
       <button class="kbd" @pointerdown.prevent="tap($event, () => showSymbols = !showSymbols)">?#</button>
       <button class="kbd" @pointerdown.prevent="key($event, '\x1b[H')">Home</button>

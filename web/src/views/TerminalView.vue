@@ -8,24 +8,31 @@ import {
   NButton, NIcon, NModal, NList, NListItem,
   NTag, NEmpty, useMessage, NSelect, NForm, NFormItem, NInput, NInputNumber, NSwitch, NSlider,
 } from 'naive-ui'
-import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline, StarOutline } from '@vicons/ionicons5'
+import { useRoute, useRouter } from 'vue-router'
+import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline, StarOutline, ExpandOutline, ContractOutline, KeypadOutline } from '@vicons/ionicons5'
 import { TermClient, type TermSummary } from '@/api/term'
 import { api, type Workspace, type TermLimitSupport } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useCommandStore } from '@/stores/commands'
 import { copyText, selectAllIn } from '@/utils/clipboard'
-import { useKeyboardInset } from '@/utils/keyboardInset'
+import { useSoftKeyboard } from '@/utils/softKeyboard'
+import { isTouchDevice } from '@/utils/touch'
 import TerminalKeyboard from '@/mobile/TerminalKeyboard.vue'
 import CommandFavorites from '@/components/CommandFavorites.vue'
 
 const message = useMessage()
 const store = useWorkspaceStore()
 const cmds = useCommandStore()
-// 软键盘遮挡高度。Chrome 默认不会因为键盘压缩 layout viewport,100dvh 的页面因此
-// 完全感知不到键盘,底部的键盘条被压在键盘下面。拿它当额外的底部内边距用:
-// 页面自己变矮 → 键盘条回到键盘上沿,终端跟着 fit。Via 那类会整页 resize 的浏览器
-// 算出来是 0,这条路自动失效,不会重复补偿(见 utils/keyboardInset.ts)。
-const kbInset = useKeyboardInset()
+const route = useRoute()
+const router = useRouter()
+// 软键盘状态,两个量分工不同(见 utils/softKeyboard.ts):
+// - kbOpen:键盘开着。底部导航这时会被 BottomNav 收掉,终端页也就不必再给它留那 56px,
+//   省下的高度全给终端。
+// - kbInset:layout viewport 下沿被键盘遮住的高度。Chrome 不会因为键盘压缩 layout
+//   viewport,100dvh 的页面完全感知不到键盘,底部的键盘条被压在键盘下面 —— 拿这个值当
+//   额外的底部内边距,页面自己变矮,键盘条回到键盘上沿,终端跟着 fit。Via 那类会整页
+//   resize 的浏览器算出来是 0(它已经变矮了),不会重复补偿。
+const { inset: kbInset, open: kbOpen } = useSoftKeyboard()
 const termEl = ref<HTMLDivElement>()
 const terminalWrap = ref<HTMLDivElement>()
 const kbd = ref<InstanceType<typeof TerminalKeyboard> | null>(null)
@@ -102,6 +109,76 @@ const dumpEl = ref<HTMLPreElement>()
 
 // 终端尝试 resize 用的信号。
 const fitSignal = ref(0)
+
+// ---- 快捷键条显隐 ----
+// 键盘条本身占掉七八十像素高。手机上看长输出(日志、diff)时那几行比快捷键值钱,
+// 所以给一个显隐开关。开关只在触控设备上出现:桌面根本没有这条(见 TerminalKeyboard
+// 的 isTouch 判定),画一个点了什么都不变的按钮比不画更糟。
+const KBD_KEY = 'lr.term.kbd'
+const isTouch = isTouchDevice()
+// 缺省显示:第一次进来的用户得先看见有这么个东西,才知道可以收。
+const showKbd = ref(localStorage.getItem(KBD_KEY) !== '0')
+watch(showKbd, (v) => {
+  localStorage.setItem(KBD_KEY, v ? '1' : '0')
+  // 条是 flex:none 的兄弟节点,它一进一出终端的可用高度就跟着变 —— 和软键盘顶上来是
+  // 同一类事,得走同一套稳定化(见 scheduleSettle)。terminalWrap 上的 ResizeObserver
+  // 本来也会响,这里显式再排一次:settle 是幂等的,重复一次的代价远小于漏掉一次
+  // (漏掉的表现是终端行数不对、视口停在空白处)。
+  scheduleSettle()
+})
+
+// ---- 终端窗口全屏 ----
+// 把终端这一页提成一层铺满视口的定位层:底部导航、页面留白、顶栏(见下面那段)全让出来,
+// 终端多出六七行。不走浏览器原生的 Fullscreen API(那是「网页全屏」),它会附带两件
+// 我们不想要的事:① 全屏期间 Escape 被浏览器留着退出全屏,根本不派发给页面 —— 而 Esc 是
+// 终端里最要紧的键之一(vim、readline 的 vi 模式全指着它),要救回来得动 Keyboard Lock,
+// 还只有 Chromium 有;② iOS Safari 至今只给 <video> 全屏,手机上最需要这个功能的地方
+// 恰好没有。铺满视口这条路在哪个浏览器上都成立,Esc 也照常进终端,按钮不需要能力探测。
+//
+// 全屏状态记在地址栏的 full 参数上,不是一个普通的 ref —— 为的是「按返回键退出全屏」:
+// 进全屏时往历史里推一条 /terminal?full=1,系统返回键(Android 手势返回、浏览器后退)
+// 弹掉它就等于退出全屏,而不是把人从终端页整页退走。同一条路径只换 query,组件不重建、
+// WebSocket 不重连、滚动位置也不会被拽走(见 router 的 scrollBehavior)。
+// 另一条出路是长按键盘条上的 Esc(见 TerminalKeyboard 的 onEscHold)。
+const zoomed = computed(() => route.query.full === '1')
+// 那条 full=1 是不是我们自己推进去的。带着 full=1 直接进来也是可能的(刷新页面、
+// PWA 从上次的地址恢复、书签),那时历史里没有可弹的东西,退出得改成把 query 抹掉。
+let pushedZoom = false
+
+function enterZoom() {
+  if (zoomed.value) return
+  pushedZoom = true
+  router.push({ path: route.path, query: { ...route.query, full: '1' } })
+  // 全屏之后顶栏一起收起,屏幕上不再有任何「怎么出去」的线索,这句提示就是唯一的说明书。
+  // 长按 Esc 那条只有键盘条在的时候才提 —— 条被收起来时它确实按不到。
+  message.info(isTouch && showKbd.value ? '已全屏 · 返回键或长按 Esc 退出' : '已全屏 · 按返回键退出',
+    { duration: 2500 })
+}
+
+function exitZoom() {
+  if (!zoomed.value) return
+  // 自己推的那条就弹掉,而不是 replace 把 query 抹掉:replace 会把这条记录留在历史里,
+  // 再按一次返回键又回到全屏。反过来,不是自己推的就只能 replace —— 那时 back() 会把人
+  // 弹出这个站点(或者什么都不做),而用户按的只是「退出全屏」。
+  if (pushedZoom) {
+    pushedZoom = false
+    router.back()
+    return
+  }
+  const q = { ...route.query }
+  delete q.full
+  router.replace({ path: route.path, query: q })
+}
+
+// 顶栏在全屏时整条收起:它加上留白有五十来像素,又是三行终端,而全屏本来就是为了那几行。
+// 收起了也不用再拉出来 —— 出去的两条路(返回键、长按 Esc)都不需要它。
+watch(zoomed, (on) => {
+  // 出了全屏就把标记清掉:这一轮推进去的那条记录已经不在栈顶了。之后再进全屏会重新推。
+  if (!on) pushedZoom = false
+  // 这一层的尺寸变了(导航、留白和顶栏都让出来),和软键盘顶上来是同一类问题,
+  // 统一走稳定化,不做同步 fit(见 scheduleSettle)。
+  scheduleSettle()
+})
 
 // 「稳定化」调度。软键盘的开合是一段动画,ResizeObserver 会连着响很多次;
 // xterm 自己也把一部分工作排到了 rAF / requestIdleCallback 上(Viewport.queueSync、
@@ -959,9 +1036,11 @@ watch(fitSignal, () => applyTheme())
 </script>
 
 <template>
-  <div class="page-content terminal-page" :class="{ 'kb-open': kbInset > 0 }">
-    <!-- 顶部操作栏 -->
-    <div class="term-toolbar">
+  <div class="page-content terminal-page" :class="{ 'kb-open': kbOpen, zoomed }">
+    <!-- 顶部操作栏。全屏时整条收起(off):不是 v-if 拿掉,而是浮起来位移出视口 —— 留在
+         DOM 里,回来时不用重新挂载,也不会因为它一进一出改变终端高度(那会牵出 fit /
+         缓冲重排 / SIGWINCH 一整串,折行的长命令会被搅乱)。 -->
+    <div class="term-toolbar" :class="{ off: zoomed }" :aria-hidden="zoomed || undefined">
       <n-button class="term-sess" size="small" quaternary @click="openSessions">
         <template #icon><n-icon :component="TerminalOutline" /></template>
         会话
@@ -969,11 +1048,29 @@ watch(fitSignal, () => applyTheme())
              所以颜色之外还有 title/aria-label,连接中另加一点呼吸动效当第二个信号。 -->
         <span class="net-dot" :class="netState" role="img" :aria-label="netLabel" :title="netLabel"></span>
       </n-button>
-      <!-- 收藏 / 复制 / 粘贴:只留图标。这排横向很挤,带字的话「新建」会被挤出去。
+      <!-- 收藏 / 快捷键 / 全屏 / 复制 / 粘贴:只留图标。这排横向很挤,带字的话「新建」会被挤出去。
            title + aria-label 补上说明,鼠标悬停和读屏都还知道是什么。 -->
       <n-button class="term-ico" size="small" quaternary title="命令收藏" aria-label="命令收藏"
         @click="showCmdModal = true">
         <template #icon><n-icon :component="StarOutline" /></template>
+      </n-button>
+      <!-- 快捷键条显隐。只在触控设备上出现:桌面本来就没有那条键盘条,给一个点了
+           什么都不变的按钮比不给更糟。 -->
+      <n-button v-if="isTouch" class="term-ico" size="small" quaternary
+        :type="showKbd ? 'primary' : 'default'"
+        :title="showKbd ? '隐藏快捷键条' : '显示快捷键条'"
+        :aria-label="showKbd ? '隐藏快捷键条' : '显示快捷键条'"
+        @click="showKbd = !showKbd">
+        <template #icon><n-icon :component="KeypadOutline" /></template>
+      </n-button>
+      <!-- 全屏。它在全屏下是够不着的(整条顶栏都收起来了),出去的路是返回键或长按 Esc,
+           见 script 里 zoomed 那段。这里仍按开关写:状态由地址栏的 full 参数决定,
+           万一以后顶栏在全屏下又露出来,这颗钮的行为是对的。 -->
+      <n-button class="term-ico" size="small" quaternary
+        :type="zoomed ? 'primary' : 'default'"
+        :title="zoomed ? '退出全屏' : '终端全屏'" :aria-label="zoomed ? '退出全屏' : '终端全屏'"
+        @click="zoomed ? exitZoom() : enterZoom()">
+        <template #icon><n-icon :component="zoomed ? ContractOutline : ExpandOutline" /></template>
       </n-button>
       <div class="spacer"></div>
       <n-button class="term-ico" size="small" quaternary aria-label="复制"
@@ -984,7 +1081,10 @@ watch(fitSignal, () => applyTheme())
         title="把剪贴板内容粘到终端" @click="pasteIntoTerm">
         <template #icon><n-icon :component="ClipboardOutline" /></template>
       </n-button>
-      <n-button size="small" type="primary" @click="pickWorkspaceAndCreate">
+      <!-- 窄屏(≤340px)下这颗钮的文字会被 CSS 藏掉(见 .term-new),display:none 的
+           文字读屏也读不到,所以 title/aria-label 一直挂着补上名字。 -->
+      <n-button class="term-new" size="small" type="primary" title="新建会话" aria-label="新建会话"
+        @click="pickWorkspaceAndCreate">
         <template #icon><n-icon :component="AddOutline" /></template>
         新建
       </n-button>
@@ -1001,8 +1101,11 @@ watch(fitSignal, () => applyTheme())
       </div>
     </div>
 
-    <!-- 移动键盘层 -->
-    <TerminalKeyboard ref="kbd" :on-key="onKbdKey" />
+    <!-- 移动键盘层。全屏时长按它的 Esc 退出全屏:那会儿顶栏是收起的,全屏钮点不到,
+         而这条键盘条一直在手边(见 TerminalKeyboard 的 escDown)。不全屏就不给这个回调,
+         免得键上挂一句用不上的「长按退出全屏」。 -->
+    <TerminalKeyboard ref="kbd" :on-key="onKbdKey" :visible="showKbd"
+      :on-esc-hold="zoomed ? exitZoom : undefined" />
 
     <!-- 命令收藏 / 输入历史 -->
     <CommandFavorites v-model:show="showCmdModal" @fill="fillCommand" @run="runCommand" />
@@ -1133,9 +1236,28 @@ watch(fitSignal, () => applyTheme())
   padding: 8px 12px calc(56px + env(safe-area-inset-bottom));
   overflow: hidden;
 }
-/* 键盘弹出时:底部让出键盘的高度,同时不用再给底部导航留位置(它本来就在键盘底下了),
-   省下的高度全给终端。--lr-kb-inset 由 useKeyboardInset 写在 :root 上。 */
+/* 键盘弹出时:底部让出键盘遮住的高度,同时不用再给底部导航留位置 —— 键盘一开它就自己
+   滑下去了(见 main.css 的 .bottom-nav.kb-open),省下的高度全给终端。
+   --lr-kb-inset 由 useSoftKeyboard 写在 :root 上;整页 resize 那类浏览器算出来是 0,
+   页面已经变矮了,不需要再补。 */
 .terminal-page.kb-open {
+  padding-bottom: calc(var(--lr-kb-inset, 0px) + 4px);
+}
+/* 终端全屏:这一页本来就是 100dvh 的不滚动列,所以「全屏」要让出来的只有底部导航
+   (桌面是左侧栏)、页面自己那点留白,以及顶栏(它整条收起,见 .term-toolbar.off)——
+   把这一层抬到导航上面盖住,再把留白削到最小,终端多出六七行。
+   导航是 position: fixed + z-index: 100 的兄弟节点,不受流影响,只能盖;而 z-index 要
+   生效得先定位,于是 relative(不用 fixed:高度仍由那条 100dvh 管着,不去碰移动端
+   fixed 元素包含块和 dvh 不一致这摊事)。这个 relative 同时给收起的顶栏当定位参照。
+   背景必须显式给:留白处透出去就会看见底下的导航。 */
+.terminal-page.zoomed {
+  position: relative;
+  z-index: 200;
+  padding: 6px 8px calc(4px + env(safe-area-inset-bottom));
+  background: var(--lr-bg);
+}
+/* 键盘的补偿要压过上面那行 padding(同特异性、写在后面就会赢),所以单独提一档。 */
+.terminal-page.zoomed.kb-open {
   padding-bottom: calc(var(--lr-kb-inset, 0px) + 4px);
 }
 .term-toolbar {
@@ -1144,10 +1266,55 @@ watch(fitSignal, () => applyTheme())
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
+  /* 兜底:实在排不下就折行,而不是把最右边的「新建」切掉一半。naive 的钮是
+     flex-shrink: 0,页面又是 overflow: hidden,不留折行余地就是直接裁掉。
+     折行会吃掉两行终端,所以下面两档媒体查询先尽量把它压进一行。 */
+  flex-wrap: wrap;
 }
 .spacer { flex: 1; }
+/* 全屏时的顶栏:出流浮起来再整条位移出视口。不用 v-if 拿掉它 —— 它一进一出会改变终端
+   高度,牵出 fit → 缓冲重排 → SIGWINCH 一整串,折行的长命令会被搅乱;浮起来则一行都
+   不用重排。transform 也不触发布局,进出全屏因此只有一次尺寸变化(留白和导航那次)。
+   visibility 一并关掉,免得还能 Tab 聚焦到看不见的按钮上(opacity: 0 的元素照样在焦点
+   序列里);它按离散规则插值,所以放进 transition 是为了让元素等动画走完再消失。 */
+.term-toolbar.off {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  right: 8px;
+  z-index: 30;
+  margin: 0;
+  transform: translateY(calc(-100% - 12px));
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: transform .18s ease, opacity .18s ease, visibility .18s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .term-toolbar.off { transition: none; }
+}
 /* 图标钮不留文字的位置,压到方形 */
 .term-ico { width: 34px; padding: 0; }
+/* 这一排原本就挤(见模板里的注释),加了快捷键和全屏两个钮之后默认要 380px 的视口:
+   内容 356px(带字的两个钮各 72 = 左右各 10 内边距 + 18 图标 + 6 图标外边距 + 两个字 28,
+   五个图标钮各 34,七道 6px 间距)+ 页面左右留白各 12。375px 的 iPhone 正好越线。
+   下面两档按屏宽依次收紧,把它压回一行。 */
+@media (max-width: 400px) {
+  .term-toolbar { gap: 4px; }
+  .term-ico { width: 30px; }
+  /* 带字的那两个只削内边距,字留着 —— 整排都变成图标就认不出来了。这里点名写
+     两个类而不是 :not(.term-ico),好让下面那档能用同等特异性再改「新建」。 */
+  .term-sess, .term-new { padding: 0 8px; }
+}
+/* 320px 那档(iPhone SE 一代之类)还差十几个像素:「新建」也退成图标。加号比「会话」
+   两个字好猜,而「会话」钮上还挂着连接状态圆点,留它的文字更值。
+   naive 只在 default 插槽为空时才把图标外边距清零,这里的文字是用 CSS 藏的,
+   那 6px 还在,得自己抹掉,不然图标在方钮里偏左 3px。 */
+@media (max-width: 340px) {
+  .term-new { width: 30px; padding: 0; }
+  .term-new :deep(.n-button__content) { display: none; }
+  .term-new :deep(.n-button__icon) { margin: 0; }
+}
 /* 连接状态圆点,贴在「会话」钮的右下角。.n-button 本身是 position: relative,
    但别指望组件库的实现细节,这里自己声明一次。 */
 .term-sess { position: relative; }

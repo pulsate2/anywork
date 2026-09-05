@@ -102,6 +102,19 @@ body {
   border-top: 1px solid rgba(127,127,127,.2);
   padding-bottom: env(safe-area-inset-bottom);
   z-index: 100;
+  transition: transform .18s ease, visibility .18s;
+}
+/* 软键盘弹起时把它滑下去。bottom: 0 贴的是 layout viewport 的下沿,而软键盘要么只压缩
+   visual viewport 并把它往下挪(Chrome Android),要么把整个 WebView 变矮(Via 那类)——
+   两种情况下这条导航都会贴着键盘上沿露出来挡住输入行,也就是「拉起键盘把导航也拉起来了」。
+   它其实一直没动,是视口挪到了它跟前。类由 BottomNav 按 useSoftKeyboard 的判定挂上。
+   visibility 一起关掉:滑出去的东西不该还能被 Tab 聚焦到。 */
+.bottom-nav.kb-open {
+  transform: translateY(100%);
+  visibility: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  .bottom-nav { transition: none; }
 }
 .bottom-nav .nav-item {
   flex: 1 1 0;
@@ -154,6 +167,9 @@ body {
     font-size: 14px;
   }
   .bottom-nav .nav-item.active { background: rgba(127,127,127,.12); }
+  /* 桌面端这条是左侧栏,translateY 会把它整条推到屏幕下面去。而这里根本用不着躲键盘:
+     真有软键盘的平板也是横屏铺满,侧栏不在键盘上方。收键盘那条规则到此为止。 */
+  .bottom-nav.kb-open { transform: none; visibility: visible; }
   /* 桌面端留白改到变量上,吸顶元素的负外边距会跟着变,不用各自再写一遍媒体查询 */
   :root {
     --lr-page-pad: 20px;
