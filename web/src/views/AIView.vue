@@ -68,6 +68,18 @@ const needsBaseUrl = computed(() => needs('BASE_URL'))
 const sorted = computed(() =>
   providers.value.slice().sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent)),
 )
+
+// 卡片不多,但名字一半是英文一半是中文,配多了只有滚屏找。按名字和端点一起过滤,
+// 类别标签也参与匹配 —— 用户看到的字都能搜到。
+const searchQ = ref('')
+const filtered = computed(() => {
+  const q = searchQ.value.trim().toLowerCase()
+  if (!q) return sorted.value
+  return sorted.value.filter((p) =>
+    [p.name, categoryLabel(p.category), baseUrlOf(p), modelOf(p)]
+      .join('\n').toLowerCase().includes(q),
+  )
+})
 async function load() {
   loading.value = true
   try {
@@ -280,14 +292,18 @@ onMounted(load)
     <input ref="importInput" type="file" accept=".json,application/json" class="ai-file"
       @change="onImportPick" />
 
+    <n-input v-model:value="searchQ" size="small" clearable :placeholder="`搜索 ${activeApp.label} 配置`"
+      class="ai-search" />
+
     <n-spin :show="loading">
       <n-empty v-if="!providers.length" :description="`还没有 ${activeApp.label} 的配置`" class="ai-empty">
         <template #extra>
           <n-button size="small" @click="openCreate">从预设建一份</n-button>
         </template>
       </n-empty>
+      <n-empty v-else-if="!filtered.length" description="没有匹配的配置" class="ai-empty" />
       <div v-else class="ai-grid">
-        <div v-for="p in sorted" :key="p.id" class="ai-card" :class="{ on: p.isCurrent }">
+        <div v-for="p in filtered" :key="p.id" class="ai-card" :class="{ on: p.isCurrent }">
           <div class="ai-top">
             <span class="ai-name">{{ p.name }}</span>
             <n-tag v-if="p.isCurrent" type="success" size="small" :bordered="false">当前</n-tag>
@@ -379,6 +395,7 @@ onMounted(load)
 .ai-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 10px 0 12px; }
 .ai-tools { display: flex; gap: 8px; }
 .ai-file { display: none; }
+.ai-search { max-width: 320px; margin-bottom: 12px; }
 
 .ai-switch { display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--lr-radius); background: rgba(127, 127, 127, .12); }
 .ai-seg {

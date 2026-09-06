@@ -162,10 +162,10 @@ const claudeRows: ClaudeRow[] = [
 ]
 
 const codexRows: CodexRow[] = [
-  // 自定义端点多半是 OpenAI 兼容的 /chat/completions,responses 那套只有少数家有。
+  // 自定义端点默认走 responses 协议;OpenAI 兼容的 /chat/completions 端点需要用户手动改回 chat。
   {
     name: '自定义', category: 'custom', site: '',
-    provider: 'custom', baseUrl: BASE_URL_PLACEHOLDER, model: '', wireApi: 'chat',
+    provider: 'custom', baseUrl: BASE_URL_PLACEHOLDER, model: '', wireApi: 'responses',
   },
   {
     name: 'Kimi', category: 'cn_official', site: 'https://platform.kimi.com',

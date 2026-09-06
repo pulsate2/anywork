@@ -1,8 +1,13 @@
 package git
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
-// StatusEntry 一条 git status 记录。
+// StatusEntry 一条 git status 记录。Add/Del 是该文件在所属那一侧的增/删行数
+// (numstat,-1 表示二进制或统计不到,前端不显示);同一文件两侧各有一份,数字只在自己
+// 那一侧有意义:暂存侧是已暂存的改动量,工作区侧是暂存之后又改的量。
 type StatusEntry struct {
 	Raw  string `json:"raw"`
 	X    string `json:"x"` // 索引状态
@@ -10,6 +15,8 @@ type StatusEntry struct {
 	Path string `json:"path"`
 	Orig string `json:"orig,omitempty"` // 重命名/复制原路径
 	Kind string `json:"kind"`           // staged | unstaged | untracked | ignored
+	Add  int    `json:"add,omitempty"`  // 新增行数(numstat)
+	Del  int    `json:"del,omitempty"`  // 删除行数(numstat)
 }
 
 // Status 分组后的状态。
@@ -64,7 +71,73 @@ func (s *Service) Status(p string) (Status, error) {
 	if _, err := s.run(info.Root, nil, "rev-parse", "--verify", "-q", "REVERT_HEAD"); err == nil {
 		st.Reverting = true
 	}
+	s.fillNumstat(info.Root, &st)
 	return st, nil
+}
+
+// fillNumstat 给每条状态记录补增删行数。两次 numstat 对应两个比较面:
+// --cached 是 HEAD→索引(暂存侧),不带参数是索引→工作区(工作区侧)。
+// 数字挂到 Path 上,两侧各查各的;同一次 mv 改名两侧都记 Path=新路径,取得到就对得上。
+// 未跟踪文件 numstat 看不见,保持 0;冲突文件 numstat 不出数,也保持 0。
+func (s *Service) fillNumstat(root string, st *Status) {
+	// numstat 的 adds/dels 是 Go 保留不了 "-" 的 int,先用 string 收再转。
+	fill := func(side map[string][2]string) func(StatusEntry) StatusEntry {
+		return func(e StatusEntry) StatusEntry {
+			if v, ok := side[e.Path]; ok {
+				e.Add, e.Del = atoiOrMinus1(v[0]), atoiOrMinus1(v[1])
+			}
+			return e
+		}
+	}
+	sided := func(entries []StatusEntry, side map[string][2]string) {
+		for i := range entries {
+			entries[i] = fill(side)(entries[i])
+		}
+	}
+	staged := s.numstatSide(root, "--cached")
+	unstaged := s.numstatSide(root)
+	sided(st.Staged, staged)
+	sided(st.Unstaged, unstaged)
+	sided(st.Conflicted, unstaged) // 冲突行也能在工作区侧拿到数字(以冲突标记计)
+}
+
+// numstatSide 跑一次 git diff --numstat -z,把输出按 NUL 切成 path→[adds,dels]。
+// 普通记录是一个完整段 `adds\tdels\tpath`;重命名记录被拆成三段:计数段(以 \t 结尾、
+// 路径位为空)→ 原路径段 → 新路径段。取新路径当 key —— status 的 Path 记的也是
+// 新路径,对得上。二进制文件计数是 `-`,atoiOrMinus1 会归成 -1。
+// 解析不了的段跳过,顶多少个数字,不至于让整个状态接口挂掉。
+func (s *Service) numstatSide(root string, extra ...string) map[string][2]string {
+	args := append([]string{"diff", "--numstat", "-z"}, extra...)
+	out, err := s.run(root, nil, args...)
+	if err != nil {
+		return nil
+	}
+	m := map[string][2]string{}
+	fields := strings.Split(strings.TrimRight(out, "\x00"), "\x00")
+	for i := 0; i < len(fields); i++ {
+		parts := strings.SplitN(fields[i], "\t", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		if parts[2] != "" {
+			m[parts[2]] = [2]string{parts[0], parts[1]}
+			continue
+		}
+		// 重命名:后面两段是 原路径/新路径,数字挂到新路径上。
+		if i+2 < len(fields) {
+			m[fields[i+2]] = [2]string{parts[0], parts[1]}
+			i += 2
+		}
+	}
+	return m
+}
+
+func atoiOrMinus1(s string) int {
+	if s == "-" {
+		return -1
+	}
+	n, _ := strconv.Atoi(s)
+	return n
 }
 
 func parseBranchLine(st *Status, l string) {

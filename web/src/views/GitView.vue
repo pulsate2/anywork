@@ -406,6 +406,16 @@ const diffTitle = computed(() => {
   return diffScope.value === 'staged' ? '已暂存改动' : '工作区改动'
 })
 
+// numstatOf 改动行右侧的 +N -N。后端给的口径:暂存行是 HEAD→索引的量,工作区行是
+// 索引→工作区的量,正好对得上各自的"查看"弹窗。二进制(-1)和未跟踪(0)不算数,不显示;
+// 全 0 的纯改名/清空暂存显示 `+0 -0`,和 diff 弹窗一致。
+function numstatOf(e: GitEntry): string {
+  const a = e.add ?? 0
+  const d = e.del ?? 0
+  if (a < 0 || d < 0 || (a === 0 && d === 0)) return ''
+  return `+${a} -${d}`
+}
+
 // 跳二级页看某个文件的差异/全文。scope: worktree|staged|commit|untracked。
 // 路由没有 keep-alive,返回时本页会整体重建,弹窗状态会丢。所以离开前把"当前开着哪个列表"
 // 写回 /git 这条历史记录的 query,返回时按它把列表重新打开;不是从列表点进来的就把旧记录清掉,
@@ -828,6 +838,7 @@ watch(() => store.currentPath, (p) => {
                 <div v-for="e in status.conflicted" :key="e.path" class="git-file">
                   <span class="git-xy danger">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path">{{ e.path }}</span>
+                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span class="na">+{{ e.add }}</span> <span class="nd">-{{ e.del }}</span></span>
                   <n-button class="git-btn" size="tiny" quaternary title="撤回改动(回到 HEAD)"
                     aria-label="撤回改动" @click="restoreEntry(e, 'all')">
                     <n-icon :component="ArrowUndoOutline" />
@@ -846,6 +857,7 @@ watch(() => store.currentPath, (p) => {
                 <div v-for="e in status.staged" :key="e.path" class="git-file">
                   <span class="git-xy add">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path" @click="goFile('staged', e.path)">{{ e.path }}</span>
+                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span class="na">+{{ e.add }}</span> <span class="nd">-{{ e.del }}</span></span>
                   <n-button class="git-btn" size="tiny" quaternary title="撤回改动(回到 HEAD)"
                     aria-label="撤回改动" @click="restoreEntry(e, 'all')">
                     <n-icon :component="ArrowUndoOutline" />
@@ -868,6 +880,7 @@ watch(() => store.currentPath, (p) => {
                 <div v-for="e in status.unstaged" :key="e.path" class="git-file">
                   <span class="git-xy">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path" @click="goFile('worktree', e.path)">{{ e.path }}</span>
+                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span class="na">+{{ e.add }}</span> <span class="nd">-{{ e.del }}</span></span>
                   <n-button class="git-btn" size="tiny" quaternary title="撤回改动" aria-label="撤回改动"
                     @click="restoreEntry(e, 'worktree')">
                     <n-icon :component="ArrowUndoOutline" />
@@ -1154,23 +1167,30 @@ watch(() => store.currentPath, (p) => {
 .spacer { flex: 1; }
 .git-group { margin-bottom: 12px; }
 .git-group-head { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 600; }
+/* 行结构:XY 码 + 可换行路径 + +N -N + 按钮,全部一行流式排布。
+   路径不再单行省略(rtl 那套也去掉):overflow-wrap 允许在任意字符处断,
+   断点优先落在 / 上;数字和按钮跟在文字后面,不换到别的行。 */
 .git-file {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 4px 2px;
   padding: 5px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.14);
 }
+/* 两个图标钮再收紧:8px 的行距在这种 28px 小钮之间显得空,4px 刚好;XY 码/路径那侧保持 8px。 */
+.git-file .git-btn + .git-btn { margin-left: -4px; }
 .git-xy {
   flex: none; width: 20px; white-space: pre;
   font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
 }
 .git-xy.add { color: var(--lr-diff-add); }
 .git-xy.danger { color: var(--lr-danger); }
-/* rtl 让长路径优先露出尾部(文件名),溢出省略号落在开头 */
 .git-path {
   flex: 1; min-width: 0; cursor: pointer;
   font-family: ui-monospace, monospace; font-size: 12px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  direction: rtl; text-align: left;
+  overflow-wrap: anywhere; text-align: left;
 }
+/* +N -N 摘要:绿红各一段,色令牌和差异行同一套(diff 列表同款);粗体给色觉障碍第二道线索 */
+.git-nums { flex: none; font-family: ui-monospace, monospace; font-size: 11px; white-space: pre; }
+.git-nums .na { color: var(--lr-diff-add); font-weight: 600; }
+.git-nums .nd { color: var(--lr-diff-del); font-weight: 600; }
 /* 覆盖全局 .n-button 的 44px 触控下限,否则行会被撑高 */
 .git-btn { min-height: 28px; height: 28px; width: 28px; }
 /* 提交弹窗的"暂存所有"开关行:给 checkbox 一点呼吸,不与提示文案挤在一起 */

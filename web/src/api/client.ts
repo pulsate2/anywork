@@ -332,6 +332,9 @@ export interface GitEntry {
   path: string
   orig?: string
   kind: string
+  // 该文件在所属分组那一侧的增/删行数(numstat);-1 = 二进制,0 = 统计不到(未跟踪),都不显示
+  add?: number
+  del?: number
 }
 
 export interface GitStatus {
