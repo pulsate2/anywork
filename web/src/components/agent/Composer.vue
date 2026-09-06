@@ -12,6 +12,9 @@ import { api } from '@/api/client'
 const props = defineProps<{
   running: boolean
   disabled?: boolean // 会话不在运行且无可恢复凭据
+  // 有未答的提问卡:回合卡在控制请求上,这时发消息只会排队、还容易被当成
+  // 回答。锁输入与发送,但保留停止(想直接打断回合是合法诉求)。
+  askPending?: boolean
   sending?: boolean
   sessionId?: string // 附件归属的会话(存独立目录,不进工作区)
   cliCommands?: string[] // CLI 真实 / 指令(claude init 透传 / codex 内置表)
@@ -28,7 +31,10 @@ const inputEl = ref<HTMLTextAreaElement | null>(null)
 const fileEl = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
 
-const canSend = computed(() => !props.disabled && !props.sending && text.value.trim() !== '')
+// 提问未答 = 输入整体锁死(与 disabled 同效但提示语不同)。
+const locked = computed(() => !!props.askPending)
+
+const canSend = computed(() => !props.disabled && !locked.value && !props.sending && text.value.trim() !== '')
 
 // ---- "/" 指令 ----
 // 本地指令(管理会话自身):CLI 不认识这些,是我们自己的控制通道。
@@ -46,7 +52,7 @@ const commands = computed(() => [
     name: `/${n}`, args: '', desc: '', hasArg: false, local: false,
   })),
 ])
-const slashOpen = computed(() => text.value.startsWith('/') && !props.disabled)
+const slashOpen = computed(() => text.value.startsWith('/') && !props.disabled && !locked.value)
 const slashMatches = computed(() => {
   if (!slashOpen.value) return []
   const word = text.value.split(/\s/)[0]!.toLowerCase()
@@ -69,7 +75,7 @@ watch(text, () => nextTick(autosize))
 
 function submit() {
   const t = text.value.trim()
-  if (!t || props.disabled) return
+  if (!t || props.disabled || locked.value) return
   if (t.startsWith('/')) {
     const [word, ...rest] = t.split(/\s+/)
     const c = commands.value.find((x) => x.name === word!.toLowerCase())
@@ -135,14 +141,17 @@ async function onFiles(files: FileList | null) {
     <!-- 自绘 textarea 而不用 n-input:输入区要贴着软键盘自动增高,naive 的 autosize
        在 fixed 布局里重算时机不稳。样式对齐 n-input 的观感。 -->
     <textarea
-      ref="inputEl" v-model="text" rows="2" :disabled="disabled"
-      class="composer-input" :placeholder="uploading ? '上传附件中…' : '发消息给 Agent(回车换行,Ctrl+Enter 发送,/ 查看指令)…'"
+      ref="inputEl" v-model="text" rows="2" :disabled="disabled || locked"
+      class="composer-input"
+      :placeholder="uploading ? '上传附件中…'
+        : locked ? 'Agent 正在等你的回答,请先回答上方提问…'
+        : '发消息给 Agent(回车换行,Ctrl+Enter 发送,/ 查看指令)…'"
       @keydown="onKeydown"
     />
     <div class="composer-row">
       <button
         type="button" class="attach-btn" title="上传附件"
-        :disabled="disabled || uploading || !sessionId" @click="fileEl?.click()"
+        :disabled="disabled || locked || uploading || !sessionId" @click="fileEl?.click()"
       >
         <n-icon :component="AttachOutline" />
       </button>

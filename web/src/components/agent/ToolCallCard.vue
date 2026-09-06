@@ -4,12 +4,14 @@
 // 详情是明确动作。审批请求仍内嵌在行下方,不跟着弹窗走。
 import { computed, ref } from 'vue'
 import { NModal } from 'naive-ui'
-import type { AgentPermissionReq, AgentToolCall } from '@/api/client'
+import { api, type AgentPermissionReq, type AgentToolCall } from '@/api/client'
 import DiffView from './DiffView.vue'
 import ApprovalCard from './ApprovalCard.vue'
 
 const props = defineProps<{
   call: AgentToolCall
+  // 会话 id:tool_result 的 image 块经 /api/agent/sessions/{id}/files/{name} 取。
+  sessionId?: string
   // 内嵌审批:同工具的审批请求并进工具卡(Write/Edit 审批与调用同卡呈现)。
   pendingReq?: AgentPermissionReq
   pendingResolved?: { allow: boolean; session?: boolean } | null
@@ -19,6 +21,19 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'decide', allow: boolean, session: boolean): void }>()
 
 const open = ref(false)
+
+// tool_result 里 image 块的缩略图地址(有会话 id 且带图才有)。
+const imageUrls = computed<string[]>(() =>
+  props.sessionId && props.call.images?.length
+    ? props.call.images.map((n) => api.agentFileUrl(props.sessionId!, n))
+    : [],
+)
+const lightbox = ref<string | null>(null)
+// n-modal 要 v-model:show;lightbox 值本身只是 url。
+const lightboxOpen = computed({
+  get: () => !!lightbox.value,
+  set: (v: boolean) => { if (!v) lightbox.value = null },
+})
 
 const stateLabel = computed(() =>
   props.call.state === 'running' ? '运行中' : props.call.state === 'error' ? '出错' : '完成',
@@ -198,6 +213,12 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
       <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
       <span class="tool-state">{{ stateLabel }}</span>
     </button>
+    <!-- 结果里的图片:缩略图条(点击放大),弹窗里也有全量 -->
+    <div v-if="imageUrls.length" class="tool-imgs">
+      <button v-for="(u, i) in imageUrls" :key="u" type="button" class="tool-img" @click.stop="lightbox = u">
+        <img :src="u" :alt="`图片 ${i + 1}`" loading="lazy" />
+      </button>
+    </div>
     <!-- 内嵌审批:compact 省掉命令摘要行(头部本来就显示着);留在时间线上,弹窗打开也能答复 -->
     <ApprovalCard
       v-if="pendingReq"
@@ -221,7 +242,14 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
         <pre v-else-if="command" class="tool-block">{{ command }}</pre>
         <pre v-if="call.result" class="tool-block result">{{ call.result }}</pre>
         <div v-else-if="call.state === 'running'" class="tool-wait">等待结果…</div>
+        <div v-if="imageUrls.length" class="tool-imgs">
+          <img v-for="(u, i) in imageUrls" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
+        </div>
       </div>
+    </n-modal>
+    <!-- 点亮的原图:独立小弹窗,Cookie 认同所以 <img src> 直连 -->
+    <n-modal v-model:show="lightboxOpen" preset="card" class="tool-modal" title="图片">
+      <img v-if="lightbox" :src="lightbox" class="tool-lightbox" alt="图片" />
     </n-modal>
   </div>
 </template>
@@ -265,6 +293,20 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
 .tool-brief::-webkit-scrollbar { display: none; }
 .tool-state { flex: none; font-size: 11px; color: var(--lr-fg-muted); }
 .tool-card.error .tool-state { color: var(--lr-danger); }
+/* 结果缩略图条:小方图,横向可滚;点击在时间线上直接放大,不必先进详情 */
+.tool-imgs {
+  display: flex; gap: 6px; padding: 6px 10px 8px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.tool-imgs::-webkit-scrollbar { display: none; }
+.tool-img {
+  flex: none; width: 56px; height: 56px; padding: 0;
+  border: 1px solid rgba(127, 127, 127, .2); border-radius: 6px;
+  background: transparent; cursor: zoom-in; overflow: hidden;
+}
+.tool-img img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
 </style>
 
 <!-- 弹窗里的详情由 teleport 渲染到 body,scoped 样式作用不到,放非 scoped 块 -->
@@ -285,4 +327,10 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
   font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
   color: var(--lr-fg); overflow-wrap: anywhere;
 }
+.tool-modal .tool-imgs { display: flex; gap: 8px; flex-wrap: wrap; }
+.tool-modal .tool-imgs img {
+  width: 96px; height: 96px; border-radius: 6px; cursor: zoom-in;
+  border: 1px solid rgba(127, 127, 127, .2); object-fit: cover;
+}
+.tool-modal .tool-lightbox { max-width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
 </style>

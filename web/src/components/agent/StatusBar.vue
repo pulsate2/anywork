@@ -9,6 +9,8 @@ import type { AgentApp, AgentUsage } from '@/api/client'
 const props = defineProps<{
   state: 'running' | 'idle' | 'dead'
   pendingApproval?: boolean
+  // agent 的提问还挂着(AskUserQuestion 选项卡未答):优先显示"等待回答"。
+  pendingAsk?: boolean
   // 压缩进行中(claude code 底部 Compacting… 同款):优先于思考动词显示。
   compacting?: boolean
   usage?: AgentUsage | null
@@ -30,6 +32,7 @@ watch(() => props.state, (s) => {
 })
 
 const status = computed(() => {
+  if (props.pendingAsk) return { text: '等待回答', tone: 'warn', pulse: true }
   if (props.pendingApproval) return { text: '等待审批', tone: 'warn', pulse: true }
   // 压缩进行中:回合其实还在跑,但值得单独说出来(claude code 的 Compacting…)
   if (props.compacting) return { text: '压缩上下文…', tone: 'busy', pulse: true }
@@ -57,7 +60,8 @@ function fmtTokens(v: number): string {
 const ctx = computed(() => {
   const u = props.usage
   if (!u || !u.context) return null
-  const win = contextWindow(props.app, u.model || props.model)
+  // 真实窗口优先(claude result 的 modelUsage 透传),没给再回落启发式。
+  const win = u.window || contextWindow(props.app, u.model || props.model)
   const pct = Math.min(100, Math.max(0, Math.round((u.context / win) * 100)))
   const tone = pct >= 90 ? 'danger' : pct >= 70 ? 'warn' : 'idle'
   return {

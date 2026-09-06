@@ -3,10 +3,16 @@
 // 2 张以上连续的"可组"工具合一张卡,一行摘要(数量 + 主意图 + 涉及目标),
 // 点开是组内每张工具的单行。写/改类(Edit/Write/Bash/ApplyPatch/CodexDiff)
 // 与待审批、TodoWrite、AskUserQuestion 不参与聚合 —— 它们每张都值得单看。
+// 组内单行可再点:弹窗看该次的参数与结果(同 ToolCallCard 详情,组卡版)。
 import { computed, ref } from 'vue'
-import type { AgentToolCall } from '@/api/client'
+import { NModal } from 'naive-ui'
+import { api, type AgentToolCall } from '@/api/client'
 
-const props = defineProps<{ calls: AgentToolCall[] }>()
+const props = defineProps<{
+  calls: AgentToolCall[]
+  // 会话 id:tool_result 的 image 块经 /api/agent/sessions/{id}/files/{name} 取。
+  sessionId?: string
+}>()
 
 const open = ref(false)
 
@@ -58,6 +64,37 @@ const state = computed(() =>
 const stateLabel = computed(() =>
   state.value === 'running' ? '运行中' : state.value === 'error' ? '出错' : '完成',
 )
+
+// ---- 组内单条的详情弹窗 ----
+// 详情 = 参数 + 结果 + 结果图片,组内工具全是只读类,没有 diff 分支。
+const detail = ref<AgentToolCall | null>(null)
+const detailOpen = computed({
+  get: () => !!detail.value,
+  set: (v: boolean) => { if (!v) detail.value = null },
+})
+
+// 参数展示:可解析的 JSON 缩进两格(键值一目了然),截断的非法 JSON 原样贴。
+const detailArgs = computed(() => {
+  const raw = detail.value?.args
+  if (!raw) return ''
+  try {
+    const v = JSON.parse(raw)
+    if (v && typeof v === 'object') return JSON.stringify(v, null, 2)
+  } catch { /* 截断的 JSON:原样 */ }
+  return raw
+})
+
+// 该次结果里的图片缩略图地址(有会话 id 且带图才有)。
+const detailImages = computed<string[]>(() =>
+  props.sessionId && detail.value?.images?.length
+    ? detail.value.images.map((n) => api.agentFileUrl(props.sessionId!, n))
+    : [],
+)
+const lightbox = ref<string | null>(null)
+const lightboxOpen = computed({
+  get: () => !!lightbox.value,
+  set: (v: boolean) => { if (!v) lightbox.value = null },
+})
 </script>
 
 <template>
@@ -69,13 +106,30 @@ const stateLabel = computed(() =>
       <span class="group-state">{{ stateLabel }}</span>
     </button>
     <div v-if="open" class="group-body">
-      <div v-for="(c, i) in calls" :key="c.toolUseId || i" class="group-item">
+      <button v-for="(c, i) in calls" :key="c.toolUseId || i" type="button" class="group-item" @click="detail = c">
         <span class="item-dot" :class="c.state" />
         <span class="item-name">{{ c.tool }}</span>
         <span v-if="c.result" class="item-lines">{{ c.result.trim().split('\n').length }} 行</span>
         <span class="item-state">{{ c.state === 'error' ? '出错' : c.state === 'running' ? '运行中' : '完成' }}</span>
-      </div>
+      </button>
     </div>
+
+    <!-- 组内单条详情:参数 + 结果 + 图片。弹窗样式(.tool-modal 系列)复用
+         ToolCallCard 非 scoped 块的全局规则 —— 两个组件总在 AgentView 一起挂载 -->
+    <n-modal v-model:show="detailOpen" preset="card" :title="detail?.tool || '工具'" class="tool-modal">
+      <div class="tool-detail">
+        <pre v-if="detailArgs" class="tool-block">{{ detailArgs }}</pre>
+        <pre v-if="detail?.result" class="tool-block result">{{ detail.result }}</pre>
+        <div v-else-if="detail?.state === 'running'" class="tool-wait">等待结果…</div>
+        <div v-if="detailImages.length" class="tool-imgs">
+          <img v-for="(u, i) in detailImages" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
+        </div>
+      </div>
+    </n-modal>
+    <!-- 点亮的原图:独立小弹窗,Cookie 认同所以 <img src> 直连 -->
+    <n-modal v-model:show="lightboxOpen" preset="card" class="tool-modal" title="图片">
+      <img v-if="lightbox" :src="lightbox" class="tool-lightbox" alt="图片" />
+    </n-modal>
   </div>
 </template>
 
@@ -113,9 +167,14 @@ const stateLabel = computed(() =>
 .group-state { flex: none; font-size: 11px; color: var(--lr-fg-muted); }
 .group-card.error .group-state { color: var(--lr-danger); }
 .group-body { border-top: 1px solid rgba(127, 127, 127, .14); }
+/* 单条从 div 换成 button(点开详情):补上按钮语义的归零样式 */
 .group-item {
   display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px; font-size: 12px;
+  width: 100%; padding: 6px 10px; font-size: 12px;
+  appearance: none; border: 0; background: transparent;
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  min-height: 38px;
 }
 .group-item + .group-item { border-top: 1px solid rgba(127, 127, 127, .08); }
 .item-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--lr-ok); }

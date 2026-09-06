@@ -27,9 +27,10 @@ type codexDriver struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	nextID    int
-	pending   map[int]chan json.RawMessage // RPC 响应
-	approvals map[string]chan int          // reqID(itemId) → 审批结果(0 拒 / 1 允许 / 2 本会话允许)
+	nextID     int
+	pending    map[int]chan json.RawMessage       // RPC 响应
+	approvals  map[string]chan int                // reqID(itemId) → 审批结果(0 拒 / 1 允许 / 2 本会话允许)
+	userInputs map[string]chan *userInputDecision // reqID(itemId) → 提问回答(nil = 取消)
 
 	threadID   string // codex thread id(续聊凭据)
 	permMode   string
@@ -51,10 +52,11 @@ type codexDriver struct {
 
 func newCodexDriver() *codexDriver {
 	return &codexDriver{
-		pending:   map[int]chan json.RawMessage{},
-		approvals: map[string]chan int{},
-		events:    make(chan Event, 128),
-		done:      make(chan struct{}),
+		pending:    map[int]chan json.RawMessage{},
+		approvals:  map[string]chan int{},
+		userInputs: map[string]chan *userInputDecision{},
+		events:     make(chan Event, 128),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -297,6 +299,117 @@ func approveCode(allow, session bool) int {
 	return 1
 }
 
+// userInputDecision 提问的回答;nil = 取消。
+type userInputDecision struct {
+	answers map[string][]string // 问题 id → 选中的选项 label / 自由文本
+}
+
+// Answer 回答一个 ask_user 请求(见 Driver 接口)。answers=nil 表示取消。
+func (d *codexDriver) Answer(reqID string, answers map[string][]string) error {
+	d.mu.Lock()
+	ch := d.userInputs[reqID]
+	if ch != nil {
+		delete(d.userInputs, reqID)
+	}
+	d.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("问题不存在或已回答: %s", reqID)
+	}
+	if answers == nil {
+		ch <- nil
+	} else {
+		ch <- &userInputDecision{answers: answers}
+	}
+	return nil
+}
+
+// handleUserInput item/tool/requestUserInput:codex 的结构化提问。params 即
+// 工具输入 {itemId, questions:[{id,question,required,multiple,options,…}]},
+// 归一成 ask_user 事件挂起等 Answer;答复形状是嵌套的
+// {decision:"accept", answers:{<问题id>:{answers:[…]}}}(与 claude 的扁平
+// answers 不同,hapi appServerPermissionAdapter 踩过的形状)。
+func (d *codexDriver) handleUserInput(msg *jsonrpcLine) {
+	var p struct {
+		ItemID    string `json:"itemId"`
+		Questions []struct {
+			ID          string `json:"id"`
+			Question    string `json:"question"`
+			Required    *bool  `json:"required"`
+			Multiple    bool   `json:"multiple"`
+			Placeholder string `json:"placeholder"`
+			Options     []struct {
+				Label       string `json:"label"`
+				Description string `json:"description"`
+				Preview     string `json:"preview"`
+			} `json:"options"`
+		} `json:"questions"`
+	}
+	json.Unmarshal(msg.Params, &p)
+
+	qs := make([]AskQuestion, 0, len(p.Questions))
+	for _, q := range p.Questions {
+		if strings.TrimSpace(q.Question) == "" {
+			continue
+		}
+		id := q.ID
+		if id == "" {
+			id = fmt.Sprintf("q-%d", len(qs))
+		}
+		opts := make([]AskOption, 0, len(q.Options))
+		for _, o := range q.Options {
+			if strings.TrimSpace(o.Label) == "" {
+				continue
+			}
+			opts = append(opts, AskOption{Label: o.Label, Description: o.Description, Preview: o.Preview})
+		}
+		qs = append(qs, AskQuestion{
+			ID:          id,
+			Question:    q.Question,
+			Multi:       q.Multiple,
+			Required:    q.Required == nil || *q.Required,
+			Options:     opts,
+			Placeholder: q.Placeholder,
+		})
+	}
+	if len(qs) == 0 {
+		// 形状不认识:取消让 agent 自己绕开,免得挂死回合。
+		d.respond(msg.ID, map[string]any{"decision": "cancel"})
+		return
+	}
+
+	reqID := p.ItemID
+	if reqID == "" {
+		reqID = fmt.Sprintf("ask-%d", time.Now().UnixNano())
+	}
+	ch := make(chan *userInputDecision, 1)
+	d.mu.Lock()
+	if d.stdin == nil {
+		d.mu.Unlock()
+		return
+	}
+	d.userInputs[reqID] = ch
+	d.mu.Unlock()
+
+	d.emit(Event{Kind: KindAskUser, Payload: &AskUserPayload{ReqID: reqID, Questions: qs}})
+
+	dec := <-ch
+	d.mu.Lock()
+	delete(d.userInputs, reqID)
+	d.mu.Unlock()
+	// 进程死掉时 waitExit 已把 stdin 置 nil,respond 自己会跳过,无需特判。
+	if dec == nil {
+		d.respond(msg.ID, map[string]any{"decision": "cancel"})
+		return
+	}
+	answers := map[string]any{}
+	for _, q := range qs {
+		if sel := dec.answers[q.ID]; len(sel) > 0 {
+			answers[q.ID] = map[string]any{"answers": sel}
+		}
+	}
+	d.respond(msg.ID, map[string]any{"decision": "accept", "answers": answers})
+}
+
 func (d *codexDriver) PendingRequests() []PermissionReqPayload {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -350,7 +463,7 @@ func (d *codexDriver) waitExit() {
 	d.mu.Lock()
 	d.exitErr = err
 	d.stdin = nil
-	// 进程死了:RPC 全部失败,挂起的审批按拒绝收尾。
+	// 进程死了:RPC 全部失败,挂起的审批按拒绝收尾,挂起的提问按取消收尾。
 	for _, ch := range d.approvals {
 		select {
 		case ch <- 0:
@@ -358,6 +471,13 @@ func (d *codexDriver) waitExit() {
 		}
 	}
 	d.approvals = map[string]chan int{}
+	for _, ch := range d.userInputs {
+		select {
+		case ch <- nil:
+		default:
+		}
+	}
+	d.userInputs = map[string]chan *userInputDecision{}
 	d.mu.Unlock()
 	d.doneOnce.Do(func() { close(d.done) })
 	close(d.events)
@@ -535,13 +655,11 @@ func (d *codexDriver) handleServerRequest(msg *jsonrpcLine) {
 		"item/tool/requestApproval",
 		"item/permissions/requestApproval":
 		d.handleApproval(msg)
-	case "item/tool/requestUserInput", "mcpServer/elicitation/request":
-		// 结构化用户输入是 Phase 3;先一律取消,agent 会自己绕开。
-		if msg.Method == "item/tool/requestUserInput" {
-			d.respond(msg.ID, map[string]any{"decision": "cancel"})
-		} else {
-			d.respond(msg.ID, map[string]any{"action": "cancel", "content": nil, "_meta": nil})
-		}
+	case "item/tool/requestUserInput":
+		d.handleUserInput(msg)
+	case "mcpServer/elicitation/request":
+		// elicitation 是 MCP 服务端向用户要表单,没有归一模型,保持自动取消。
+		d.respond(msg.ID, map[string]any{"action": "cancel", "content": nil, "_meta": nil})
 	default:
 		d.respond(msg.ID, map[string]any{"error": map[string]any{"code": -32601, "message": "method not found: " + msg.Method}})
 	}

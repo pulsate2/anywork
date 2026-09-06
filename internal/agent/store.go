@@ -31,6 +31,15 @@ const (
 	// microcompact_boundary、codex thread/compacted):时间线上插一条
 	// 系统提示,之后的 usage 数字会明显回落。
 	KindCompaction = "compaction"
+	// KindSystemInfo claude 可见的 system 子类型(api_error / turn_duration /
+	// away_summary):时间线渲染成系统行,不接的话过载重试像卡死。
+	KindSystemInfo = "system_info"
+	// KindAskUser agent 向用户提问(claude AskUserQuestion / codex
+	// request_user_input 走的是控制协议而非普通工具调用):渲染成选项卡,
+	// 回答经 Answer 回传。
+	KindAskUser = "ask_user"
+	// KindAskUserResult 提问的回答(落库,历史回放时选项卡显示已选)。
+	KindAskUserResult = "ask_user_result"
 	// KindSessionStatus 会话状态变化(running/idle/dead;仅推送给列表
 	// 观察者,不落库 —— 列表状态实时刷新用)。
 	KindSessionStatus = "session_status"
@@ -76,12 +85,15 @@ type Event struct {
 
 // ToolCallPayload KindToolCall 的负载。Result 可为空(还在跑);
 // 前端按 ToolUseID 把 tool_use 与 tool_result 合并成同一张卡。
+// Images 是 tool_result 里 image 块落盘后的文件名(前端经
+// /api/agent/sessions/{id}/files/{name} 取)。
 type ToolCallPayload struct {
-	Tool      string `json:"tool"`
-	ToolUseID string `json:"toolUseId,omitempty"`
-	Args      string `json:"args"`             // JSON 序列化并截断后的参数
-	Result    string `json:"result,omitempty"` // 文本化并截断后的结果
-	State     string `json:"state"`            // running | ok | error
+	Tool      string   `json:"tool"`
+	ToolUseID string   `json:"toolUseId,omitempty"`
+	Args      string   `json:"args"`             // JSON 序列化并截断后的参数
+	Result    string   `json:"result,omitempty"` // 文本化并截断后的结果
+	Images    []string `json:"images,omitempty"` // image 块的文件名
+	State     string   `json:"state"`            // running | ok | error
 }
 
 // PermissionReqPayload KindPermissionReq 的负载。
@@ -107,12 +119,14 @@ type StatusPayload struct {
 
 // UsagePayload KindUsage 的负载。Context 是"当前上下文占用"(claude =
 // input+cache_read+cache_creation;codex 的 input 本就含缓存),前端拿它
-// 对模型上下文窗口算百分比。
+// 对模型上下文窗口算百分比。Window 是真实窗口大小(claude result 的
+// modelUsage 透传;0 = 没给,前端回落启发式)。
 type UsagePayload struct {
 	Context   int    `json:"context"`
 	Output    int    `json:"output,omitempty"`
 	CacheRead int    `json:"cacheRead,omitempty"`
 	Model     string `json:"model,omitempty"`
+	Window    int    `json:"window,omitempty"`
 }
 
 // CompactionPayload KindCompaction 的负载。Micro=true 是微压缩(不清历史,
@@ -129,6 +143,54 @@ type CompactionPayload struct {
 	Phase       string `json:"phase,omitempty"`
 	Failed      bool   `json:"failed,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+// SystemInfoPayload KindSystemInfo 的负载。Type 区分三类:api_error(过载/
+// 限流重试,Retry/MaxRetry 是进度)、turn_duration(回合结束统计)、
+// away_summary(离开期间的 recap,Text 是原文)。
+type SystemInfoPayload struct {
+	Type       string  `json:"type"` // api_error | turn_duration | away_summary
+	Text       string  `json:"text,omitempty"`
+	Error      string  `json:"error,omitempty"`
+	Retry      int     `json:"retry,omitempty"`
+	MaxRetry   int     `json:"maxRetry,omitempty"`
+	DurationMs float64 `json:"durationMs,omitempty"`
+	Turns      int     `json:"turns,omitempty"`
+	CostUSD    float64 `json:"costUsd,omitempty"`
+}
+
+// AskUserPayload KindAskUser 的负载:agent 向用户提问。两家归一成同一形状:
+// claude AskUserQuestion 用下标当问题 id;codex request_user_input 自带 id。
+type AskUserPayload struct {
+	ReqID     string        `json:"reqId"`
+	Questions []AskQuestion `json:"questions"`
+}
+
+// AskQuestion 一个问题。Options 空 = 自由文本(codex 的 editor/占位符场景)。
+type AskQuestion struct {
+	ID          string      `json:"id"`
+	Header      string      `json:"header,omitempty"`
+	Question    string      `json:"question"`
+	Multi       bool        `json:"multi,omitempty"`
+	Required    bool        `json:"required,omitempty"`
+	Options     []AskOption `json:"options,omitempty"`
+	Placeholder string      `json:"placeholder,omitempty"`
+}
+
+// AskOption 一个选项。Preview 是单选题的预览内容(markdown,官方客户端
+// 选中选项时在旁边展示;多选题官方忽略此字段)。
+type AskOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Preview     string `json:"preview,omitempty"`
+}
+
+// AskUserResultPayload KindAskUserResult 的负载。Answers 键 = 问题 id,
+// 值 = 选中的选项 label(自由文本就是文本本身);Cancelled = 用户取消。
+type AskUserResultPayload struct {
+	ReqID     string              `json:"reqId"`
+	Answers   map[string][]string `json:"answers,omitempty"`
+	Cancelled bool                `json:"cancelled,omitempty"`
 }
 
 // SessionStatusPayload KindSessionStatus 的负载:会话列表实时刷新用,

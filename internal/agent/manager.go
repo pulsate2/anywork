@@ -25,6 +25,11 @@ type liveSession struct {
 	// model 最近落库的模型(去重用:claude 每个事件都会查一遍)。
 	model string
 
+	// wmu 落库写锁:pump(driver 事件)与 Send/Approve(HTTP 请求)会在不同
+	// goroutine 里并发 AppendMessage,而 seq 分配是 MAX(seq)+1 —— 不锁的话
+	// 插话时两边拿到同一个 seq,前端按 seq 去重会互相吞消息。
+	wmu sync.Mutex
+
 	mu          sync.Mutex
 	subscribers map[Subscriber]struct{}
 }
@@ -114,6 +119,9 @@ func (m *Manager) Create(opt CreateOptions) (*Session, error) {
 		}
 	}
 
+	// 会话 id 先于 Start 生成:driver 要拿它拼附件目录(tool_result 的
+	// image 块落 <FilesDir>/<会话id>/)。
+	sessID := util.ID()
 	driver, err := newDriver(opt.App)
 	if err != nil {
 		return nil, err
@@ -125,13 +133,14 @@ func (m *Manager) Create(opt CreateOptions) (*Session, error) {
 		PermissionMode: opt.PermissionMode,
 		Model:          opt.Model,
 		Effort:         opt.Effort,
+		FilesDir:       m.sessionFilesDir(sessID),
 	}); err != nil {
 		return nil, err
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	sess := &Session{
-		ID:             util.ID(),
+		ID:             sessID,
 		App:            opt.App,
 		Workspace:      filepath.ToSlash(cwd),
 		Title:          opt.Title,
@@ -162,6 +171,13 @@ func (m *Manager) Create(opt CreateOptions) (*Session, error) {
 	return sess, nil
 }
 
+// append 会话内串行落库(见 liveSession.wmu)。返回带 seq 的完整事件。
+func (m *Manager) append(ls *liveSession, ev *Event) (*Event, error) {
+	ls.wmu.Lock()
+	defer ls.wmu.Unlock()
+	return m.store.AppendMessage(ls.id, ev)
+}
+
 // pump 事件泵:driver 事件 → 落库 → 广播。会话所有消息的落库都在这一个
 // goroutine 里串行进行,Store 的 MAX(seq)+1 分配因此不需要额外锁。
 func (m *Manager) pump(ls *liveSession) {
@@ -176,7 +192,7 @@ func (m *Manager) pump(ls *liveSession) {
 			ls.model = cur
 			m.store.SetModel(ls.id, cur)
 		}
-		stored, err := m.store.AppendMessage(ls.id, &ev)
+		stored, err := m.append(ls, &ev)
 		if err != nil {
 			continue
 		}
@@ -184,11 +200,13 @@ func (m *Manager) pump(ls *liveSession) {
 		m.broadcast(ls, stored)
 
 		switch ev.Kind {
-		case KindPermissionReq:
+		case KindPermissionReq, KindAskUser:
 			if m.NotifyPermission != nil {
+				tool := "提问"
 				if pr, ok := ev.Payload.(*PermissionReqPayload); ok {
-					go m.NotifyPermission(m.titleOf(ls.id), pr.Tool)
+					tool = pr.Tool
 				}
+				go m.NotifyPermission(m.titleOf(ls.id), tool)
 			}
 		case KindStatus:
 			if sp, ok := ev.Payload.(*StatusPayload); ok {
@@ -236,7 +254,7 @@ func (m *Manager) Send(sessionID, text string) (*Event, error) {
 	// 先落库再写 stdin:写 stdin 失败时消息已经在历史里,错误也会以
 	// error 事件出现在时间线上,信息不丢。
 	ev := &Event{Kind: KindUser, Payload: text}
-	stored, err := m.store.AppendMessage(sessionID, ev)
+	stored, err := m.append(ls, ev)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +302,7 @@ func (m *Manager) revive(id string) (*liveSession, error) {
 		PermissionMode: sess.PermissionMode,
 		Model:          sess.Model,
 		Effort:         sess.Effort,
+		FilesDir:       m.sessionFilesDir(id),
 	}); err != nil {
 		return nil, err
 	}
@@ -372,9 +391,32 @@ func (m *Manager) Approve(sessionID, reqID string, allow, session bool) error {
 	if err := ls.driver.Resolve(reqID, allow, session); err != nil {
 		return err
 	}
-	stored, err := m.store.AppendMessage(sessionID, &Event{
-		Kind: KindPermissionResult,
+	stored, err := m.append(ls, &Event{
+		Kind:    KindPermissionResult,
 		Payload: &PermissionResultPayload{ReqID: reqID, Allow: allow, Session: session},
+	})
+	if err == nil {
+		m.broadcast(ls, stored)
+	}
+	return nil
+}
+
+// Answer 回答 agent 的提问,并落一条 ask_user_result(历史回放时选项卡
+// 显示已选)。answers=nil 表示取消。
+func (m *Manager) Answer(sessionID, reqID string, answers map[string][]string) error {
+	if m.ReadOnly {
+		return fmt.Errorf("只读模式")
+	}
+	ls := m.get(sessionID)
+	if ls == nil {
+		return fmt.Errorf("会话不在运行: %s", sessionID)
+	}
+	if err := ls.driver.Answer(reqID, answers); err != nil {
+		return err
+	}
+	stored, err := m.append(ls, &Event{
+		Kind:    KindAskUserResult,
+		Payload: &AskUserResultPayload{ReqID: reqID, Answers: answers, Cancelled: answers == nil},
 	})
 	if err == nil {
 		m.broadcast(ls, stored)
@@ -503,6 +545,15 @@ func (m *Manager) titleOf(id string) string {
 		return sess.Title
 	}
 	return sess.Workspace
+}
+
+// sessionFilesDir 会话专属附件目录(聊天上传与 tool_result 图片都落这里);
+// FilesDir 未启用(测试)返回空串。
+func (m *Manager) sessionFilesDir(id string) string {
+	if m.store.FilesDir == "" {
+		return ""
+	}
+	return filepath.Join(m.store.FilesDir, id)
 }
 
 // resolve 把 workspace 归一化到 root 内的绝对路径(与 terminal.Manager 同语义)。

@@ -27,8 +27,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	aiprofile "lightremote/internal/aiprofile"
 	"lightremote/internal/agent"
+	aiprofile "lightremote/internal/aiprofile"
 
 	"lightremote/internal/auth"
 	backupsvc "lightremote/internal/backup"
@@ -311,10 +311,12 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/agent/sessions/{id}/messages", a.agent.SendMessage)
 		pr.Post("/api/agent/sessions/{id}/interrupt", a.agent.Interrupt)
 		pr.Post("/api/agent/sessions/{id}/approve", a.agent.Approve)
+		pr.Post("/api/agent/sessions/{id}/answer", a.agent.Answer)
 		pr.Post("/api/agent/sessions/{id}/settings", a.agent.Settings)
 		pr.Post("/api/agent/sessions/{id}/attachments", a.agent.Upload)
 		pr.Delete("/api/agent/sessions/{id}", a.agent.Kill)
 		pr.Post("/api/agent/sessions/{id}/delete", a.agent.DeleteSession)
+		pr.Get("/api/agent/sessions/{id}/files/{name}", a.agent.File)
 		pr.Get("/api/agent/cleanup", a.agent.CleanupStatus)
 		pr.Post("/api/agent/cleanup", a.agent.Cleanup)
 		pr.Put("/api/agent/cleanup", a.agent.SaveCleanupSettings)

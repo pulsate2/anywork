@@ -28,6 +28,9 @@ type StartOpts struct {
 	Effort         string // EffortNone…EffortHigh;空 = 默认
 	// Env 覆盖项(driver 自己注入的之外再追加)。
 	Env []string
+	// FilesDir 会话附件目录(<数据目录>/agent-files/<会话id>):tool_result
+	// 里的 image 块落这里,前端经 REST 取。空 = 不落盘(测试)。
+	FilesDir string
 }
 
 // SettingsUpdate 运行中调整会话设置;空串 = 不改。
@@ -51,6 +54,10 @@ type Driver interface {
 	// driver 记住规则,同类请求后续自动放行不再询问(claude 内存规则 /
 	// codex acceptForSession)。请求不存在/已答复返回错误。
 	Resolve(reqID string, allow, session bool) error
+	// Answer 回答一个 ask_user 请求(claude AskUserQuestion / codex
+	// request_user_input)。answers 键 = 问题 id、值 = 选项 label;
+	// nil = 取消。请求不存在/已回答返回错误。
+	Answer(reqID string, answers map[string][]string) error
 	// PendingRequests 当前挂起的权限请求(快照)。
 	PendingRequests() []PermissionReqPayload
 	// ExternalID 会话恢复凭据(claude 在 init 消息里返回后才有值)。

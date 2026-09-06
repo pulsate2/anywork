@@ -5,8 +5,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
-import { StopOutline, TrashOutline } from '@vicons/ionicons5'
-import { api, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentSession, type AgentToolCall, type AgentUsage } from '@/api/client'
+import { AddOutline, CheckboxOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
+import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
 import { useImmersive } from '@/utils/immersive'
@@ -14,6 +14,7 @@ import { useWorkspaceStore } from '@/stores/workspace'
 import ToolCallCard from '@/components/agent/ToolCallCard.vue'
 import ToolGroupCard from '@/components/agent/ToolGroupCard.vue'
 import ApprovalCard from '@/components/agent/ApprovalCard.vue'
+import AskUserCard from '@/components/agent/AskUserCard.vue'
 import Composer from '@/components/agent/Composer.vue'
 import StatusBar from '@/components/agent/StatusBar.vue'
 
@@ -99,11 +100,16 @@ const maxSeq = computed(() => messages.value.length ? messages.value[messages.va
 
 interface Card {
   key: string
-  kind: 'user' | 'assistant' | 'reasoning' | 'tool' | 'toolgroup' | 'approval' | 'error' | 'system'
+  kind: 'user' | 'assistant' | 'reasoning' | 'tool' | 'toolgroup' | 'approval' | 'askuser' | 'error' | 'system'
   text?: string
   call?: AgentToolCall
-  // 系统提示线(上下文压缩等):居中淡色一行,不占聊天气泡。
+  // 系统提示线(上下文压缩/api_error/回合统计等):居中淡色一行,不占聊天气泡。
   compaction?: AgentCompaction
+  sysinfo?: AgentSystemInfo
+  // 提问卡(claude AskUserQuestion / codex request_user_input):
+  // ask_user 落卡,ask_user_result 按 reqId 回填已选/取消。
+  ask?: AgentAskUser
+  askResult?: AgentAskUserResult
   // 聚合组:连续 ≥2 张同类只读工具合成的一张卡(hapi buildVisibleChatBlocks)。
   groupCalls?: AgentToolCall[]
   req?: AgentPermissionReq
@@ -248,6 +254,7 @@ const cards = computed<Card[]>(() => {
   const out: Card[] = []
   const toolIndex = new Map<string, number>() // toolUseId → out 下标
   const apprIndex = new Map<string, number>() // reqId → out 下标
+  const askIndex = new Map<string, number>() // ask reqId → out 下标
   // 隐藏的任务类工具的 toolUseId:它们的结果事件(tool 名可能为空)一并隐藏。
   const hiddenToolIds = new Set<string>()
   for (const ev of messages.value) {
@@ -281,6 +288,29 @@ const cards = computed<Card[]>(() => {
         if (p && p.phase !== 'start') out.push({ key: `m${ev.seq}`, kind: 'system', compaction: p })
         break
       }
+      case 'system_info': {
+        // api_error 重试 / 回合统计 / 离开 recap:同样是居中系统提示线
+        // (hapi SystemMessage 同款),不接的话过载重试期间像卡死。
+        const p = ev.payload as AgentSystemInfo | null
+        if (p && p.type) out.push({ key: `m${ev.seq}`, kind: 'system', sysinfo: p })
+        break
+      }
+      case 'ask_user': {
+        // agent 向用户提问:选项卡,回答走 api.agentAnswer。
+        const p = ev.payload as AgentAskUser | null
+        if (p && p.reqId && p.questions?.length) {
+          out.push({ key: `m${ev.seq}`, kind: 'askuser', ask: p })
+          askIndex.set(p.reqId, out.length - 1)
+        }
+        break
+      }
+      case 'ask_user_result': {
+        // 回答回执:按 reqId 回填提问卡(历史回放显示已选/取消)。
+        const p = ev.payload as AgentAskUserResult | null
+        const i = p?.reqId ? askIndex.get(p.reqId) : undefined
+        if (i !== undefined && p) out[i].askResult = p
+        break
+      }
       case 'tool_call': {
         const p = ev.payload as AgentToolCall
         // Task 套件与 TodoWrite 不出卡:状态汇进顶部 sessionTasks 面板。
@@ -295,7 +325,7 @@ const cards = computed<Card[]>(() => {
         if (p.toolUseId && toolIndex.has(p.toolUseId)) {
           const card = out[toolIndex.get(p.toolUseId)!]
           if (card.call) {
-            card.call = { ...card.call, result: p.result, state: p.state }
+            card.call = { ...card.call, result: p.result, state: p.state, images: p.images }
           }
           break
         }
@@ -365,6 +395,39 @@ function compactionText(p: AgentCompaction): string {
   return '会话已压缩'
 }
 
+// sysinfoIcon 系统信息行前缀图标:重试 ⏳ / 上限 ⚠️ / 回合统计 ⏱️ / recap 💭。
+function sysinfoIcon(p: AgentSystemInfo): string {
+  switch (p.type) {
+    case 'api_error': return p.retry ? '⏳' : '⚠️'
+    case 'turn_duration': return '⏱️'
+    default: return '💭'
+  }
+}
+
+// sysinfoText 系统信息行文案(hapi presentation 同款):api_error 重试进度、
+// 回合结束统计、离开期间的 recap。
+function sysinfoText(p: AgentSystemInfo): string {
+  switch (p.type) {
+    case 'api_error': {
+      if (p.retry && p.maxRetry) return `API 错误,重试中(${p.retry}/${p.maxRetry})`
+      if (p.maxRetry) return `API 错误:重试已达上限(${p.maxRetry} 次)${p.error ? `:${p.error}` : ''}`
+      return `API 错误${p.error ? `:${p.error}` : ''}`
+    }
+    case 'turn_duration': {
+      const sec = Math.round((p.durationMs ?? 0) / 1000)
+      const dur = sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`
+      const parts = [`回合完成 · ${dur}`]
+      if (p.turns) parts.push(`${p.turns} 轮`)
+      if (p.costUsd) parts.push(`$${p.costUsd.toFixed(2)}`)
+      return parts.join(' · ')
+    }
+    case 'away_summary':
+      return p.text ? `recap:${p.text}` : 'recap'
+    default:
+      return p.text || p.error || ''
+  }
+}
+
 function groupToolCards(cards: Card[]): Card[] {
   const out: Card[] = []
   let i = 0
@@ -432,9 +495,12 @@ const latestUsage = computed<AgentUsage | null>(() => {
   return null
 })
 
-// 有待决审批(工具卡内嵌或独立卡):StatusBar 状态优先显示"等待审批"。
+// 有待决审批(工具卡内嵌或独立卡)或未答提问:StatusBar 状态优先显示。
 const pendingApproval = computed(() =>
   cards.value.some((c) => (c.kind === 'approval' && !c.resolved) || (c.kind === 'tool' && c.pendingReq && !c.resolved)),
+)
+const pendingAsk = computed(() =>
+  cards.value.some((c) => c.kind === 'askuser' && !c.askResult),
 )
 
 // ---- WS 推送 ----
@@ -645,8 +711,7 @@ async function interrupt() {
 }
 
 const approveBusy = ref('')
-async function decide(reqId: string, allow: boolean, session = false) {
-  if (!selectedId.value) return
+async function decide(reqId: string, allow: boolean, session = false) {  if (!selectedId.value) return
   approveBusy.value = reqId
   try {
     await api.agentApprove(selectedId.value, reqId, allow, session)
@@ -659,6 +724,21 @@ async function decide(reqId: string, allow: boolean, session = false) {
     message.error(e?.message || '操作失败')
   } finally {
     approveBusy.value = ''
+  }
+}
+
+// 回答 agent 的提问:null = 取消。回执(ask_user_result)经 WS 回来落库,
+// 这里只负责发 REST + 记 busy。
+const askBusy = ref('')
+async function answerAsk(reqId: string, answers: Record<string, string[]> | null) {
+  if (!selectedId.value) return
+  askBusy.value = reqId
+  try {
+    await api.agentAnswer(selectedId.value, reqId, answers ?? undefined)
+  } catch (e: any) {
+    message.error(e?.message || '回答失败')
+  } finally {
+    askBusy.value = ''
   }
 }
 
@@ -966,9 +1046,15 @@ onBeforeUnmount(() => {
             <n-button size="small" secondary @click="exitSelectMode">完成</n-button>
           </template>
           <template v-else>
-            <n-button size="small" secondary @click="enterSelectMode">选择</n-button>
-            <n-button size="small" secondary @click="openCleanup">清理</n-button>
-            <n-button size="small" type="primary" @click="openCreate">新建会话</n-button>
+            <n-button size="small" secondary title="选择" aria-label="选择" @click="enterSelectMode">
+              <template #icon><n-icon :component="CheckboxOutline" /></template>
+            </n-button>
+            <n-button size="small" secondary title="清理" aria-label="清理" @click="openCleanup">
+              <template #icon><n-icon :component="HourglassOutline" /></template>
+            </n-button>
+            <n-button size="small" type="primary" title="新建会话" aria-label="新建会话" @click="openCreate">
+              <template #icon><n-icon :component="AddOutline" /></template>
+            </n-button>
           </template>
         </div>
       </div>
@@ -1073,9 +1159,9 @@ onBeforeUnmount(() => {
             <summary>思考过程</summary>
             <div class="reasoning-body">{{ c.text }}</div>
           </details>
-          <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" />
+          <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" :session-id="selectedId || undefined" />
           <ToolCallCard
-            v-else-if="c.kind === 'tool' && c.call" :call="c.call"
+            v-else-if="c.kind === 'tool' && c.call" :call="c.call" :session-id="selectedId || undefined"
             :pending-req="c.pendingReq" :pending-resolved="c.resolved ?? null"
             :approve-busy="c.pendingReq ? approveBusy === c.pendingReq.reqId : false"
             @decide="(allow, session) => c.pendingReq && decide(c.pendingReq.reqId, allow, session)"
@@ -1085,8 +1171,14 @@ onBeforeUnmount(() => {
             :req="c.req" :resolved="c.resolved ?? null" :busy="approveBusy === c.req.reqId"
             @decide="(allow, session) => decide(c.req!.reqId, allow, session)"
           />
+          <AskUserCard
+            v-else-if="c.kind === 'askuser' && c.ask"
+            :ask="c.ask" :result="c.askResult ?? null" :busy="askBusy === c.ask.reqId"
+            @answer="(answers) => answerAsk(c.ask!.reqId, answers)"
+          />
           <div v-else-if="c.kind === 'error'" class="bubble error">{{ c.text }}</div>
           <div v-else-if="c.kind === 'system' && c.compaction" class="sysline" :class="{ 'sysline-failed': c.compaction.failed }">📦 {{ compactionText(c.compaction) }}</div>
+          <div v-else-if="c.kind === 'system' && c.sysinfo" class="sysline" :class="{ 'sysline-failed': c.sysinfo.type === 'api_error' && c.sysinfo.maxRetry && !c.sysinfo.retry }">{{ sysinfoIcon(c.sysinfo) }} {{ sysinfoText(c.sysinfo) }}</div>
         </div>
         <!-- 乐观气泡:发送中转圈,失败标 ⚠ 可重发/丢弃 -->
         <div v-for="pb in pendingBubbles" :key="pb.key" class="chat-row user">
@@ -1120,6 +1212,7 @@ onBeforeUnmount(() => {
       <StatusBar
         :state="turnState"
         :pending-approval="pendingApproval"
+        :pending-ask="pendingAsk"
         :compacting="compacting"
         :usage="latestUsage"
         :app="selected.app"
@@ -1130,6 +1223,7 @@ onBeforeUnmount(() => {
       <Composer
         :running="turnState === 'running'"
         :disabled="turnState === 'dead' && !selected.externalId"
+        :ask-pending="pendingAsk"
         :sending="sending"
         :session-id="selected.id"
         :cli-commands="cliCommands"
@@ -1276,7 +1370,13 @@ onBeforeUnmount(() => {
   margin: 0.6em 0; padding: 8px 10px; border-radius: 6px;
   background: rgba(127, 127, 127, .12); overflow: auto; line-height: 1.5;
 }
-.agent-md-body pre.md-pre code { padding: 0; background: none; font-size: 12px; white-space: pre; overflow-wrap: normal; }
+.agent-md-body pre.md-pre code {
+  padding: 0; background: none; font-size: 12px; white-space: pre; overflow-wrap: normal;
+  /* 显式等宽栈:框线字符(─│├…)在缺省回退字体里宽度不稳;
+     连字必须关 —— 有的等宽字体把 ├── 合成一个字形,ASCII 图直接错位。 */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0;
+}
 .agent-md-body table { border-collapse: collapse; }
 .agent-md-body th, .agent-md-body td { padding: 4px 8px; border: 1px solid rgba(127, 127, 127, .28); }
 .agent-md-body blockquote {
@@ -1458,7 +1558,11 @@ onBeforeUnmount(() => {
   -webkit-tap-highlight-color: transparent;
 }
 .pending-drop { color: #6b7280; } /* 浅红底上取固定灰,不依赖主题变量对比度 */
-.chat-row { display: flex; }
+.chat-row { display: flex; min-width: 0; }
+/* flex 子项默认 min-width:auto 会被 nowrap 内容顶宽:长 bash 命令把卡片
+   撑出屏、内部 overflow-x: auto 失效的根源。归零后卡片宽度由容器决定,
+   卡内的横向滚动/换行才生效。 */
+.chat-row > * { min-width: 0; }
 .chat-row.user { justify-content: flex-end; }
 .chat-row.tool, .chat-row.toolgroup, .chat-row.approval, .chat-row.reasoning, .chat-row.error { justify-content: stretch; }
 

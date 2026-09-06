@@ -205,6 +205,11 @@ export const api = {
   // session=true 即「本会话允许」:driver 记规则,同类请求后续自动放行。
   agentApprove: (id: string, reqId: string, allow: boolean, session = false) =>
     request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/approve`, { reqId, allow, session }),
+  // 回答 agent 的提问;answers 缺省(null)= 取消。
+  agentAnswer: (id: string, reqId: string, answers?: Record<string, string[]>) =>
+    request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/answer`, { reqId, answers: answers ?? null }),
+  // tool_result 图片块:落盘文件经这个端点取(Cookie 认同,<img src> 直连)。
+  agentFileUrl: (id: string, name: string) => `/api/agent/sessions/${id}/files/${encodeURIComponent(name)}`,
   // 结束进程树;会话记录保留(历史可看、可续聊)。
   agentKill: (id: string) => request<{ ok: boolean }>('DELETE', `/api/agent/sessions/${id}`),
   // 彻底删除:进程(如在跑)、记录、消息、附件目录一起走。
@@ -258,6 +263,8 @@ export interface AgentToolCall {
   toolUseId?: string
   args?: string
   result?: string
+  // tool_result 里 image 块落盘后的文件名,取 /api/agent/sessions/{id}/files/{name}。
+  images?: string[]
   state: 'running' | 'ok' | 'error'
 }
 
@@ -266,11 +273,48 @@ export interface AgentPermissionResult { reqId: string; allow: boolean }
 export interface AgentStatusPayload { state: 'running' | 'idle' }
 export interface AgentErrorPayload { message: string }
 // KindUsage 负载:当前上下文占用 token(claude=input+cache;codex input 含缓存)。
+// window 是真实上下文窗口(claude result 的 modelUsage 透传;0/缺省回落启发式)。
 export interface AgentUsage {
   context: number
   output?: number
   cacheRead?: number
   model?: string
+  window?: number
+}
+
+// KindSystemInfo 负载:api_error(过载/限流重试)、turn_duration(回合统计)、
+// away_summary(离开期间的 recap)。详见后端 SystemInfoPayload。
+export interface AgentSystemInfo {
+  type: 'api_error' | 'turn_duration' | 'away_summary'
+  text?: string
+  error?: string
+  retry?: number
+  maxRetry?: number
+  durationMs?: number
+  turns?: number
+  costUsd?: number
+}
+
+// KindAskUser:agent 向用户的提问(claude AskUserQuestion / codex
+// request_user_input 归一形状)。answers 键 = 问题 id,值 = 选项 label/文本。
+// preview 是单选题选项的预览内容(markdown,官方客户端选中时旁边展示)。
+export interface AgentAskUser {
+  reqId: string
+  questions: {
+    id: string
+    header?: string
+    question: string
+    multi?: boolean
+    required?: boolean
+    options?: { label: string; description?: string; preview?: string }[]
+    placeholder?: string
+  }[]
+}
+
+export interface AgentAskUserResult {
+  reqId: string
+  answers?: Record<string, string[]>
+  cancelled?: boolean
 }
 
 // KindCompaction 负载:上下文压缩边界。Micro=微压缩(只裁缓存不清历史);

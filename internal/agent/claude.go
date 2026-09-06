@@ -2,11 +2,14 @@ package agent
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -31,9 +34,14 @@ type claudeDriver struct {
 	lastReqArgs map[string]string
 	// toolUseId → 工具名:tool_result 事件回填 Tool 用(stream-json 的
 	// tool_result 块不带工具名,只有 id;没名字前端配对不上就单开卡)。
-	toolNames  map[string]string
-	external   string // claude session_id(system/init 里返回)
-	model      string // 当前模型(system/init 里返回)
+	toolNames map[string]string
+	external  string // claude session_id(system/init 里返回)
+	model     string // 当前模型(system/init 里返回)
+	// filesDir 会话附件目录:tool_result 的 image 块落这里(空 = 不落盘)。
+	filesDir string
+	// asks 挂起的提问(reqID → 原始 input + 归一后的问题):AskUserQuestion
+	// 走 can_use_tool 协议,回答要回 allow + updatedInput.answers。
+	asks       map[string]*askPending
 	stderrTail string // 退出原因排查用
 	closeOnce  sync.Once
 	exitErr    error
@@ -43,10 +51,19 @@ type claudeDriver struct {
 	doneOnce sync.Once
 }
 
-// approveDecision 一次审批的答复。Session=本会话允许。
+// approveDecision 一次审批的答复。Session=本会话允许;
+// answers 是 ask_user 的回答(问题 id → 选项 label),仅 allow 时有意义。
 type approveDecision struct {
 	allow   bool
 	session bool
+	answers map[string][]string
+}
+
+// askPending 一个挂起的提问:原始 input(回 updatedInput 要原样带上
+// questions 数组)+ 归一后的问题列表。
+type askPending struct {
+	raw       json.RawMessage
+	questions []AskQuestion
 }
 
 func newClaudeDriver() *claudeDriver {
@@ -56,6 +73,7 @@ func newClaudeDriver() *claudeDriver {
 		lastReqTool:  map[string]string{},
 		lastReqArgs:  map[string]string{},
 		toolNames:    map[string]string{},
+		asks:         map[string]*askPending{},
 		events:       make(chan Event, 128),
 		done:         make(chan struct{}),
 	}
@@ -70,6 +88,7 @@ func claudeBin() (string, error) {
 }
 
 func (d *claudeDriver) Start(opts StartOpts) error {
+	d.filesDir = opts.FilesDir
 	bin, err := claudeBin()
 	if err != nil {
 		return fmt.Errorf("未找到 claude 可执行文件(可用 LR_CLAUDE_BIN 指定): %w", err)
@@ -283,9 +302,11 @@ func (d *claudeDriver) waitExit() {
 	d.mu.Lock()
 	d.exitErr = err
 	d.stdin = nil
-	// 进程死了,挂起的审批永远等不到用户答复,全部按拒绝收尾
-	// (claude 已经收不到 control_response,只是清掉 pending map)。
+	// 进程死了,挂起的审批/提问永远等不到用户答复,全部按拒绝收尾
+	// (claude 已经收不到 control_response,只是清掉 pending/asks map;
+	// handleAskUser 见 asks 里没有该项就不再回写)。
 	d.pending = map[string]chan *approveDecision{}
+	d.asks = map[string]*askPending{}
 	d.mu.Unlock()
 	d.doneOnce.Do(func() { close(d.done) })
 	close(d.events)
@@ -328,10 +349,17 @@ type claudeLine struct {
 	CompactMetadata      *claudeCompactMeta `json:"compactMetadata"`
 	MicrocompactMetadata *claudeCompactMeta `json:"microcompactMetadata"`
 	// system/status:压缩进度("compacting" 先到,compact_result 的结果后到)。
-	Status        string     `json:"status"`
-	CompactResult string     `json:"compact_result"`
-	CompactError  string     `json:"compact_error"`
-	Message       *claudeMsg `json:"message"`
+	Status        string `json:"status"`
+	CompactResult string `json:"compact_result"`
+	CompactError  string `json:"compact_error"`
+	// system/api_error / turn_duration / away_summary 的载荷。
+	Content       json.RawMessage     `json:"content"` // away_summary 的 recap
+	RetryAttempt  int                 `json:"retryAttempt"`
+	MaxRetries    int                 `json:"maxRetries"`
+	APIError      json.RawMessage     `json:"error"`      // 字符串或 {message}
+	DurationMs    float64             `json:"durationMs"` // turn_duration 用驼峰
+	ResultSummary *claudeRoundSummary `json:"resultSummary"`
+	Message       *claudeMsg          `json:"message"`
 	// control_request(权限询问)
 	RequestID string          `json:"request_id"`
 	Request   json.RawMessage `json:"request"`
@@ -341,6 +369,14 @@ type claudeLine struct {
 	Duration float64      `json:"duration_ms"`
 	CostUSD  float64      `json:"total_cost_usd"`
 	Usage    *claudeUsage `json:"usage"`
+	// result 行的 modelUsage(键是模型名):带真实上下文窗口,比前端按
+	// 模型名猜 200k/1M 准。
+	ModelUsage map[string]*claudeModelUsage `json:"modelUsage"`
+}
+
+// claudeModelUsage result.modelUsage 的单模型条目(只取我们用的字段)。
+type claudeModelUsage struct {
+	ContextWindow int `json:"contextWindow"`
 }
 
 // claudeCompactMeta compact_boundary 携带的元数据(触发方式与压缩前规模)。
@@ -348,6 +384,13 @@ type claudeCompactMeta struct {
 	Trigger     string `json:"trigger"`     // auto | manual
 	PreTokens   int    `json:"preTokens"`   // 压缩前上下文占用
 	TokensSaved int    `json:"tokensSaved"` // 微压缩省下的量(整压不带)
+}
+
+// claudeRoundSummary turn_duration 的 resultSummary:回合统计。
+type claudeRoundSummary struct {
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	NumTurns     int     `json:"num_turns"`
+	DurationMs   float64 `json:"duration_ms"`
 }
 
 // claudeUsage stream-json 的 usage 块(assistant 消息与 result 行都带)。
@@ -360,7 +403,7 @@ type claudeUsage struct {
 
 // emitUsage 把 usage 块归一成 KindUsage 事件(claude 的 input_tokens 不含
 // 缓存,上下文占用 = input + cache_read + cache_creation)。全零不发声。
-func (d *claudeDriver) emitUsage(u *claudeUsage, model string) {
+func (d *claudeDriver) emitUsage(u *claudeUsage, model string, window int) {
 	if u == nil {
 		return
 	}
@@ -373,6 +416,7 @@ func (d *claudeDriver) emitUsage(u *claudeUsage, model string) {
 		Output:    u.OutputTokens,
 		CacheRead: u.CacheReadInputTokens,
 		Model:     model,
+		Window:    window,
 	}})
 }
 
@@ -385,7 +429,7 @@ type claudeMsg struct {
 }
 
 type contentBlock struct {
-	Type      string          `json:"type"` // text | thinking | tool_use | tool_result
+	Type      string          `json:"type"` // text | thinking | tool_use | tool_result | image
 	Text      string          `json:"text"`
 	Thinking  string          `json:"thinking"`
 	ID        string          `json:"id"`          // tool_use
@@ -394,6 +438,29 @@ type contentBlock struct {
 	ToolUseID string          `json:"tool_use_id"` // tool_result
 	Content   json.RawMessage `json:"content"`     // tool_result(字符串或块数组)
 	IsError   bool            `json:"is_error"`
+	// image 块(用户贴图 / 工具产出图):source.data 是 base64。
+	Source *imageSource `json:"source"`
+}
+
+// imageSource Anthropic 格式的图片源(base64 编码 + media_type)。
+type imageSource struct {
+	Type      string `json:"type"`       // base64
+	MediaType string `json:"media_type"` // image/png 等
+	Data      string `json:"data"`
+}
+
+// imgExt media_type → 扩展名(扩展名同时当 REST 端点的 Content-Type 依据)。
+func imgExt(mediaType string) string {
+	switch strings.ToLower(mediaType) {
+	case "image/jpeg", "image/jpg":
+		return "jpg"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	default:
+		return "png"
+	}
 }
 
 type canUseToolRequest struct {
@@ -465,6 +532,48 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 						Error:  truncate(msg.CompactError, 500),
 					}})
 				}
+			} else if msg.Subtype == "api_error" {
+				// API 错误(过载/限流重试):不接的话用户只看到一直转圈,
+				// 分不清是慢还是挂了。error 字符串或 {message} 都认。
+				errMsg := ""
+				if rawIsString(msg.APIError) {
+					json.Unmarshal(msg.APIError, &errMsg)
+				} else {
+					var e struct {
+						Message string `json:"message"`
+					}
+					json.Unmarshal(msg.APIError, &e)
+					errMsg = e.Message
+				}
+				d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
+					Type:     "api_error",
+					Error:    truncate(errMsg, 300),
+					Retry:    msg.RetryAttempt,
+					MaxRetry: msg.MaxRetries,
+				}})
+			} else if msg.Subtype == "turn_duration" {
+				// 回合结束统计(耗时/轮数/花费,有啥带啥)。
+				p := &SystemInfoPayload{Type: "turn_duration", DurationMs: msg.DurationMs}
+				if msg.ResultSummary != nil {
+					p.Turns = msg.ResultSummary.NumTurns
+					p.CostUSD = msg.ResultSummary.TotalCostUSD
+					if p.DurationMs == 0 {
+						p.DurationMs = msg.ResultSummary.DurationMs
+					}
+				}
+				d.emit(Event{Kind: KindSystemInfo, Payload: p})
+			} else if msg.Subtype == "away_summary" {
+				// 离开期间的 recap:content 是字符串。
+				var recap string
+				if rawIsString(msg.Content) {
+					json.Unmarshal(msg.Content, &recap)
+				}
+				if recap != "" {
+					d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
+						Type: "away_summary",
+						Text: truncate(recap, 2000),
+					}})
+				}
 			}
 		case "control_request":
 			// 权限询问:单独 goroutine 处理,不阻塞读循环
@@ -481,7 +590,15 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 			// result 行的 usage 是回合最后一次 API 调用的计数,是最准的期末值。
 			var m string
 			json.Unmarshal(msg.Model, &m)
-			d.emitUsage(msg.Usage, m)
+			// modelUsage 里挑一个非零 contextWindow 透传(回合里换过模型时
+			// 取最后一个;空 map/全零 = 没给,前端回落启发式)。
+			window := 0
+			for _, mu := range msg.ModelUsage {
+				if mu != nil && mu.ContextWindow > 0 {
+					window = mu.ContextWindow
+				}
+			}
+			d.emitUsage(msg.Usage, m, window)
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
 		case "error":
 			d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(line, 4000)}})
@@ -495,7 +612,7 @@ func (d *claudeDriver) handleAssistant(m *claudeMsg) {
 	if m == nil {
 		return
 	}
-	d.emitUsage(m.Usage, m.Model)
+	d.emitUsage(m.Usage, m.Model, 0)
 	var blocks []contentBlock
 	if rawIsString(m.Content) {
 		// content 是纯字符串的退化形式:整条当正文。
@@ -547,6 +664,7 @@ func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
 			continue
 		}
 		result := toolResultText(b.Content)
+		images := d.saveResultImages(b.Content, b.ToolUseID)
 		if b.IsError && result != "" {
 			result = "错误: " + result
 		}
@@ -558,6 +676,7 @@ func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
 			Tool:      tool,
 			ToolUseID: b.ToolUseID,
 			Result:    truncate(result, 16*1024),
+			Images:    images,
 			State:     map[bool]string{true: "error", false: "ok"}[b.IsError],
 		}})
 	}
@@ -565,12 +684,18 @@ func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
 
 // handleCanUseTool 一个权限询问:落一条 permission_request 事件,挂起等 Resolve。
 // 会话规则(本会话允许)命中时直接放行,不打扰用户。
+// AskUserQuestion 是特例:它不是权限询问而是 agent 向用户提问,分流到
+// handleAskUser(回答走 allow + updatedInput.answers,空答案会锁死回合)。
 func (d *claudeDriver) handleCanUseTool(reqID string, rawReq json.RawMessage) {
 	var req canUseToolRequest
 	if err := json.Unmarshal(rawReq, &req); err != nil || req.Subtype != "can_use_tool" {
 		return
 	}
 	if reqID == "" {
+		return
+	}
+	if isAskToolName(req.ToolName) {
+		d.handleAskUser(reqID, req.Input)
 		return
 	}
 	args := truncate(string(req.Input), 8*1024)
@@ -598,25 +723,168 @@ func (d *claudeDriver) handleCanUseTool(reqID string, rawReq json.RawMessage) {
 	d.writeControlResponse(reqID, dec.allow)
 }
 
+// isAskToolName claude 的提问工具(stream-json 里同样走 can_use_tool 协议)。
+func isAskToolName(tool string) bool {
+	return tool == "AskUserQuestion" || tool == "ask_user_question"
+}
+
+// handleAskUser 一个提问:解析 questions 落 ask_user 事件,挂起等 Answer。
+// 形状不认识(没有 questions)时退回普通审批卡 —— 用户至少能看到点什么,
+// 拒绝即"不给答案",claude 自己会绕开。
+func (d *claudeDriver) handleAskUser(reqID string, rawInput json.RawMessage) {
+	var in struct {
+		Questions []struct {
+			Header      string `json:"header"`
+			Question    string `json:"question"`
+			MultiSelect bool   `json:"multiSelect"`
+			Options     []struct {
+				Label       string `json:"label"`
+				Description string `json:"description"`
+				Preview     string `json:"preview"`
+			} `json:"options"`
+		} `json:"questions"`
+	}
+	json.Unmarshal(rawInput, &in)
+	qs := make([]AskQuestion, 0, len(in.Questions))
+	for i, q := range in.Questions {
+		if strings.TrimSpace(q.Question) == "" {
+			continue
+		}
+		opts := make([]AskOption, 0, len(q.Options))
+		for _, o := range q.Options {
+			if strings.TrimSpace(o.Label) == "" {
+				continue
+			}
+			opts = append(opts, AskOption{Label: o.Label, Description: o.Description, Preview: o.Preview})
+		}
+		qs = append(qs, AskQuestion{
+			ID:       strconv.Itoa(i), // claude 没有稳定问题 id,用下标
+			Header:   q.Header,
+			Question: q.Question,
+			Multi:    q.MultiSelect,
+			Required: true,
+			Options:  opts,
+		})
+	}
+	if len(qs) == 0 {
+		args := truncate(string(rawInput), 8*1024)
+		ch := make(chan *approveDecision, 1)
+		d.mu.Lock()
+		if d.stdin == nil {
+			d.mu.Unlock()
+			return
+		}
+		d.pending[reqID] = ch
+		d.lastReqTool[reqID] = "AskUserQuestion"
+		d.lastReqArgs[reqID] = args
+		d.mu.Unlock()
+		d.emit(Event{Kind: KindPermissionReq, Payload: &PermissionReqPayload{
+			ReqID: reqID,
+			Tool:  "AskUserQuestion",
+			Args:  args,
+		}})
+		dec := <-ch
+		d.writeControlResponse(reqID, dec.allow)
+		return
+	}
+
+	ch := make(chan *approveDecision, 1)
+	d.mu.Lock()
+	if d.stdin == nil {
+		d.mu.Unlock()
+		return
+	}
+	d.pending[reqID] = ch
+	d.asks[reqID] = &askPending{raw: rawInput, questions: qs}
+	d.mu.Unlock()
+
+	d.emit(Event{Kind: KindAskUser, Payload: &AskUserPayload{ReqID: reqID, Questions: qs}})
+
+	dec := <-ch
+
+	d.mu.Lock()
+	ask := d.asks[reqID]
+	delete(d.asks, reqID)
+	d.mu.Unlock()
+	if ask == nil { // 进程退出时被清:claude 已收不到答复
+		return
+	}
+	if !dec.allow || dec.answers == nil {
+		d.writeControlResponse(reqID, false)
+		return
+	}
+	// claude 2.x 的 AskUserQuestion 要 answers: {问题文本: 选项}(多选拼
+	// 逗号),且 updatedInput 带上原 questions 数组 —— 按问题 id(下标)
+	// 反查问题文本。空答案会产出空结果并锁死回合(hapi 踩过),所以提交前
+	// 前端强制必选。
+	answers := map[string]string{}
+	for _, q := range ask.questions {
+		if sel := dec.answers[q.ID]; len(sel) > 0 {
+			answers[q.Question] = strings.Join(sel, ",")
+		}
+	}
+	var input map[string]any
+	if json.Unmarshal(ask.raw, &input) != nil || input == nil {
+		input = map[string]any{}
+	}
+	input["answers"] = answers
+	d.writeControlResponseInput(reqID, input)
+}
+
+// Answer 回答一个 ask_user 请求(见 Driver 接口)。answers=nil 表示取消。
+func (d *claudeDriver) Answer(reqID string, answers map[string][]string) error {
+	d.mu.Lock()
+	ch := d.pending[reqID]
+	if ch != nil {
+		delete(d.pending, reqID)
+	}
+	delete(d.lastReqTool, reqID)
+	delete(d.lastReqArgs, reqID)
+	d.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("问题不存在或已回答: %s", reqID)
+	}
+	if answers == nil {
+		ch <- &approveDecision{allow: false}
+	} else {
+		ch <- &approveDecision{allow: true, answers: answers}
+	}
+	return nil
+}
+
 // writeControlResponse 把审批决定按控制协议写回 stdin。
 func (d *claudeDriver) writeControlResponse(reqID string, allow bool) {
+	if allow {
+		d.writeControlResponseInput(reqID, nil)
+		return
+	}
+	d.writeControlResponseRaw(reqID, map[string]any{
+		"behavior": "deny",
+		"message":  "用户拒绝了此操作",
+	})
+}
+
+// writeControlResponseInput allow + 带 updatedInput 的答复。updatedInput 为
+// nil 时等于普通放行(空 updatedInput);AskUserQuestion 用它把 answers 塞回。
+func (d *claudeDriver) writeControlResponseInput(reqID string, updatedInput map[string]any) {
+	if updatedInput == nil {
+		updatedInput = map[string]any{}
+	}
+	d.writeControlResponseRaw(reqID, map[string]any{
+		"behavior":     "allow",
+		"updatedInput": updatedInput,
+	})
+}
+
+// writeControlResponseRaw control_response 信封 + 行为体,唯一的写 stdin 路径。
+func (d *claudeDriver) writeControlResponseRaw(reqID string, behavior map[string]any) {
 	resp := map[string]any{
 		"type": "control_response",
 		"response": map[string]any{
 			"subtype":    "success",
 			"request_id": reqID,
+			"response":   behavior,
 		},
-	}
-	if allow {
-		resp["response"].(map[string]any)["response"] = map[string]any{
-			"behavior":     "allow",
-			"updatedInput": map[string]any{},
-		}
-	} else {
-		resp["response"].(map[string]any)["response"] = map[string]any{
-			"behavior": "deny",
-			"message":  "用户拒绝了此操作",
-		}
 	}
 	b, _ := json.Marshal(resp)
 	d.mu.Lock()
@@ -630,7 +898,53 @@ func rawIsString(raw json.RawMessage) bool {
 	return len(raw) > 0 && raw[0] == '"'
 }
 
-// toolResultText tool_result 的 content:字符串或 [{type:"text",text:…}] 块数组。
+// saveResultImages 把 tool_result content 里的 image 块(base64)落盘到会话
+// 附件目录,返回文件名列表。filesDir 为空(测试)或没有 image 块时返回 nil。
+// 文件名 = img-<toolUseId>-<序号>.<ext>,同 id 重复落盘直接覆盖,幂等。
+func (d *claudeDriver) saveResultImages(raw json.RawMessage, toolUseID string) []string {
+	if d.filesDir == "" || len(raw) == 0 || raw[0] == '"' {
+		return nil
+	}
+	var blocks []contentBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil
+	}
+	// toolUseId 只留安全字符做文件名(toolu_01X… 本就安全,防御性过滤)。
+	safe := make([]byte, 0, len(toolUseID))
+	for _, c := range []byte(toolUseID) {
+		if c == '-' || c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			safe = append(safe, c)
+		}
+	}
+	if len(safe) == 0 {
+		safe = append(safe, 'x')
+	}
+	var names []string
+	i := 0
+	for _, b := range blocks {
+		if b.Type != "image" || b.Source == nil || b.Source.Data == "" {
+			continue
+		}
+		if b.Source.Type != "" && b.Source.Type != "base64" {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(b.Source.Data)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		name := fmt.Sprintf("img-%s-%d.%s", string(safe), i, imgExt(b.Source.MediaType))
+		if err := os.MkdirAll(d.filesDir, 0o755); err != nil {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(d.filesDir, name), data, 0o644); err != nil {
+			continue
+		}
+		names = append(names, name)
+		i++
+	}
+	return names
+}
+
 func toolResultText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""

@@ -34,7 +34,7 @@ type Handlers struct {
 
 func NewHandlers(mgr *Manager, store *Store) *Handlers {
 	return &Handlers{mgr: mgr, store: store}
-}// sessionJSON 会话的对外形状(列表/创建响应)。
+} // sessionJSON 会话的对外形状(列表/创建响应)。
 type sessionJSON struct {
 	ID             string `json:"id"`
 	App            string `json:"app"`
@@ -208,6 +208,34 @@ func (h *Handlers) Approve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// Answer POST /api/agent/sessions/{id}/answer {reqId, answers}
+// 回答 agent 的提问(AskUserQuestion / request_user_input)。answers 是
+// 问题 id → 选中选项 label(或自由文本)的映射;字段缺失或为 null = 取消。
+func (h *Handlers) Answer(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		ReqID   string               `json:"reqId"`
+		Answers *map[string][]string `json:"answers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ReqID == "" {
+		http.Error(w, "reqId required", http.StatusBadRequest)
+		return
+	}
+	if err := h.mgr.Answer(id, body.ReqID, mapOrNil(body.Answers)); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// mapOrNil 把 *map 解成 map(nil 保持 nil,区别于"空回答")。
+func mapOrNil(m *map[string][]string) map[string][]string {
+	if m == nil {
+		return nil
+	}
+	return *m
+}
+
 // Kill DELETE /api/agent/sessions/{id} —— 结束进程,记录保留(历史可看、可续聊)。
 func (h *Handlers) Kill(w http.ResponseWriter, r *http.Request) {
 	if err := h.mgr.Kill(chi.URLParam(r, "id")); err != nil {
@@ -297,6 +325,45 @@ func (h *Handlers) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"path": filepath.ToSlash(filepath.Join(dir, name))})
+}
+
+// File GET /api/agent/sessions/{id}/files/{name} —— 会话附件(tool_result 的
+// image 块、聊天上传)读取。<img> 直接引用:Cookie 认证浏览器自动带。
+// name 限 basename,防目录穿越;只放行图片类扩展名。
+func (h *Handlers) File(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	name := filepath.Base(chi.URLParam(r, "name"))
+	var ct string
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png":
+		ct = "image/png"
+	case ".jpg", ".jpeg":
+		ct = "image/jpeg"
+	case ".gif":
+		ct = "image/gif"
+	case ".webp":
+		ct = "image/webp"
+	default:
+		http.Error(w, "只支持图片文件", http.StatusBadRequest)
+		return
+	}
+	if h.store.FilesDir == "" {
+		http.Error(w, "附件目录未启用", http.StatusNotFound)
+		return
+	}
+	// 会话必须存在:不存在的会话不给翻它的附件目录。
+	if sess, err := h.store.GetSession(id); err != nil || sess == nil {
+		http.Error(w, "会话不存在", http.StatusNotFound)
+		return
+	}
+	path := filepath.Join(h.store.FilesDir, id, name)
+	if _, err := os.Stat(path); err != nil {
+		http.Error(w, "文件不存在", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	http.ServeFile(w, r, path)
 }
 
 // ---- 清理(DESIGN-AGENT.md 5.7) ----
