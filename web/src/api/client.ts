@@ -183,6 +183,115 @@ export const api = {
   pushSubscribe: (sub: PushSubscriptionJSON) => request<{ ok: boolean }>('POST', '/api/push/subscribe', sub),
   pushUnsubscribe: (endpoint?: string) => request<{ ok: boolean; removed: number }>('POST', '/api/push/unsubscribe', { endpoint }),
   pushTest: () => request<{ ok: boolean; sent: number; failed: number }>('POST', '/api/push/test'),
+
+  // ---- Agent 会话(DESIGN-AGENT.md;推送通道见 api/agent.ts) ----
+  agentSessions: () => request<AgentSession[]>('GET', '/api/agent/sessions'),
+  // CLI 不在服务器上时后端回 409,提示先装。resume = 要续聊的旧会话 id。
+  agentSessionCreate: (b: { app: AgentApp; workspace: string; resume?: string; permissionMode?: string; model?: string; effort?: string }) =>
+    request<AgentSession>('POST', '/api/agent/sessions', b),
+  // 历史拉取(返回一律升序):不带参数 = 最新一页;beforeSeq 往前翻"加载更早";
+  // afterSeq 增量补差(WS 断线重连后找回丢的推送)。
+  agentMessages: (id: string, opts: { afterSeq?: number; beforeSeq?: number; limit?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (opts.afterSeq) qs.set('afterSeq', String(opts.afterSeq))
+    if (opts.beforeSeq) qs.set('beforeSeq', String(opts.beforeSeq))
+    if (opts.limit) qs.set('limit', String(opts.limit))
+    return request<AgentEvent[]>('GET', `/api/agent/sessions/${id}/messages?${qs.toString()}`)
+  },
+  // 返回落库事件(带 seq):本地即时追加,与 WS 推送按 seq 去重。
+  agentSend: (id: string, text: string) =>
+    request<AgentEvent>('POST', `/api/agent/sessions/${id}/messages`, { text }),
+  agentInterrupt: (id: string) => request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/interrupt`),
+  // session=true 即「本会话允许」:driver 记规则,同类请求后续自动放行。
+  agentApprove: (id: string, reqId: string, allow: boolean, session = false) =>
+    request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/approve`, { reqId, allow, session }),
+  // 结束进程树;会话记录保留(历史可看、可续聊)。
+  agentKill: (id: string) => request<{ ok: boolean }>('DELETE', `/api/agent/sessions/${id}`),
+  // 彻底删除:进程(如在跑)、记录、消息、附件目录一起走。
+  agentDelete: (id: string) => request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/delete`),
+  agentSettings: (id: string, b: { model?: string; effort?: string; permissionMode?: string }) =>
+    request<{ session: AgentSession; note: string }>('POST', `/api/agent/sessions/${id}/settings`, b),
+  // 聊天附件:传到独立目录(不进工作区),返回落盘路径,由消息里 @路径 提及。
+  agentUpload: async (id: string, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(`/api/agent/sessions/${id}/attachments`, {
+      method: 'POST', body: fd, credentials: 'same-origin',
+    })
+    if (!res.ok) throw new Error(`上传失败(${res.status})`)
+    return res.json() as Promise<{ path: string }>
+  },
+  agentCleanupStatus: () => request<AgentCleanupSettings>('GET', '/api/agent/cleanup'),
+  agentCleanupRun: (days: number, dryRun: boolean) =>
+    request<{ sessions: number; messages: number }>('POST', '/api/agent/cleanup', { days, dryRun }),
+  agentCleanupSave: (days: number, auto: boolean) =>
+    request<AgentCleanupSettings>('PUT', '/api/agent/cleanup', { days, auto }),
+}
+
+export type AgentApp = 'claude' | 'codex'
+
+// AgentEvent 的 payload 按 kind 取形状(unknown 收窄交给视图)。
+export interface AgentSession {
+  id: string
+  app: AgentApp
+  workspace: string
+  title?: string
+  externalId?: string
+  permissionMode: string
+  model?: string
+  effort?: string
+  status: 'running' | 'idle' | 'dead'
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AgentEvent {
+  sessionId: string
+  seq: number
+  kind: string
+  payload: unknown
+  createdAt: string
+}
+
+export interface AgentToolCall {
+  tool: string
+  toolUseId?: string
+  args?: string
+  result?: string
+  state: 'running' | 'ok' | 'error'
+}
+
+export interface AgentPermissionReq { reqId: string; tool: string; args: string }
+export interface AgentPermissionResult { reqId: string; allow: boolean }
+export interface AgentStatusPayload { state: 'running' | 'idle' }
+export interface AgentErrorPayload { message: string }
+// KindUsage 负载:当前上下文占用 token(claude=input+cache;codex input 含缓存)。
+export interface AgentUsage {
+  context: number
+  output?: number
+  cacheRead?: number
+  model?: string
+}
+
+// KindCompaction 负载:上下文压缩边界。Micro=微压缩(只裁缓存不清历史);
+// preTokens 压缩前占用;tokensSaved 微压缩省下的量。
+// phase='start' 是压缩进行中的瞬态(claude system/status),只驱动 StatusBar;
+// failed 带失败原因。
+export interface AgentCompaction {
+  micro?: boolean
+  trigger?: 'auto' | 'manual'
+  preTokens?: number
+  tokensSaved?: number
+  phase?: 'start'
+  failed?: boolean
+  error?: string
+}
+
+export interface AgentCleanupSettings {
+  days: number
+  auto: boolean
+  lastRun?: { sessions: number; messages: number }
+  lastAt?: string
 }
 
 export interface PushSubscriptionJSON {

@@ -28,6 +28,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	aiprofile "lightremote/internal/aiprofile"
+	"lightremote/internal/agent"
 
 	"lightremote/internal/auth"
 	backupsvc "lightremote/internal/backup"
@@ -101,6 +102,24 @@ func main() {
 	pushHandlers := pushsvc.NewHandlers(pushsvc.NewStore(database.DB), pushSender)
 	pushHandlers.IdleSeconds = cfg.PushIdle
 
+	// Agent 会话远控(DESIGN-AGENT.md):spawn claude stream-json,REST + WS 推送。
+	// 聊天附件存数据目录下的 agent-files,不进工作区。
+	agentStore := agent.NewStore(database.DB)
+	agentStore.FilesDir = filepath.Join(cfg.DataDir, "agent-files")
+	agentStore.BackfillTitles() // 存量无标题会话用首条消息补上
+	agentMgr := agent.NewManager(agentStore, cfg.Root, cfg.ReadOnly)
+	// 权限请求/回合完成 → Web Push(与终端空闲推送同一套通道)。
+	agentMgr.NotifyPermission = func(title, tool string) {
+		pushHandlers.NotifyAgent("Agent 请求审批",
+			fmt.Sprintf("「%s」想执行 %s,点开批准或拒绝", title, tool),
+			"agent-perm", "/agent")
+	}
+	agentMgr.NotifyTurnDone = func(title string) {
+		pushHandlers.NotifyAgent("回合完成",
+			fmt.Sprintf("「%s」的回合已结束", title),
+			"agent-done", "/agent")
+	}
+
 	app := &App{
 		cfg:          cfg,
 		db:           database.DB,
@@ -113,6 +132,7 @@ func main() {
 		backupMgr:    backupsvc.New(database.DB, cfg.Root),
 		push:         pushHandlers,
 		sysmon:       sysmon.New(cfg.Root, cfg.ReadOnly),
+		agent:        agent.NewHandlers(agentMgr, agentStore),
 	}
 	app.backup = backupsvc.NewHandlers(app.backupMgr)
 	// 交互式 git 认证:broker 把"需要凭据"推给浏览器弹窗,answer 回填后放行 push/pull。
@@ -140,6 +160,8 @@ func main() {
 	// 优雅停机:捕获信号,给在途请求留窗口。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 会话自动清理(默认关,每日自查开关):停机信号与 HTTP 同一来源。
+	app.agent.StartAutoCleanup(ctx.Done())
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -184,6 +206,7 @@ type App struct {
 	backupMgr    *backupsvc.Manager
 	push         *pushsvc.Handlers
 	sysmon       *sysmon.Monitor
+	agent        *agent.Handlers
 }
 
 func (a *App) routes() http.Handler {
@@ -279,6 +302,22 @@ func (a *App) routes() http.Handler {
 		// 系统信息(采集只读,低成本);结束进程是写操作,只读模式下被 sysmon 拒掉。
 		pr.Get("/api/sysinfo", a.handleSysInfo)
 		pr.Post("/api/sysinfo/kill", a.handleKillProc)
+
+		// Agent 会话远控(DESIGN-AGENT.md):REST 操作 + WS 单向推送。
+		pr.Get("/api/agent", a.agent.ServeWS)
+		pr.Get("/api/agent/sessions", a.agent.List)
+		pr.Post("/api/agent/sessions", a.agent.Create)
+		pr.Get("/api/agent/sessions/{id}/messages", a.agent.Messages)
+		pr.Post("/api/agent/sessions/{id}/messages", a.agent.SendMessage)
+		pr.Post("/api/agent/sessions/{id}/interrupt", a.agent.Interrupt)
+		pr.Post("/api/agent/sessions/{id}/approve", a.agent.Approve)
+		pr.Post("/api/agent/sessions/{id}/settings", a.agent.Settings)
+		pr.Post("/api/agent/sessions/{id}/attachments", a.agent.Upload)
+		pr.Delete("/api/agent/sessions/{id}", a.agent.Kill)
+		pr.Post("/api/agent/sessions/{id}/delete", a.agent.DeleteSession)
+		pr.Get("/api/agent/cleanup", a.agent.CleanupStatus)
+		pr.Post("/api/agent/cleanup", a.agent.Cleanup)
+		pr.Put("/api/agent/cleanup", a.agent.SaveCleanupSettings)
 	})
 
 	// ---- 静态资源(SPA 前端)----

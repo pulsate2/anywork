@@ -26,6 +26,7 @@ const views = {
   git: () => import('@/views/GitView.vue'),
   gitFile: () => import('@/views/GitFileView.vue'),
   ai: () => import('@/views/AIView.vue'),
+  agent: () => import('@/views/AgentView.vue'),
   settings: () => import('@/views/SettingsView.vue'),
 }
 
@@ -49,6 +50,7 @@ const router = createRouter({
     { path: '/git', name: 'git', component: views.git },
     { path: '/git/file', name: 'git-file', component: views.gitFile },
     { path: '/ai', name: 'ai', component: views.ai },
+    { path: '/agent', name: 'agent', component: views.agent },
     { path: '/settings', name: 'settings', component: views.settings },
   ],
 })

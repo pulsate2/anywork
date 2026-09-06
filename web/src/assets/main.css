@@ -113,6 +113,14 @@ body {
   transform: translateY(100%);
   visibility: hidden;
 }
+/* 沉浸模式(Agent 聊天这类全屏子视图):导航让路。只在移动端 —— 桌面端它是左侧栏,
+   聊天只是右边一列,收掉就没有任何切页入口了。 */
+@media (max-width: 767px) {
+  .bottom-nav.immersive {
+    transform: translateY(100%);
+    visibility: hidden;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .bottom-nav { transition: none; }
 }

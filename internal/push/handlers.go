@@ -140,6 +140,21 @@ func (h *Handlers) NotifyTerminal(sessionID, dir string) {
 	})
 }
 
+// NotifyAgent agent 会话事件推送(权限请求/回合完成):调用方给全部文案,
+// tag 用于同源通知去重,url 是点开后落地的页面。
+func (h *Handlers) NotifyAgent(title, body, tag, url string) {
+	subs, err := h.store.List()
+	if err != nil || len(subs) == 0 {
+		return
+	}
+	h.deliverAll(context.Background(), subs, Message{
+		Title: title,
+		Body:  body,
+		Tag:   tag,
+		URL:   url,
+	})
+}
+
 // deliverAll 逐个投递;对 gone(失效)的订阅清理删除。返回 sent/failed。
 func (h *Handlers) deliverAll(ctx context.Context, subs []Subscription, msg Message) (sent, failed int) {
 	for _, sub := range subs {
