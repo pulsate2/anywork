@@ -4,7 +4,7 @@
 // 停止与发送是两个独立按钮,回合进行中都可点:停止打断,发送进排队。
 // 另外两个入口:"/" 指令弹层(模型/思考强度/权限/打断)、附件(传到会话
 // 专属目录后以 @路径 提及)。
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { NButton, NIcon } from 'naive-ui'
 import { AttachOutline, SendOutline, StopOutline } from '@vicons/ionicons5'
 import { api } from '@/api/client'
@@ -30,6 +30,29 @@ const text = ref('')
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const fileEl = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
+
+// ---- 草稿:按会话存 localStorage ----
+// 返回列表/切会话/离开页面时,没发出去的内容不丢:切走与卸载都落一份,
+// 回来接着写。发出去(submit 清空)草稿即消失;空文本不占键。
+// 注意 draftOwner 跟着"当前 text 属于哪个会话"走,sessionId 切换时先把
+// 旧文本归档到旧会话再载入新会话的草稿。
+const draftOwner = ref<string | undefined>(props.sessionId)
+function persistDraft(id?: string) {
+  if (!id) return
+  if (text.value.trim()) localStorage.setItem(`agent.draft.${id}`, text.value)
+  else localStorage.removeItem(`agent.draft.${id}`)
+}
+// 挂载时载入当前会话的草稿(Composer 随聊天视图 v-if 挂载,sessionId 已就绪)。
+if (props.sessionId) {
+  text.value = localStorage.getItem(`agent.draft.${props.sessionId}`) || ''
+}
+watch(() => props.sessionId, (id) => {
+  persistDraft(draftOwner.value)
+  draftOwner.value = id
+  text.value = (id && localStorage.getItem(`agent.draft.${id}`)) || ''
+})
+watch(text, () => persistDraft(draftOwner.value))
+onBeforeUnmount(() => persistDraft(draftOwner.value))
 
 // 提问未答 = 输入整体锁死(与 disabled 同效但提示语不同)。
 const locked = computed(() => !!props.askPending)

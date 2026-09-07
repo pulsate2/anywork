@@ -5,7 +5,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
-import { AddOutline, CheckboxOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
+import { AddOutline, CheckboxOutline, CopyOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
 import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
@@ -749,6 +749,38 @@ function dropPending(key: number) {
   if (i >= 0) pendingBubbles.value.splice(i, 1)
 }
 
+// ---- 复制自己发过的消息 ----
+// 远端常见诉求:把发给 agent 的命令/长提示转走。平时不打扰,点一下气泡,
+// 下方浮现复制键;再点气泡(或点别的气泡)收起。点复制变 ✓ 1.5 秒回弹。
+const revealedKey = ref<string | null>(null)
+const copiedKey = ref<string | null>(null)
+let copyTimer: number | undefined
+function toggleCopy(key: string) {
+  revealedKey.value = revealedKey.value === key ? null : key
+}
+async function copySent(key: string, text: string) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      // 非安全上下文(http 访问)没有 clipboard API:隐藏 textarea 兜底。
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      ta.remove()
+    }
+    copiedKey.value = key
+    window.clearTimeout(copyTimer)
+    copyTimer = window.setTimeout(() => { copiedKey.value = null }, 1500)
+  } catch {
+    message.error('复制失败')
+  }
+}
+
 // 回合结束(idle)自动放行队首一条;该条发出后状态会转 running,
 // 下一次 idle 再放行下一条 —— 逐条串行,天然限速。
 watch(turnState, (st) => {
@@ -1079,6 +1111,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   ws.close()
   immersive.value = false
+  window.clearTimeout(copyTimer)
 })
 </script>
 
@@ -1212,7 +1245,19 @@ onBeforeUnmount(() => {
         </div>
         <n-empty v-if="!cards.length" description="会话已就绪,发第一条消息开始" class="chat-empty" />
         <div v-for="c in cards" :key="c.key" class="chat-row" :class="c.kind">
-          <div v-if="c.kind === 'user'" class="bubble user">{{ c.text }}</div>
+          <!-- 用户气泡:点击在下方浮现复制键(再点收起);✓ 一闪即回 -->
+          <div v-if="c.kind === 'user'" class="user-bubble-wrap">
+            <div class="bubble user" @click="toggleCopy(c.key)">{{ c.text }}</div>
+            <button
+              v-if="revealedKey === c.key"
+              type="button" class="copy-btn" :class="{ copied: copiedKey === c.key }"
+              :title="copiedKey === c.key ? '已复制' : '复制'"
+              @click="copySent(c.key, c.text || '')"
+            >
+              <n-icon :component="copiedKey === c.key ? CheckboxOutline : CopyOutline" />
+              <span>{{ copiedKey === c.key ? '已复制' : '复制' }}</span>
+            </button>
+          </div>
           <div v-else-if="c.kind === 'assistant'" class="agent-plain agent-md-body" v-html="renderMarkdown(c.text || '')" />
           <details v-else-if="c.kind === 'reasoning'" class="reasoning">
             <summary>思考过程</summary>
@@ -1687,6 +1732,30 @@ onBeforeUnmount(() => {
   background: var(--lr-accent); color: #fff;
   border-bottom-right-radius: 4px;
   white-space: pre-wrap;
+}
+/* 用户气泡:点击在正下方浮现复制键(气泡竖排右对齐,复制键跟在气泡底下);
+   复制键平时不存在,浮现时带个小弹出动画 */
+/* 86% 上限从气泡挪到这层(相对整行时间线解析);里面气泡放宽到 100%。
+   直接在气泡上留 86% 会相对这个按内容收缩的容器解析,气泡被压成几个字宽 */
+.user-bubble-wrap { display: flex; flex-direction: column; align-items: flex-end; max-width: 86%; min-width: 0; }
+.user-bubble-wrap .bubble.user { max-width: 100%; cursor: pointer; }
+.copy-btn {
+  margin-top: 4px;
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  height: 30px; padding: 0 10px;
+  border: 1px solid rgba(127, 127, 127, .25); border-radius: 15px;
+  background: var(--lr-bg-elevated);
+  color: var(--lr-fg-muted); font-size: 12px;
+  cursor: pointer;
+  animation: copy-pop .16s ease-out;
+  -webkit-tap-highlight-color: transparent;
+}
+.copy-btn:hover { color: var(--lr-fg); border-color: rgba(127, 127, 127, .45); }
+.copy-btn:active { color: var(--lr-fg); }
+.copy-btn.copied { color: var(--lr-ok); border-color: var(--lr-ok); }
+@keyframes copy-pop {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
 }
 /* 普通聊天直接显示,不包卡片(hapi 风格):只有正文排版,没有气泡底色 */
 .agent-plain { min-width: 0; color: var(--lr-fg); }
