@@ -1,6 +1,7 @@
 # ---- Go 构建产物 ----
 /lightremote
 /lightremote.exe
+/server
 *.exe
 *.test
 *.out
