@@ -32,8 +32,14 @@ const (
 	// 系统提示,之后的 usage 数字会明显回落。
 	KindCompaction = "compaction"
 	// KindSystemInfo claude 可见的 system 子类型(api_error / turn_duration /
-	// away_summary):时间线渲染成系统行,不接的话过载重试像卡死。
+	// away_summary / task_notification):时间线渲染成系统行,不接的话过载
+	// 重试像卡死、后台任务完成悄无声息。
 	KindSystemInfo = "system_info"
+	// KindAssistantDelta / KindReasoningDelta 流式增量(claude
+	// --include-partial-messages 的 text_delta / thinking_delta)。瞬态事件:
+	// 只广播不落库 —— 完整消息随后照旧到达并持久化,历史回放不依赖增量。
+	KindAssistantDelta = "assistant_delta"
+	KindReasoningDelta = "reasoning_delta"
 	// KindAskUser agent 向用户提问(claude AskUserQuestion / codex
 	// request_user_input 走的是控制协议而非普通工具调用):渲染成选项卡,
 	// 回答经 Answer 回传。
@@ -145,12 +151,16 @@ type CompactionPayload struct {
 	Error       string `json:"error,omitempty"`
 }
 
-// SystemInfoPayload KindSystemInfo 的负载。Type 区分三类:api_error(过载/
+// SystemInfoPayload KindSystemInfo 的负载。Type 区分四类:api_error(过载/
 // 限流重试,Retry/MaxRetry 是进度)、turn_duration(回合结束统计)、
-// away_summary(离开期间的 recap,Text 是原文)。
+// away_summary(离开期间的 recap,Text 是原文)、task_notification(后台任务
+// 完成/Monitor 事件,Text 是摘要,Status 是 completed/failed 等状态词,
+// Event 是 Monitor 事件的具体行)。
 type SystemInfoPayload struct {
-	Type       string  `json:"type"` // api_error | turn_duration | away_summary
+	Type       string  `json:"type"` // api_error | turn_duration | away_summary | task_notification
 	Text       string  `json:"text,omitempty"`
+	Status     string  `json:"status,omitempty"`
+	Event      string  `json:"event,omitempty"`
 	Error      string  `json:"error,omitempty"`
 	Retry      int     `json:"retry,omitempty"`
 	MaxRetry   int     `json:"maxRetry,omitempty"`

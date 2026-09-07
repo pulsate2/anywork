@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // claudeDriver:spawn `claude` 的 stream-json 模式,stdio 双向 JSON 行流。
@@ -39,6 +40,12 @@ type claudeDriver struct {
 	model     string // 当前模型(system/init 里返回)
 	// filesDir 会话附件目录:tool_result 的 image 块落这里(空 = 不落盘)。
 	filesDir string
+	// cwd 工作目录:转录 tailer 要按它拼 ~/.claude/projects/<slug>/ 路径。
+	cwd string
+	// notified 最近转发过的通知内容键(transcript tailer 与 stdout user-echo
+	// 两条路径可能先后看到同一条,防双发);notifyOrder 是淘汰顺序。
+	notified    map[string]struct{}
+	notifyOrder []string
 	// asks 挂起的提问(reqID → 原始 input + 归一后的问题):AskUserQuestion
 	// 走 can_use_tool 协议,回答要回 allow + updatedInput.answers。
 	asks       map[string]*askPending
@@ -74,6 +81,7 @@ func newClaudeDriver() *claudeDriver {
 		lastReqArgs:  map[string]string{},
 		toolNames:    map[string]string{},
 		asks:         map[string]*askPending{},
+		notified:     map[string]struct{}{},
 		events:       make(chan Event, 128),
 		done:         make(chan struct{}),
 	}
@@ -89,12 +97,16 @@ func claudeBin() (string, error) {
 
 func (d *claudeDriver) Start(opts StartOpts) error {
 	d.filesDir = opts.FilesDir
+	d.cwd = opts.Cwd
 	bin, err := claudeBin()
 	if err != nil {
 		return fmt.Errorf("未找到 claude 可执行文件(可用 LR_CLAUDE_BIN 指定): %w", err)
 	}
 
-	args := []string{"--output-format", "stream-json", "--verbose", "--input-format", "stream-json"}
+	args := []string{"--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
+		// 流式增量:partial message 事件(text_delta/thinking_delta)随生成
+		// 逐段到达,完整消息照旧在后面;不接的话长思考期间远端一直空白。
+		"--include-partial-messages"}
 	// 权限询问走 stdio 控制协议(plan/ask/edits 都可能产生询问);
 	// accept 直接 bypass,不会有询问。映射:plan/acceptEdits/bypassPermissions。
 	switch opts.PermissionMode {
@@ -352,6 +364,8 @@ type claudeLine struct {
 	Status        string `json:"status"`
 	CompactResult string `json:"compact_result"`
 	CompactError  string `json:"compact_error"`
+	// system/task_notification:后台任务完成/Monitor 事件的摘要与状态词。
+	Summary string `json:"summary"`
 	// system/api_error / turn_duration / away_summary 的载荷。
 	Content       json.RawMessage     `json:"content"` // away_summary 的 recap
 	RetryAttempt  int                 `json:"retryAttempt"`
@@ -360,6 +374,10 @@ type claudeLine struct {
 	DurationMs    float64             `json:"durationMs"` // turn_duration 用驼峰
 	ResultSummary *claudeRoundSummary `json:"resultSummary"`
 	Message       *claudeMsg          `json:"message"`
+	// stream_event(--include-partial-messages):event 包着 Anthropic 流式事件;
+	// parent_tool_use_id 非空 = 子 agent(Task 工具)自己的流,不透出。
+	Event           json.RawMessage `json:"event"`
+	ParentToolUseID string          `json:"parent_tool_use_id"`
 	// control_request(权限询问)
 	RequestID string          `json:"request_id"`
 	Request   json.RawMessage `json:"request"`
@@ -490,8 +508,14 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 				json.Unmarshal(msg.Session, &sid)
 				if sid != "" {
 					d.mu.Lock()
+					first := d.external == ""
 					d.external = sid
 					d.mu.Unlock()
+					// 转录 tailer 只起一次:补捞 stdout 上看不见的后台通知
+					// (回合中入队被 absorbed_mid_turn 吸收的 Monitor 事件等)。
+					if first {
+						go d.tailTranscript(sid)
+					}
 				}
 				var m string
 				json.Unmarshal(msg.Model, &m)
@@ -530,6 +554,17 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 					d.emit(Event{Kind: KindCompaction, Payload: &CompactionPayload{
 						Failed: true,
 						Error:  truncate(msg.CompactError, 500),
+					}})
+				}
+			} else if msg.Subtype == "task_notification" {
+				// 后台任务(Bash run_in_background / Monitor)完成或产出事件:
+				// claude 在空闲间隙注入,不透出的话远程端会以为任务还在跑。
+				// 与 XML 形态共用 seenNotify 去重(event 为空时键一致)。
+				if msg.Summary != "" && !d.seenNotify(msg.Summary+"|"+msg.Status+"|") {
+					d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
+						Type:   "task_notification",
+						Text:   truncate(msg.Summary, 2000),
+						Status: msg.Status,
 					}})
 				}
 			} else if msg.Subtype == "api_error" {
@@ -583,6 +618,8 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 			d.handleAssistant(msg.Message)
 		case "user":
 			d.handleUserEcho(msg.Message)
+		case "stream_event":
+			d.handleStreamEvent(msg)
 		case "result":
 			if msg.IsError {
 				d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(msg.Result, 4000)}})
@@ -650,9 +687,16 @@ func (d *claudeDriver) handleAssistant(m *claudeMsg) {
 }
 
 // handleUserEcho user 消息两种来源:我们自己 Send 的回显(REST 路径已落库,跳过)
-// 与 tool_result(补全工具卡片结果)。只认后者。
+// 与 tool_result(补全工具卡片结果)。字符串 content 只有回显与后台通知两种
+// 可能 —— 后者(旧形态的 task_notification)是空闲间隙注入的 XML,要透出。
 func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
-	if m == nil || rawIsString(m.Content) {
+	if m == nil {
+		return
+	}
+	if rawIsString(m.Content) {
+		var text string
+		json.Unmarshal(m.Content, &text)
+		d.maybeTaskNotificationXML(text)
 		return
 	}
 	var blocks []contentBlock
@@ -679,6 +723,175 @@ func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
 			Images:    images,
 			State:     map[bool]string{true: "error", false: "ok"}[b.IsError],
 		}})
+	}
+}
+
+// maybeTaskNotificationXML 旧形态的后台通知:作为 user 消息注入的
+// <task-notification><summary>…</summary><status>…</status><event>…</event>
+// </task-notification>(hapi eventParsing 同款解析;Monitor 事件带 <event>
+// 具体行、无 <status>)。非此形态(普通回显)静默跳过。
+// transcript tailer 与 stdout user-echo 两条路径都走这里,seenNotify 去重。
+func (d *claudeDriver) maybeTaskNotificationXML(text string) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "<task-notification>") {
+		return
+	}
+	summary := xmlTagValue(trimmed, "summary")
+	if summary == "" {
+		return
+	}
+	status := xmlTagValue(trimmed, "status")
+	event := xmlTagValue(trimmed, "event")
+	if d.seenNotify(summary + "|" + status + "|" + event) {
+		return
+	}
+	d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
+		Type:   "task_notification",
+		Text:   truncate(summary, 2000),
+		Status: status,
+		Event:  truncate(event, 2000),
+	}})
+}
+
+// seenNotify 通知去重(双路径防双发):没见过就记下并返回 false。
+// 键有界(64 条 FIFO),会话生命周期内够用且不膨胀。
+func (d *claudeDriver) seenNotify(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.notified[key]; ok {
+		return true
+	}
+	d.notified[key] = struct{}{}
+	d.notifyOrder = append(d.notifyOrder, key)
+	if len(d.notifyOrder) > 64 {
+		delete(d.notified, d.notifyOrder[0])
+		d.notifyOrder = d.notifyOrder[1:]
+	}
+	return false
+}
+
+// tailTranscript 盯 claude 的会话转录文件,补捞 stream-json stdout 上看不见的
+// 后台通知:回合进行中入队的 task-notification 会被 absorbed_mid_turn 吸收进
+// 上下文(转录里只留下 queue-operation/attachment 条目),stdout 永不发对应
+// user 消息 —— Monitor 事件几乎总落在这个窗口,只能从转录侧看见。
+// 轮询周期 1 秒:告警延迟可接受,又不用 inotify(容器/跨平台省心)。
+func (d *claudeDriver) tailTranscript(sessionID string) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	path := filepath.Join(home, ".claude", "projects", projectSlug(d.cwd), sessionID+".jsonl")
+	var offset int64
+	for {
+		select {
+		case <-d.done:
+			return
+		default:
+		}
+		if f, err := os.Open(path); err == nil {
+			if st, err := f.Stat(); err == nil {
+				if st.Size() < offset {
+					offset = 0 // 文件被重建:从头再来
+				}
+				if _, err := f.Seek(offset, io.SeekStart); err == nil {
+					br := bufio.NewReaderSize(f, 64*1024)
+					for {
+						line, err := br.ReadBytes('\n')
+						if err != nil {
+							break // EOF:半行留到下一轮,offset 不动
+						}
+						offset += int64(len(line))
+						d.onTranscriptLine(line)
+					}
+				}
+			}
+			f.Close()
+		}
+		// 文件晚于 init 创建也无所谓:开着一直等。
+		select {
+		case <-d.done:
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// onTranscriptLine 转录里的一条:只关心 queue-operation 的 enqueue(通知
+// 发生的最早信号;attachment/remove 是它的后续,dequeue 后 stdout 会发
+// user 消息,由去重兜住)。
+func (d *claudeDriver) onTranscriptLine(line []byte) {
+	var o struct {
+		Type      string `json:"type"`
+		Operation string `json:"operation"`
+		Content   string `json:"content"`
+	}
+	if json.Unmarshal(line, &o) != nil || o.Type != "queue-operation" || o.Operation != "enqueue" {
+		return
+	}
+	d.maybeTaskNotificationXML(o.Content)
+}
+
+// projectSlug claude 转录目录的路径编码:路径里非字母数字的字符一律换 '-'。
+func projectSlug(cwd string) string {
+	var b strings.Builder
+	b.Grow(len(cwd))
+	for _, r := range cwd {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
+}
+
+// xmlTagValue 提取 <tag>值</tag>(首个匹配;标签不存在返回空串)。
+func xmlTagValue(s, tag string) string {
+	open, close := "<"+tag+">", "</"+tag+">"
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	i += len(open)
+	j := strings.Index(s[i:], close)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[i : i+j])
+}
+
+// claudeStreamEvent --include-partial-messages 的 stream_event 行:event 字段
+// 包着 Anthropic Messages API 的流式事件,只关心 content_block_delta 的
+// 文本与思考增量(工具参数的 input_json_delta 不透出,完整 tool_use 照旧到达)。
+type claudeStreamEvent struct {
+	Type  string `json:"type"`
+	Delta *struct {
+		Type     string `json:"type"` // text_delta | thinking_delta | input_json_delta
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
+	} `json:"delta"`
+}
+
+// handleStreamEvent 流式增量 → 瞬态事件(不落库,只广播;完整消息随后到达)。
+// parent_tool_use_id 非空的是子 agent(Task 工具)自己的流:子 agent 的输出
+// 不会以顶级 assistant 消息落库,流了也配不上对,跳过。
+func (d *claudeDriver) handleStreamEvent(msg claudeLine) {
+	if msg.ParentToolUseID != "" || len(msg.Event) == 0 {
+		return
+	}
+	var ev claudeStreamEvent
+	if err := json.Unmarshal(msg.Event, &ev); err != nil || ev.Type != "content_block_delta" || ev.Delta == nil {
+		return
+	}
+	switch ev.Delta.Type {
+	case "text_delta":
+		if ev.Delta.Text != "" {
+			d.emit(Event{Kind: KindAssistantDelta, Payload: ev.Delta.Text})
+		}
+	case "thinking_delta":
+		if ev.Delta.Thinking != "" {
+			d.emit(Event{Kind: KindReasoningDelta, Payload: ev.Delta.Thinking})
+		}
 	}
 }
 

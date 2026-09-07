@@ -3,6 +3,8 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -157,6 +159,164 @@ func TestClaudeAskUserCancel(t *testing.T) {
 	if !strings.Contains(stdin.String(), `"behavior":"deny"`) {
 		t.Fatalf("取消应回 deny: %s", stdin.String())
 	}
+}
+
+// TestClaudeTaskNotification 后台任务通知的两种形态:system/task_notification
+// 子类型(新)与 user 消息字符串 content 里的 <task-notification> XML(旧)。
+// 两者都归一成 system_info{type:task_notification};普通字符串回显不透出。
+func TestClaudeTaskNotification(t *testing.T) {
+	d := newClaudeDriver()
+	lines := []string{
+		`{"type":"system","subtype":"task_notification","summary":"Background task completed: sleep 2 (exit 0)","status":"completed"}`,
+		`{"type":"user","message":{"role":"user","content":"<task-notification>\n<summary>Monitor 捕获 3 条事件</summary>\n<status>timeout</status>\n</task-notification>"}}`,
+		`{"type":"user","message":{"role":"user","content":"普通回显,不该透出"}}`,
+	}
+	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+
+	expect := []*SystemInfoPayload{
+		{Type: "task_notification", Text: "Background task completed: sleep 2 (exit 0)", Status: "completed"},
+		{Type: "task_notification", Text: "Monitor 捕获 3 条事件", Status: "timeout"},
+	}
+	for i, want := range expect {
+		select {
+		case ev := <-d.events:
+			if ev.Kind != KindSystemInfo {
+				t.Fatalf("第 %d 条:kind = %s,想要 %s", i, ev.Kind, KindSystemInfo)
+			}
+			got, ok := ev.Payload.(*SystemInfoPayload)
+			if !ok {
+				t.Fatalf("第 %d 条:payload 类型 %T", i, ev.Payload)
+			}
+			if *got != *want {
+				t.Fatalf("第 %d 条:got %+v, want %+v", i, *got, *want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("第 %d 条:2 秒内没等到事件", i)
+		}
+	}
+	// 第三行(普通回显)不该再产事件:等一小段确认静默。
+	select {
+	case ev := <-d.events:
+		t.Fatalf("普通回显不该透出: %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestClaudeStreamEvent --include-partial-messages 的流式增量:text_delta /
+// thinking_delta 归一成瞬态事件;子 agent 流(parent_tool_use_id 非空)与
+// 工具参数增量(input_json_delta)不透出。
+func TestClaudeStreamEvent(t *testing.T) {
+	d := newClaudeDriver()
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}}`,
+		`{"type":"stream_event","parent_tool_use_id":"toolu_01","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"子agent的字"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想想"}}}`,
+		`{"type":"stream_event","event":{"type":"message_stop"}}`,
+	}
+	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+
+	type want struct {
+		kind    string
+		payload string
+	}
+	for _, w := range []want{
+		{KindAssistantDelta, "你"},
+		{KindAssistantDelta, "好"},
+		{KindReasoningDelta, "先想想"},
+	} {
+		select {
+		case ev := <-d.events:
+			if ev.Kind != w.kind || ev.Payload != w.payload {
+				t.Fatalf("got %s/%v,想要 %s/%v", ev.Kind, ev.Payload, w.kind, w.payload)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("2 秒内没等到 %s 事件", w.kind)
+		}
+	}
+	select {
+	case ev := <-d.events:
+		t.Fatalf("不该再透出事件: %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestClaudeTranscriptTailMonitor 转录 tailer:回合中入队的通知被
+// absorbed_mid_turn 吸收,stdout 上永不出现,只能从转录的 queue-operation
+// enqueue 条目补捞。验证:初始内容读取、增量追加、非通知条目过滤、
+// 与 stdout 路径(maybeTaskNotificationXML)同内容去重不双发。
+func TestClaudeTranscriptTailMonitor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	d := newClaudeDriver()
+	d.cwd = "/root/proj"
+
+	dir := filepath.Join(home, ".claude", "projects", projectSlug(d.cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "sess1.jsonl")
+	monitorXML := "<task-notification>\n<task-id>b8h</task-id>\n<summary>Monitor event: \"测试\"</summary>\n<event>EVENT-1\nEVENT-2</event>\n</task-notification>"
+	line1, _ := json.Marshal(map[string]string{"type": "queue-operation", "operation": "enqueue", "content": monitorXML})
+	os.WriteFile(path, append(line1, '\n'), 0o644)
+
+	go d.tailTranscript("sess1")
+
+	want := &SystemInfoPayload{
+		Type:  "task_notification",
+		Text:  `Monitor event: "测试"`,
+		Event: "EVENT-1\nEVENT-2",
+	}
+	select {
+	case ev := <-d.events:
+		if ev.Kind != KindSystemInfo {
+			t.Fatalf("kind = %s,想要 %s", ev.Kind, KindSystemInfo)
+		}
+		if got, ok := ev.Payload.(*SystemInfoPayload); !ok || *got != *want {
+			t.Fatalf("got %+v, want %+v", ev.Payload, *want)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("3 秒内没等到 tailer 的 Monitor 事件")
+	}
+
+	// stdout 路径又送来同一条(空闲时 dequeue 之后的 user 消息):去重,不双发。
+	d.maybeTaskNotificationXML(monitorXML)
+	select {
+	case ev := <-d.events:
+		t.Fatalf("同内容通知双发了: %+v", ev)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 增量追加:新事件 + 非通知的 enqueue(排队用户消息),后者不该透出。
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	for _, content := range []string{
+		"插话的排队消息",
+		"<task-notification>\n<summary>Monitor event: \"二段\"</summary>\n<event>[Monitor timed out — re-arm if needed.]</event>\n</task-notification>",
+	} {
+		b, _ := json.Marshal(map[string]string{"type": "queue-operation", "operation": "enqueue", "content": content})
+		f.Write(append(b, '\n'))
+	}
+	f.Close()
+	want2 := &SystemInfoPayload{
+		Type:  "task_notification",
+		Text:  `Monitor event: "二段"`,
+		Event: "[Monitor timed out — re-arm if needed.]",
+	}
+	select {
+	case ev := <-d.events:
+		if got, ok := ev.Payload.(*SystemInfoPayload); !ok || *got != *want2 {
+			t.Fatalf("got %+v, want %+v", ev.Payload, *want2)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("3 秒内没等到追加的 Monitor 事件")
+	}
+	select {
+	case ev := <-d.events:
+		t.Fatalf("多透出了事件: %+v", ev)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(d.done)
 }
 
 // waitWritten 轮询等 handler goroutine 把答复写进 stdin 缓冲。

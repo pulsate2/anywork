@@ -48,9 +48,12 @@ type Manager struct {
 	Root string
 	// ReadOnly 只读模式禁止建会话/发消息/审批。
 	ReadOnly bool
-	// NotifyPermission / NotifyTurnDone 推送钩子(main 注入;nil = 不推送)。
+	// NotifyPermission / NotifyTurnDone / NotifyTask 推送钩子(main 注入;nil = 不推送)。
 	NotifyPermission func(sessionTitle, tool string)
 	NotifyTurnDone   func(sessionTitle string)
+	// NotifyTask 后台任务通知(Bash run_in_background 完成 / Monitor 事件):
+	// 远程用户最容易错过的一类 —— 回合早已结束,不推就永远看不见。
+	NotifyTask func(sessionTitle, summary string)
 }
 
 func NewManager(store *Store, root string, readonly bool) *Manager {
@@ -180,8 +183,15 @@ func (m *Manager) append(ls *liveSession, ev *Event) (*Event, error) {
 
 // pump 事件泵:driver 事件 → 落库 → 广播。会话所有消息的落库都在这一个
 // goroutine 里串行进行,Store 的 MAX(seq)+1 分配因此不需要额外锁。
+// 流式增量(assistant_delta/reasoning_delta)是瞬态事件:完整消息随后到达
+// 并持久化,增量只走广播,历史回放与落库体积都不受影响。
 func (m *Manager) pump(ls *liveSession) {
 	for ev := range ls.driver.Events() {
+		if ev.Kind == KindAssistantDelta || ev.Kind == KindReasoningDelta {
+			ev.SessionID = ls.id
+			m.broadcast(ls, &ev)
+			continue
+		}
 		// system/init 到达后就有 session_id 了:立即落 external_id,
 		// 进程哪怕只活了一秒,续聊凭据也不能丢。
 		if ls.driver.ExternalID() != "" {
@@ -207,6 +217,12 @@ func (m *Manager) pump(ls *liveSession) {
 					tool = pr.Tool
 				}
 				go m.NotifyPermission(m.titleOf(ls.id), tool)
+			}
+		case KindSystemInfo:
+			// 后台任务通知推给远端:回合可能早已结束,turn-done 推送不会
+			// 再发生,不推的话 Monitor 告警就只有打开页面才看得见。
+			if si, ok := ev.Payload.(*SystemInfoPayload); ok && si.Type == "task_notification" && m.NotifyTask != nil {
+				go m.NotifyTask(m.titleOf(ls.id), si.Text)
 			}
 		case KindStatus:
 			if sp, ok := ev.Payload.(*StatusPayload); ok {

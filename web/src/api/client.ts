@@ -283,10 +283,13 @@ export interface AgentUsage {
 }
 
 // KindSystemInfo 负载:api_error(过载/限流重试)、turn_duration(回合统计)、
-// away_summary(离开期间的 recap)。详见后端 SystemInfoPayload。
+// away_summary(离开期间的 recap)、task_notification(后台任务完成/Monitor
+// 事件,status 是 completed/failed 等状态词,event 是 Monitor 事件的具体行)。
 export interface AgentSystemInfo {
-  type: 'api_error' | 'turn_duration' | 'away_summary'
+  type: 'api_error' | 'turn_duration' | 'away_summary' | 'task_notification'
   text?: string
+  status?: string
+  event?: string
   error?: string
   retry?: number
   maxRetry?: number

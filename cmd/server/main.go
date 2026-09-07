@@ -119,6 +119,13 @@ func main() {
 			fmt.Sprintf("「%s」的回合已结束", title),
 			"agent-done", "/agent")
 	}
+	// 后台任务完成 / Monitor 事件:回合结束后才发生,turn-done 推不到,
+	// 远程用户不看页面就永远错过(hapi notificationHub 同款场景)。
+	agentMgr.NotifyTask = func(title, summary string) {
+		pushHandlers.NotifyAgent("后台任务通知",
+			fmt.Sprintf("「%s」:%s", title, truncatePush(summary, 80)),
+			"agent-task", "/agent")
+	}
 
 	app := &App{
 		cfg:          cfg,
@@ -732,4 +739,12 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// truncatePush 推送正文截断(按 rune,不会切出半个汉字)。
+func truncatePush(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }

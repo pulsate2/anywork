@@ -110,7 +110,7 @@ interface Card {
   // ask_user 落卡,ask_user_result 按 reqId 回填已选/取消。
   ask?: AgentAskUser
   askResult?: AgentAskUserResult
-  // 聚合组:连续 ≥2 张同类只读工具合成的一张卡(hapi buildVisibleChatBlocks)。
+  // 聚合组:连续 ≥2 张可组工具(混排不限同类)合成的一张卡(hapi 模型)。
   groupCalls?: AgentToolCall[]
   req?: AgentPermissionReq
   resolved?: { allow: boolean; session?: boolean }
@@ -373,14 +373,20 @@ const cards = computed<Card[]>(() => {
   return groupToolCards(out)
 })
 
-// ---- 只读工具聚合(hapi buildVisibleChatBlocks 的精简版) ----
-// 连续 ≥2 张"可组"工具卡合一张 ToolGroupCard。可组 = 只读类
-// (Read/LS/Glob/Grep/WebFetch/WebSearch 等小工具);写改类(Edit/Write/
-// Bash/ApplyPatch/CodexDiff)、带待审批的、TodoWrite 例外 —— 每张都值得单看。
+// ---- 工具卡聚合(hapi buildVisibleChatBlocks 的精简版) ----
+// 连续 ≥2 张"可组"工具卡(混排不限同类)合一张 ToolGroupCard。
+// 聚合规则(hapi buildVisibleChatBlocks 同款):连续的工具卡混排聚合成一张
+// 组卡 —— 不限同类(Read+Grep+Bash+Edit 连着出就进同一组),只有少数例外
+// 单独成卡:子 agent 启动类(里程碑)、计划类、待审批的(要等决定)。
 // 注意:聚合只在渲染层,toolUseId 索引(结果合并、审批内嵌)都已完成,
 // 组卡是最终展示形态,不需要再参与回填。
-const GROUPABLE_TOOLS = new Set([
-  'Read', 'LS', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'NotebookRead', 'NotebookEdit',
+const UNGROUPABLE_TOOLS = new Set([
+  // 里程碑:开 agent / 跨 agent 通信,时间线上值得单独一卡
+  'Task', 'Agent', 'CodexAgent', 'TeamCreate', 'TeamDelete', 'SendMessage',
+  'Skill', 'spawn_agent', 'send_input', 'send_message', 'resume_agent',
+  'followup_task', 'wait_agent', 'close_agent', 'interrupt_agent', 'list_agents',
+  // 计划类:进任务面板或单独成卡
+  'TodoWrite', 'update_plan', 'ExitPlanMode', 'exit_plan_mode', 'CodexReasoning',
 ])
 
 // compactionText 压缩提示文案(hapi SystemMessage 同款语义):微压缩报省下
@@ -395,11 +401,17 @@ function compactionText(p: AgentCompaction): string {
   return '会话已压缩'
 }
 
-// sysinfoIcon 系统信息行前缀图标:重试 ⏳ / 上限 ⚠️ / 回合统计 ⏱️ / recap 💭。
+// sysinfoIcon 系统信息行前缀图标:重试 ⏳ / 上限 ⚠️ / 回合统计 ⏱️ / recap 💭 /
+// 后台通知 🔔(失败 ⚠️)/ 监视器事件 📡。
 function sysinfoIcon(p: AgentSystemInfo): string {
   switch (p.type) {
     case 'api_error': return p.retry ? '⏳' : '⚠️'
     case 'turn_duration': return '⏱️'
+    case 'task_notification': {
+      if (p.status === 'failed') return '⚠️'
+      if ((p.text || '').startsWith('Monitor event:')) return '📡'
+      return '🔔'
+    }
     default: return '💭'
   }
 }
@@ -428,32 +440,49 @@ function sysinfoText(p: AgentSystemInfo): string {
   }
 }
 
+// notifyLabel / notifySummary 后台通知卡(sysinfoText 已不覆盖 task_notification,
+// 单独拆出来):Monitor 的 summary 形如 'Monitor event: "名字"',剥前缀取名字;
+// 正文走 markdown 渲染,不再塞一行纯文本。
+function notifyLabel(p: AgentSystemInfo): string {
+  if ((p.text || '').startsWith('Monitor event:')) return '监视器'
+  if (p.status === 'failed') return '后台任务失败'
+  if (p.status === 'completed') return '后台任务完成'
+  return p.status ? `后台任务(${p.status})` : '后台任务'
+}
+
+function notifySummary(p: AgentSystemInfo): string {
+  return (p.text || '').replace(/^Monitor event:\s*/, '')
+}
+
+// groupableToolCard 一张工具卡能否进组:非例外工具、且没有未决审批
+// (已答复的审批照常进组,审批内嵌的展示由详情弹窗兜底)。
+function groupableToolCard(c: Card): boolean {
+  return c.kind === 'tool' && !!c.call && !UNGROUPABLE_TOOLS.has(c.call.tool)
+    && !(c.pendingReq && !c.resolved)
+}
+
 function groupToolCards(cards: Card[]): Card[] {
   const out: Card[] = []
   let i = 0
   while (i < cards.length) {
-    const c = cards[i]
-    if (c.kind !== 'tool' || !c.call || !GROUPABLE_TOOLS.has(c.call.tool) || c.pendingReq) {
-      out.push(c)
+    if (!groupableToolCard(cards[i])) {
+      out.push(cards[i])
       i++
       continue
     }
-    // 收集连续可组工具(同一类;Read 与 Grep 混排不合,摘要意图会串)。
-    const family = c.call.tool
-    const group: AgentToolCall[] = [c.call]
+    // 收集连续可组工具,不限同类(hapi:混排进同一组,标题按主导意图起)。
+    const group: AgentToolCall[] = [cards[i].call!]
     let j = i + 1
-    while (j < cards.length) {
-      const d = cards[j]
-      if (d.kind !== 'tool' || !d.call || d.call.tool !== family || d.pendingReq) break
-      group.push(d.call)
+    while (j < cards.length && groupableToolCard(cards[j])) {
+      group.push(cards[j].call!)
       j++
     }
     if (group.length < 2) {
-      out.push(c)
+      out.push(cards[i])
       i++
       continue
     }
-    out.push({ key: `g${c.key}`, kind: 'toolgroup', groupCalls: group })
+    out.push({ key: `g${cards[i].key}`, kind: 'toolgroup', groupCalls: group })
     i = j
   }
   return out
@@ -503,17 +532,38 @@ const pendingAsk = computed(() =>
   cards.value.some((c) => c.kind === 'askuser' && !c.askResult),
 )
 
+// ---- 流式输出(瞬态增量,不进 messages) ----
+// assistant_delta / reasoning_delta 是 --include-partial-messages 的逐段增量:
+// 只在 WS 上广播、不落库,完整消息随后到达并落库。这里攒两块缓冲区直播,
+// 任意持久化事件(含完整消息、状态、错误)到达即清空 —— 缓冲区只负责
+// "正在生成"的那一段,历史回放完全靠落库消息,不依赖它。
+const streamText = ref('')
+const streamThink = ref('')
+watch([streamText, streamThink], () => scrollBottom())
+
 // ---- WS 推送 ----
 const ws = new AgentWS((e) => {
   if (e.type === 'message') {
     const ev = e.event
     if (ev.sessionId !== selectedId.value) return
+    // 流式增量:无 seq(不落库),不走去重,直接进缓冲区。
+    if (ev.kind === 'assistant_delta' || ev.kind === 'reasoning_delta') {
+      const t = typeof ev.payload === 'string' ? ev.payload : ''
+      if (ev.kind === 'assistant_delta') streamText.value += t
+      else streamThink.value += t
+      return
+    }
+    // 任何持久化事件都意味着当前流式块已收尾(完整消息就是下一个事件)。
+    streamText.value = ''
+    streamThink.value = ''
     // seq 去重:REST 响应已本地追加过,推送与补差重合的也在这里丢掉。
     if (ev.seq <= maxSeq.value) return
     messages.value.push(ev)
   } else if (e.type === 'exit') {
     // exit 只发给会话订阅者:正在看这个会话才收得到,顺手清排队消息。
     if (e.sessionId !== selectedId.value) return
+    streamText.value = ''
+    streamThink.value = ''
     markDead(e.sessionId)
   } else if (e.type === 'session') {
     // 会话状态变化(watch 观察者):列表实时刷新,不管当前看没看它。
@@ -558,6 +608,8 @@ async function openSession(id: string) {
   if (selectedId.value && selectedId.value !== id) ws.unsubscribe(selectedId.value)
   selectedId.value = id
   messages.value = []
+  streamText.value = ''
+  streamThink.value = ''
   decided.value.clear()
   cliCommands.value = []
   pendingBubbles.value = []
@@ -1178,7 +1230,23 @@ onBeforeUnmount(() => {
           />
           <div v-else-if="c.kind === 'error'" class="bubble error">{{ c.text }}</div>
           <div v-else-if="c.kind === 'system' && c.compaction" class="sysline" :class="{ 'sysline-failed': c.compaction.failed }">📦 {{ compactionText(c.compaction) }}</div>
+          <!-- 后台通知卡:头部图标+标签,正文 markdown 渲染,Monitor 的 event 是原始日志行走等宽 pre -->
+          <div v-else-if="c.kind === 'system' && c.sysinfo?.type === 'task_notification'" class="notify-card" :class="{ 'notify-failed': c.sysinfo.status === 'failed' }">
+            <div class="notify-head">{{ sysinfoIcon(c.sysinfo) }} {{ notifyLabel(c.sysinfo) }}</div>
+            <div v-if="notifySummary(c.sysinfo)" class="notify-body agent-md-body" v-html="renderMarkdown(notifySummary(c.sysinfo))" />
+            <pre v-if="c.sysinfo.event" class="notify-event">{{ c.sysinfo.event }}</pre>
+          </div>
           <div v-else-if="c.kind === 'system' && c.sysinfo" class="sysline" :class="{ 'sysline-failed': c.sysinfo.type === 'api_error' && c.sysinfo.maxRetry && !c.sysinfo.retry }">{{ sysinfoIcon(c.sysinfo) }} {{ sysinfoText(c.sysinfo) }}</div>
+        </div>
+        <!-- 流式直播区:正在生成的思考与正文(瞬态,完整消息落库后清空换正式卡) -->
+        <div v-if="streamThink" class="chat-row reasoning">
+          <details class="reasoning" open>
+            <summary>思考过程中…</summary>
+            <div class="reasoning-body">{{ streamThink }}</div>
+          </details>
+        </div>
+        <div v-if="streamText" class="chat-row assistant">
+          <div class="agent-plain agent-md-body" v-html="renderMarkdown(streamText)" />
         </div>
         <!-- 乐观气泡:发送中转圈,失败标 ⚠ 可重发/丢弃 -->
         <div v-for="pb in pendingBubbles" :key="pb.key" class="chat-row user">
@@ -1638,6 +1706,31 @@ onBeforeUnmount(() => {
 .sysline-failed {
   background: rgba(220, 38, 38, .08);
   color: var(--lr-danger);
+}
+/* 后台通知卡(task_notification):工具卡同款底,头部标签行 + markdown 正文 +
+   Monitor 的等宽事件行;失败态描红。 */
+.notify-card {
+  align-self: stretch;
+  border: 1px solid rgba(127, 127, 127, .18);
+  border-radius: var(--lr-radius);
+  background: var(--lr-bg-elevated);
+  overflow: hidden;
+}
+.notify-failed { border-color: rgba(220, 38, 38, .45); }
+.notify-head {
+  display: flex; align-items: center; gap: 8px;
+  min-height: 38px; padding: 6px 10px;
+  font-size: 12px; font-weight: 600; color: var(--lr-fg);
+}
+.notify-failed .notify-head { color: var(--lr-danger); }
+.notify-body { padding: 0 10px 8px; font-size: 13px; }
+.notify-event {
+  margin: 0; padding: 6px 10px 8px;
+  border-top: 1px solid rgba(127, 127, 127, .14);
+  font-family: ui-monospace, monospace; font-size: 12px;
+  color: var(--lr-fg-muted);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 30vh; overflow-y: auto;
 }
 .reasoning {
   align-self: stretch;
