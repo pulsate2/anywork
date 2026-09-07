@@ -160,12 +160,19 @@ func TestCodexPlanUpdate(t *testing.T) {
 		t.Fatalf("包装格式 plan 不对: %s (%v)", call.Args, err)
 	}
 
-	// 空快照不发事件。
+	// 空快照 = 关闭计划(实测 0.144.5):发空表,前端整表替换后面板消失。
 	empty, _ := json.Marshal(map[string]any{"plan": []map[string]string{}})
 	d.handleNotification("turn/plan/updated", empty)
+	ev = <-d.events
+	if call, ok := ev.Payload.(*ToolCallPayload); !ok || call.Tool != "update_plan" || !strings.Contains(call.Args, `"plan":[]`) {
+		t.Fatalf("空快照没当成关闭发出去: %+v", ev.Payload)
+	}
+	// 四个键一个都没有的通知不算计划事件,不能当清空。
+	noKeys, _ := json.Marshal(map[string]any{"threadId": "th"})
+	d.handleNotification("turn/plan/updated", noKeys)
 	select {
 	case ev := <-d.events:
-		t.Errorf("空 plan 多发了事件: %+v", ev)
+		t.Errorf("无 plan 键的通知多发了事件: %+v", ev)
 	default:
 	}
 }

@@ -1727,28 +1727,35 @@ type codexPlanStep struct {
 // emitPlanUpdate 计划快照合成 update_plan 工具调用(hapi plan_update 同款
 // 模型):前端任务面板认这个形状,整表替换。codex 的 status 是 camelCase
 // (inProgress),这里归一成前端认的 in_progress;未知状态一律 pending。
+// 空快照(plan:[])是"关闭计划"(实测 0.144.5):照发,前端整表替换成空、
+// 面板消失 —— 但 plan/update/items/steps 四个键一个都没有的通知不算,
+// 不能把无关通知当清空。
 func (d *codexDriver) emitPlanUpdate(raw json.RawMessage) {
 	var p struct {
-		Plan   []codexPlanStep `json:"plan"`
-		Update []codexPlanStep `json:"update"`
-		Items  []codexPlanStep `json:"items"`
-		Steps  []codexPlanStep `json:"steps"`
+		Plan   *[]codexPlanStep `json:"plan"`
+		Update *[]codexPlanStep `json:"update"`
+		Items  *[]codexPlanStep `json:"items"`
+		Steps  *[]codexPlanStep `json:"steps"`
 	}
-	if json.Unmarshal(raw, &p) != nil {
+	if json.Unmarshal(raw, &p) != nil || (p.Plan == nil && p.Update == nil && p.Items == nil && p.Steps == nil) {
 		return
 	}
 	steps := p.Plan
-	for _, alt := range [][]codexPlanStep{p.Update, p.Items, p.Steps} {
-		if len(steps) == 0 {
+	for _, alt := range []*[]codexPlanStep{p.Update, p.Items, p.Steps} {
+		if steps == nil {
 			steps = alt
 		}
+	}
+	var list []codexPlanStep
+	if steps != nil {
+		list = *steps
 	}
 	type step struct {
 		Step   string `json:"step"`
 		Status string `json:"status"`
 	}
-	out := make([]step, 0, len(steps))
-	for _, s := range steps {
+	out := make([]step, 0, len(list))
+	for _, s := range list {
 		if s.Step == "" {
 			continue
 		}
@@ -1760,9 +1767,6 @@ func (d *codexDriver) emitPlanUpdate(raw json.RawMessage) {
 			st = "completed"
 		}
 		out = append(out, step{Step: s.Step, Status: st})
-	}
-	if len(out) == 0 {
-		return
 	}
 	args, _ := json.Marshal(map[string]any{"plan": out})
 	d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
