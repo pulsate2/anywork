@@ -33,6 +33,7 @@ type codexDriver struct {
 	userInputs map[string]chan *userInputDecision // reqID(itemId) → 提问回答(nil = 取消)
 
 	threadID   string // codex thread id(续聊凭据)
+	turnID     string // 当前回合 id(task_started 带,turn/interrupt 必须指名)
 	permMode   string
 	model      string // 当前模型(thread/start 响应回填,运行中可改)
 	effort     string // 思考强度,每回合随 turn/start 下发
@@ -42,8 +43,16 @@ type codexDriver struct {
 	// CodexDiff 工具卡,前端渲染行级 diff —— ApplyPatch 通知里只有文件名,
 	// 真正的改动内容要走这个通知(对齐 hapi 的 DiffProcessor)。
 	lastTurnDiff string
-	closeOnce    sync.Once
-	exitErr      error
+	// 最近一次 thread/goal/updated 的 objective+status(去重键)。goal 通知
+	// 每个 token 计数变化都推一遍,只有目标/状态真的变了才发卡。
+	lastGoalKey string
+	// 多智能体工具调用的去重与配对:两条通道(v2 的 rawResponseItem/completed
+	// 裸函数调用、v1 的 collabagenttoolcall item)会报同一 call_id,只认先到
+	// 的;names 记进行中的调用(call_id → 工具名),output 来了收卡即忘。
+	agentToolSeen  map[string]bool
+	agentToolNames map[string]string
+	closeOnce      sync.Once
+	exitErr        error
 
 	events   chan Event
 	done     chan struct{}
@@ -52,11 +61,13 @@ type codexDriver struct {
 
 func newCodexDriver() *codexDriver {
 	return &codexDriver{
-		pending:    map[int]chan json.RawMessage{},
-		approvals:  map[string]chan int{},
-		userInputs: map[string]chan *userInputDecision{},
-		events:     make(chan Event, 128),
-		done:       make(chan struct{}),
+		pending:        map[int]chan json.RawMessage{},
+		approvals:      map[string]chan int{},
+		userInputs:     map[string]chan *userInputDecision{},
+		agentToolSeen:  map[string]bool{},
+		agentToolNames: map[string]string{},
+		events:         make(chan Event, 128),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -223,6 +234,12 @@ func (d *codexDriver) Send(text string) error {
 	if d.stdin == nil || d.threadID == "" {
 		return fmt.Errorf("会话未运行")
 	}
+	// /compact 主动压缩:app-server 不认这个斜杠命令(会被当普通文本喂给
+	// 模型),拦下来转 thread/compact/start RPC(参数只有 threadId,hapi
+	// compactThread 同款)。完成走 thread/compacted 通知,失败走 RPC 错误。
+	if t := strings.TrimSpace(text); t == "/compact" || strings.HasPrefix(t, "/compact ") {
+		return d.sendCompactLocked()
+	}
 	d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
 	params := map[string]any{
 		"threadId":       d.threadID,
@@ -239,6 +256,47 @@ func (d *codexDriver) Send(text string) error {
 		params["effort"] = d.effort
 	}
 	return d.asyncCall("turn/start", params)
+}
+
+// sendCompactLocked 主动压缩。必须在持有 mu 时调用(同 asyncCall 约定)。
+// 响应用 goroutine 等:失败/超时要自己回 idle,否则 StatusBar 永远停在
+// "运行中";成功路径的 idle 由 thread/compacted 通知负责(响应先到,
+// 完成以通知为准 —— hapi 也是两个信号都等)。
+func (d *codexDriver) sendCompactLocked() error {
+	threadID := d.threadID
+	d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
+	id, ch, err := d.sendLocked("thread/compact/start", map[string]any{"threadId": threadID})
+	if err != nil {
+		return err
+	}
+	go func() {
+		select {
+		case raw := <-ch:
+			// 错误事件已由 handleRPCResponse 发过,这里只把状态收回 idle。
+			if raw == nil {
+				d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+			}
+		case <-time.After(180 * time.Second):
+			d.mu.Lock()
+			delete(d.pending, id)
+			d.mu.Unlock()
+			d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: "压缩超时(180 秒未完成)"}})
+			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+		case <-d.done:
+		}
+	}()
+	return nil
+}
+
+// emitCompactIdle 压缩完成后的状态收尾:压缩不是回合,没有 turn/completed
+// 来回 idle,这里补。回合中发生的自动压缩(turnID 非空)不打扰回合状态。
+func (d *codexDriver) emitCompactIdle() {
+	d.mu.Lock()
+	idle := d.turnID == ""
+	d.mu.Unlock()
+	if idle {
+		d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+	}
 }
 
 // ApplySettings 运行中调整:存进 driver,下一回合 turn/start 生效(原生支持)。
@@ -264,11 +322,15 @@ func (d *codexDriver) Interrupt() error {
 	d.mu.Lock()
 	running := d.stdin != nil && d.threadID != ""
 	threadID := d.threadID
+	turnID := d.turnID
 	d.mu.Unlock()
 	if !running {
 		return fmt.Errorf("会话未运行")
 	}
-	_, err := d.call("turn/interrupt", map[string]any{"threadId": threadID}, 30*time.Second)
+	if turnID == "" {
+		return fmt.Errorf("回合尚未开始,没有可打断的回合")
+	}
+	_, err := d.call("turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}, 30*time.Second)
 	return err
 }
 
@@ -776,10 +838,28 @@ type codexItem struct {
 	Status           string          `json:"status"`
 	Server           string          `json:"server"`
 	Tool             string          `json:"tool"`
+	Name             string          `json:"name"`
 	Arguments        json.RawMessage `json:"arguments"`
 	Changes          json.RawMessage `json:"changes"`
 	Stdout           string          `json:"stdout"`
 	Success          *bool           `json:"success"`
+	Path             string          `json:"path"`
+	// 多智能体 v1 的 collabagenttoolcall item(字段 snake/camel 双拼)。
+	Prompt             string          `json:"prompt"`
+	AgentType          string          `json:"agent_type"`
+	AgentType2         string          `json:"agentType"`
+	ForkContext        *bool           `json:"fork_context"`
+	ForkContext2       *bool           `json:"forkContext"`
+	Model              string          `json:"model"`
+	ReasoningEffort    string          `json:"reasoning_effort"`
+	ReasoningEffort2   string          `json:"reasoningEffort"`
+	SenderThreadID     string          `json:"sender_thread_id"`
+	SenderThreadID2    string          `json:"senderThreadId"`
+	ReceiverThreadIDs  []string        `json:"receiver_thread_ids"`
+	ReceiverThreadIDs2 []string        `json:"receiverThreadIds"`
+	Targets            []string        `json:"targets"`
+	AgentsStates       json.RawMessage `json:"agents_states"`
+	AgentsStates2      json.RawMessage `json:"agentsStates"`
 }
 
 // codexItemParams item/started|completed 通知参数。itemId 顶层可能没有
@@ -814,12 +894,17 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 			Item      *codexItem `json:"item"`
 			ItemID    string     `json:"item_id"`
 			TurnID    string     `json:"turn_id"`
+			TurnID2   string     `json:"turnId"`
 			Error     string     `json:"error"`
 			WillRetry bool       `json:"will_retry"`
+			Delta     string     `json:"delta"`
+			Text      string     `json:"text"`
+			Message   string     `json:"message"`
 		}
 		if json.Unmarshal(wrapped.Msg, &m) != nil {
 			return
 		}
+		turnID := firstNonEmpty(m.TurnID, m.TurnID2)
 		// 包装层同样:item_id 可能没有,兜底 item.id。
 		itemID := m.ItemID
 		if itemID == "" && m.Item != nil {
@@ -832,14 +917,39 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 				verb = "completed"
 			}
 			d.handleItem(verb, itemID, m.Item)
+		case "agent_message_delta", "agent_message_content_delta":
+			// 流式增量:完整 agentMessage 随后 item_completed 落库,增量只广播。
+			if delta := firstNonEmpty(m.Delta, m.Text, m.Message); delta != "" {
+				d.emit(Event{Kind: KindAssistantDelta, Payload: delta})
+			}
+		case "reasoning_content_delta":
+			if delta := firstNonEmpty(m.Delta, m.Text, m.Message); delta != "" {
+				d.emit(Event{Kind: KindReasoningDelta, Payload: delta})
+			}
+		case "plan_update":
+			// 新版包装的计划快照:与老格式 turn/plan/updated 同一归一。
+			d.emitPlanUpdate(wrapped.Msg)
 		case "task_started":
+			// 记下回合 id:turn/interrupt 要指名打断哪个回合。
+			if turnID != "" {
+				d.mu.Lock()
+				d.turnID = turnID
+				d.mu.Unlock()
+			}
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
 		case "task_complete", "turn_aborted":
+			d.mu.Lock()
+			d.turnID = ""
+			d.mu.Unlock()
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
 		case "context_compacted":
 			// 上下文压缩完成(新版包装事件):不带 token 细节。
 			d.emit(Event{Kind: KindCompaction, Payload: &CompactionPayload{}})
+			d.emitCompactIdle()
 		case "task_failed":
+			d.mu.Lock()
+			d.turnID = ""
+			d.mu.Unlock()
 			if !m.WillRetry {
 				msg := m.Error
 				if msg == "" {
@@ -868,7 +978,102 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		}
 		d.handleItem(verb, p.id(), p.Item)
 
+	case "rawResponseItem/completed":
+		// 多智能体 v2 的裸函数调用(hapi 同款):functioncall 开卡、
+		// functioncalloutput 收卡,只认 8 个 agent 工具名。
+		d.handleRawAgentItem(params)
+
+	case "item/agentMessage/delta":
+		// 老格式流式增量(实测 0.144.5):{itemId, delta}。字段名版本间
+		// 有差异,delta/text/message 都认(hapi 同款)。
+		var p struct {
+			Delta   string `json:"delta"`
+			Text    string `json:"text"`
+			Message string `json:"message"`
+		}
+		json.Unmarshal(params, &p)
+		if delta := firstNonEmpty(p.Delta, p.Text, p.Message); delta != "" {
+			d.emit(Event{Kind: KindAssistantDelta, Payload: delta})
+		}
+
+	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta":
+		var p struct {
+			Delta   string `json:"delta"`
+			Text    string `json:"text"`
+			Message string `json:"message"`
+		}
+		json.Unmarshal(params, &p)
+		if delta := firstNonEmpty(p.Delta, p.Text, p.Message); delta != "" {
+			d.emit(Event{Kind: KindReasoningDelta, Payload: delta})
+		}
+
+	case "turn/plan/updated":
+		// 计划快照(实测 0.144.5):{plan:[{step,status}],explanation}。
+		// update_plan 工具本身不出 item 事件,只有这条通知 —— 不接的话
+		// 用户端完全看不见 codex 在推进计划。
+		d.emitPlanUpdate(params)
+
+	case "thread/goal/updated":
+		// 长期目标(实测 0.144.5):{goal:{objective,status,tokenBudget,
+		// tokensUsed,timeUsedSeconds}}。token 计数每次都推,只在目标或
+		// 状态变化时发一张卡。
+		var p struct {
+			Goal struct {
+				Objective   string `json:"objective"`
+				Status      string `json:"status"`
+				TokenBudget *int   `json:"tokenBudget"`
+				TokensUsed  int    `json:"tokensUsed"`
+			} `json:"goal"`
+		}
+		if json.Unmarshal(params, &p) != nil || p.Goal.Objective == "" {
+			return
+		}
+		key := p.Goal.Objective + "\x00" + p.Goal.Status
+		d.mu.Lock()
+		changed := d.lastGoalKey != key
+		d.lastGoalKey = key
+		d.mu.Unlock()
+		if !changed {
+			return
+		}
+		args := map[string]any{
+			"objective":  p.Goal.Objective,
+			"status":     p.Goal.Status,
+			"tokensUsed": p.Goal.TokensUsed,
+		}
+		if p.Goal.TokenBudget != nil {
+			args["tokenBudget"] = *p.Goal.TokenBudget
+		}
+		b, _ := json.Marshal(args)
+		d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+			Tool:      "CodexGoal",
+			ToolUseID: "codex-goal",
+			Args:      string(b),
+			State:     "ok",
+		}})
+
+	case "thread/goal/cleared":
+		// 目标清除:重置去重键,下一个新目标照常发卡。
+		d.mu.Lock()
+		d.lastGoalKey = ""
+		d.mu.Unlock()
+
 	case "turn/started":
+		// 实测 0.144.5:turnId 在 params.turn.id(嵌套),顶层 turnId 是
+		// item/* 通知的形状 —— 两种都认,别漏。
+		var p struct {
+			TurnID  string `json:"turnId"`
+			TurnID2 string `json:"turn_id"`
+			Turn    struct {
+				ID string `json:"id"`
+			} `json:"turn"`
+		}
+		json.Unmarshal(params, &p)
+		if tid := firstNonEmpty(p.TurnID, p.TurnID2, p.Turn.ID); tid != "" {
+			d.mu.Lock()
+			d.turnID = tid
+			d.mu.Unlock()
+		}
 		d.mu.Lock()
 		d.lastTurnDiff = "" // 回合开始:diff 计数归零
 		d.mu.Unlock()
@@ -915,6 +1120,9 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		json.Unmarshal(params, &p)
 		status := strings.ToLower(firstNonEmpty(p.Status, p.Turn.Status))
 		errMsg := firstNonEmpty(p.Error, p.Turn.Error.Message)
+		d.mu.Lock()
+		d.turnID = "" // 回合结束(含打断):清掉,下次 Interrupt 不至于拿旧 id
+		d.mu.Unlock()
 		switch status {
 		case "interrupted", "cancelled", "canceled":
 			// 打断不算失败:安静回到 idle。
@@ -930,21 +1138,29 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 	case "thread/compacted":
 		// 上下文压缩完成(老版通知):不带 token 细节,与新版包装事件同一归一。
 		d.emit(Event{Kind: KindCompaction, Payload: &CompactionPayload{}})
+		d.emitCompactIdle()
 
-	case "tokenCount", "token_count", "tokenUsage", "token_usage":
-		// 累计 token 用量(StatusBar 上下文占用)。params.info.total_token_usage
-		// 是整线程累计,codex 的 input 本就含缓存 —— 直接当上下文数用。
-		// 字段名 snake/camel 都认(app-server 版本间有差异)。
+	case "tokenCount", "token_count", "tokenUsage", "token_usage", "thread/tokenUsage/updated":
+		// 累计 token 用量(StatusBar 上下文占用)。两种形态都认:
+		// 老:params.info.total_token_usage.{input_tokens,cached_input_tokens,output_tokens}
+		// 新(thread/tokenUsage/updated,0.144+ 实测):params.tokenUsage.total.
+		//     {inputTokens,cachedInputTokens,outputTokens} + modelContextWindow。
+		// total 是整线程累计,codex 的 input 本就含缓存 —— 直接当上下文数用。
 		var p struct {
 			Info struct {
 				Total json.RawMessage `json:"total_token_usage"`
 			} `json:"info"`
-			Total json.RawMessage `json:"total_token_usage"`
+			Total      json.RawMessage `json:"total_token_usage"`
+			TokenUsage struct {
+				Total  json.RawMessage `json:"total"`
+				Window int             `json:"modelContextWindow"`
+			} `json:"tokenUsage"`
+			Window int `json:"modelContextWindow"`
 		}
 		if json.Unmarshal(params, &p) != nil {
 			return
 		}
-		raw := firstNonEmpty(string(p.Info.Total), string(p.Total))
+		raw := firstNonEmpty(string(p.Info.Total), string(p.Total), string(p.TokenUsage.Total))
 		if raw == "" {
 			return
 		}
@@ -965,10 +1181,14 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		if in+cached+out <= 0 {
 			return
 		}
+		// 新通知自带真实窗口大小,透传给 StatusBar(老通知没有,窗口由
+		// result 的 modelUsage 另行补)。
+		window := firstNonZero(p.TokenUsage.Window, p.Window)
 		d.emit(Event{Kind: KindUsage, Payload: &UsagePayload{
 			Context:   in, // codex 的 input 含缓存,不再加 cached
 			Output:    out,
 			CacheRead: cached,
+			Window:    window,
 		}})
 
 	case "error":
@@ -1079,7 +1299,9 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 			if item.Success != nil && !*item.Success {
 				state = "error"
 			}
-			result := firstNonEmpty(item.Stdout, item.Output)
+			// 失败原因在 item.error(bwrap 权限错误等);不带上失败卡片只有
+			// 一个红点,看不出为什么失败。
+			result := firstNonEmpty(item.Error, item.Stdout, item.Output)
 			if item.Stderr != "" {
 				result += "\n[stderr] " + item.Stderr
 			}
@@ -1088,6 +1310,69 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 				Result:    truncate(result, 16*1024),
 				State:     state,
 			}})
+		}
+
+	case "imageview":
+		// view_image 工具(实测 0.144.5):item 只有 path,图本身不回传,
+		// 模型看完会在正文里描述。发一张卡让人知道它看了哪张图。
+		if verb == "started" {
+			args, _ := json.Marshal(map[string]string{"path": item.Path})
+			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+				Tool:      "view_image",
+				ToolUseID: itemID,
+				Args:      string(args),
+				State:     "running",
+			}})
+		} else {
+			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+				ToolUseID: itemID,
+				State:     "ok",
+			}})
+		}
+
+	case "collabagenttoolcall":
+		// 多智能体 v1 item(hapi 同款):started 开卡、completed 收卡。
+		// v2 的 rawResponseItem/completed 若已对同一 call_id 发过卡(seen 有
+		// 记录),这里整条丢弃 —— 两条通道只认先到的;本通道自己不标记
+		// seen,否则 completed 会被自己的 started 挡掉。
+		if d.agentToolSeen[itemID] {
+			return
+		}
+		tool := normalizeCollabAgentToolName(firstNonEmpty(item.Tool, item.Name))
+		if tool == "" {
+			// completed 的 item 可能不带 tool 字段:用 started 时记下的名字。
+			tool = d.agentToolNames[itemID]
+		}
+		if tool == "" {
+			return
+		}
+		if verb == "started" {
+			d.agentToolNames[itemID] = tool
+			args, _ := json.Marshal(buildCollabAgentInput(item, tool))
+			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+				Tool:      tool,
+				ToolUseID: itemID,
+				Args:      truncate(string(args), 16*1024),
+				State:     "running",
+			}})
+		} else {
+			state := "ok"
+			if n := normalizeCodexItemType(item.Status); n == "failed" || n == "error" {
+				state = "error"
+			}
+			out, _ := json.Marshal(buildCollabAgentOutput(item, tool))
+			call := &ToolCallPayload{
+				ToolUseID: itemID,
+				Result:    truncate(string(out), 16*1024),
+				State:     state,
+			}
+			// started 没见过(事件序异常)就带全字段发,别落一张没工具名的空卡。
+			if _, ok := d.agentToolNames[itemID]; !ok {
+				call.Tool = tool
+			} else {
+				delete(d.agentToolNames, itemID)
+			}
+			d.emit(Event{Kind: KindToolCall, Payload: call})
 		}
 
 	case "mcptoolcall":
@@ -1123,6 +1408,369 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 
 func normalizeCodexItemType(t string) string {
 	return strings.ToLower(strings.NewReplacer(" ", "", "_", "", "-", "").Replace(t))
+}
+
+// normalizeCodexAgentToolName 多智能体工具名归一(hapi 同款):抹掉大小写、
+// 空格和 _- 后查表;不在表内的返回空(不是 agent 调用)。归一后的 8 个
+// 名字在前端 UNGROUPABLE_TOOLS 里,各自独立成卡。
+func normalizeCodexAgentToolName(name string) string {
+	switch normalizeCodexItemType(name) {
+	case "spawnagent", "spawn":
+		return "spawn_agent"
+	case "sendinput":
+		return "send_input"
+	case "sendmessage":
+		return "send_message"
+	case "resumeagent", "resume":
+		return "resume_agent"
+	case "followuptask", "assigntask":
+		return "followup_task"
+	case "waitagent", "wait":
+		return "wait_agent"
+	case "closeagent", "close":
+		return "close_agent"
+	case "interruptagent":
+		return "interrupt_agent"
+	case "listagents":
+		return "list_agents"
+	}
+	return ""
+}
+
+// normalizeCollabAgentToolName v1 collabagenttoolcall 只认 5 个有完整
+// item 生命周期的工具(hapi 同款);其余走 v2 裸调用通道。
+func normalizeCollabAgentToolName(name string) string {
+	switch tool := normalizeCodexAgentToolName(name); tool {
+	case "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent":
+		return tool
+	}
+	return ""
+}
+
+// handleRawAgentItem 多智能体 v2 的裸函数调用。v1 有自己的
+// collabagenttoolcall item,这里先排除 multi_agent_v1 固定命名空间,再按
+// 参数形状辨认 v2(spawn_agent 必须带 task_name、wait_agent 不能带 targets
+// 数组);与 v1 通道同一 call_id 只认先到的(hapi 同款)。
+func (d *codexDriver) handleRawAgentItem(params json.RawMessage) {
+	var p struct {
+		Item struct {
+			Type      string          `json:"type"`
+			CallID    string          `json:"call_id"`
+			CallID2   string          `json:"callId"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+			Namespace string          `json:"namespace"`
+			Output    json.RawMessage `json:"output"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return
+	}
+	callID := firstNonEmpty(p.Item.CallID, p.Item.CallID2)
+	if callID == "" {
+		return
+	}
+	switch normalizeCodexItemType(p.Item.Type) {
+	case "functioncall":
+		tool := normalizeCodexAgentToolName(p.Item.Name)
+		input := parseRawToolInput(p.Item.Arguments)
+		if tool == "" || d.agentToolSeen[callID] ||
+			!isRawMultiAgentV2Call(tool, input, p.Item.Namespace) {
+			return
+		}
+		d.agentToolSeen[callID] = true
+		d.agentToolNames[callID] = tool
+		args, _ := json.Marshal(input)
+		d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+			Tool:      tool,
+			ToolUseID: callID,
+			Args:      truncate(string(args), 16*1024),
+			State:     "running",
+		}})
+	case "functioncalloutput":
+		if _, ok := d.agentToolNames[callID]; !ok {
+			return
+		}
+		delete(d.agentToolNames, callID)
+		d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+			ToolUseID: callID,
+			Result:    truncate(rawOutputString(p.Item.Output), 16*1024),
+			State:     "ok",
+		}})
+	}
+}
+
+// isRawMultiAgentV2Call v2 裸调用的辨认规则(hapi 同款):命名空间可配置,
+// 只有 v1 的固定命名空间能排除;四个纯消息类工具直接放行,spawn/wait
+// 靠参数形状区分(v1 的 spawn 没有 task_name,wait 带 targets 数组)。
+func isRawMultiAgentV2Call(tool string, input map[string]any, namespace string) bool {
+	if namespace == "multi_agent_v1" {
+		return false
+	}
+	switch tool {
+	case "send_message", "followup_task", "interrupt_agent", "list_agents":
+		return true
+	case "spawn_agent":
+		return strField(input, "task_name", "taskName") != ""
+	case "wait_agent":
+		_, isArray := input["targets"].([]any)
+		return !isArray
+	}
+	return false
+}
+
+// parseRawToolInput v2 裸调用的 arguments 是 JSON 字符串包着对象;解开
+// 失败时当普通文本保留(原样塞进 input,详情弹窗里还能看)。
+func parseRawToolInput(raw json.RawMessage) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		var m map[string]any
+		if json.Unmarshal([]byte(s), &m) == nil && m != nil {
+			return m
+		}
+		return map[string]any{"input": s}
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) == nil && m != nil {
+		return m
+	}
+	return map[string]any{}
+}
+
+// rawOutputString v2 裸调用的 output:JSON 字符串解开用,其他形状原样序列化。
+func rawOutputString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return string(raw)
+}
+
+// buildCollabAgentInput v1 collabagenttoolcall 的入参归一(hapi 同款):
+// prompt/message → message,receiverThreadIds/targets → targets(单目标
+// 工具再取首元素作 target),其余可选字段直传。
+func buildCollabAgentInput(item *codexItem, tool string) map[string]any {
+	targets := firstNonEmptySlice(item.ReceiverThreadIDs, item.ReceiverThreadIDs2, item.Targets)
+	input := map[string]any{}
+	if prompt := firstNonEmpty(item.Prompt, item.Message); prompt != "" {
+		input["message"] = prompt
+	}
+	if v := firstNonEmpty(item.AgentType, item.AgentType2); v != "" {
+		input["agent_type"] = v
+	}
+	if item.ForkContext != nil {
+		input["fork_context"] = *item.ForkContext
+	} else if item.ForkContext2 != nil {
+		input["fork_context"] = *item.ForkContext2
+	}
+	if item.Model != "" {
+		input["model"] = item.Model
+	}
+	if v := firstNonEmpty(item.ReasoningEffort, item.ReasoningEffort2); v != "" {
+		input["reasoning_effort"] = v
+	}
+	if v := firstNonEmpty(item.SenderThreadID, item.SenderThreadID2); v != "" {
+		input["sender_thread_id"] = v
+	}
+	if len(targets) > 0 {
+		input["targets"] = targets
+		if tool == "close_agent" || tool == "send_input" || tool == "resume_agent" {
+			input["target"] = targets[0]
+		}
+	}
+	return input
+}
+
+// buildCollabAgentOutput v1 collabagenttoolcall 的结果归一(hapi 同款,
+// 各工具挑重点):spawn→agent_id+状态表;wait→逐 agent 状态归一;
+// close→previous_status;其余 targets+status+错误附状态表。
+func buildCollabAgentOutput(item *codexItem, tool string) map[string]any {
+	targets := firstNonEmptySlice(item.ReceiverThreadIDs, item.ReceiverThreadIDs2, item.Targets)
+	states := agentStatesMap(item)
+	out := map[string]any{}
+	errMsg := firstNonEmpty(item.Error, item.Message)
+	if errMsg != "" {
+		out["error"] = errMsg
+		out["message"] = errMsg
+	}
+	switch tool {
+	case "spawn_agent":
+		if len(targets) > 0 {
+			out["agent_id"] = targets[0]
+		}
+		if item.Status != "" {
+			out["status"] = item.Status
+		}
+		if len(states) > 0 {
+			out["agentsStates"] = states
+		}
+	case "wait_agent":
+		normalized := map[string]any{}
+		for id, st := range states {
+			normalized[id] = statusObjectFromAgentState(st)
+		}
+		out["status"] = normalized
+		out["timed_out"] = item.Status == "timedOut" || item.Status == "timed_out"
+	case "close_agent":
+		var first any
+		if len(targets) > 0 {
+			first = states[targets[0]]
+		}
+		if first == nil {
+			for _, v := range states {
+				first = v
+				break
+			}
+		}
+		out["previous_status"] = statusObjectFromAgentState(first)
+		if len(targets) > 0 {
+			out["agent_id"] = targets[0]
+		}
+	default:
+		if len(targets) > 0 {
+			out["targets"] = targets
+		}
+		if item.Status != "" {
+			out["status"] = item.Status
+		}
+		if len(states) > 0 {
+			out["agentsStates"] = states
+		}
+	}
+	return out
+}
+
+// agentStatesMap item.agentsStates(对象 map),snake/camel 双拼。
+func agentStatesMap(item *codexItem) map[string]any {
+	raw := item.AgentsStates
+	if len(raw) == 0 {
+		raw = item.AgentsStates2
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil
+	}
+	return m
+}
+
+// statusObjectFromAgentState agent 状态对象归一(hapi 同款):完成/失败/
+// 取消带消息的压缩成 {"completed": 消息} 形态,完成的没消息补 status,
+// 其余原样。
+func statusObjectFromAgentState(value any) any {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	msg := strField(m, "message", "output", "result", "finalMessage", "final_message")
+	status, _ := m["status"].(string)
+	if status == "" {
+		status, _ = m["state"].(string)
+	}
+	n := normalizeCodexItemType(status)
+	completed := n == "completed" || n == "complete" || n == "done" ||
+		m["completed"] == true || m["done"] == true
+	if completed && msg != "" {
+		return map[string]any{"completed": msg}
+	}
+	if completed {
+		clone := make(map[string]any, len(m)+1)
+		for k, v := range m {
+			clone[k] = v
+		}
+		clone["status"] = "completed"
+		return clone
+	}
+	if (n == "failed" || n == "error") && msg != "" {
+		return map[string]any{"failed": msg}
+	}
+	if (n == "canceled" || n == "cancelled") && msg != "" {
+		return map[string]any{"canceled": msg}
+	}
+	return value
+}
+
+// strField map 里按顺序取第一个非空字符串字段。
+func strField(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s, ok := m[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// firstNonEmptySlice 第一组非空切片(hapi extractStringArray 的取值部分)。
+func firstNonEmptySlice(vals ...[]string) []string {
+	for _, v := range vals {
+		if len(v) > 0 {
+			return v
+		}
+	}
+	return nil
+}
+
+// codexPlanStep 计划快照里的一步(实测 0.144.5:turn/plan/updated 的 plan 数组)。
+type codexPlanStep struct {
+	Step   string `json:"step"`
+	Status string `json:"status"`
+}
+
+// emitPlanUpdate 计划快照合成 update_plan 工具调用(hapi plan_update 同款
+// 模型):前端任务面板认这个形状,整表替换。codex 的 status 是 camelCase
+// (inProgress),这里归一成前端认的 in_progress;未知状态一律 pending。
+func (d *codexDriver) emitPlanUpdate(raw json.RawMessage) {
+	var p struct {
+		Plan   []codexPlanStep `json:"plan"`
+		Update []codexPlanStep `json:"update"`
+		Items  []codexPlanStep `json:"items"`
+		Steps  []codexPlanStep `json:"steps"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return
+	}
+	steps := p.Plan
+	for _, alt := range [][]codexPlanStep{p.Update, p.Items, p.Steps} {
+		if len(steps) == 0 {
+			steps = alt
+		}
+	}
+	type step struct {
+		Step   string `json:"step"`
+		Status string `json:"status"`
+	}
+	out := make([]step, 0, len(steps))
+	for _, s := range steps {
+		if s.Step == "" {
+			continue
+		}
+		st := "pending"
+		switch normalizeCodexItemType(s.Status) {
+		case "inprogress", "active", "running":
+			st = "in_progress"
+		case "completed", "complete", "done":
+			st = "completed"
+		}
+		out = append(out, step{Step: s.Step, Status: st})
+	}
+	if len(out) == 0 {
+		return
+	}
+	args, _ := json.Marshal(map[string]any{"plan": out})
+	d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+		Tool:      "update_plan",
+		ToolUseID: "codex-plan",
+		Args:      string(args),
+		State:     "ok",
+	}})
 }
 
 // codexItemText agentMessage 正文:text/message/content(字符串或块数组)。

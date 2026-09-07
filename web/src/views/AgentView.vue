@@ -278,7 +278,9 @@ const cards = computed<Card[]>(() => {
         break
       case 'error': {
         const p = ev.payload as { message?: string } | null
-        out.push({ key: `m${ev.seq}`, kind: 'error', text: p?.message || String(ev.payload) })
+        // message 为空时不能拿 payload 对象兜底 —— 模板插值对象会渲染成
+        // "[object Object]"(中断回合曾落过空 message 的 error 事件)。
+        out.push({ key: `m${ev.seq}`, kind: 'error', text: p?.message || (typeof ev.payload === 'string' ? ev.payload : '发生错误') })
         break
       }
       case 'compaction': {
@@ -387,6 +389,8 @@ const UNGROUPABLE_TOOLS = new Set([
   'followup_task', 'wait_agent', 'close_agent', 'interrupt_agent', 'list_agents',
   // 计划类:进任务面板或单独成卡
   'TodoWrite', 'update_plan', 'ExitPlanMode', 'exit_plan_mode', 'CodexReasoning',
+  // codex 长期目标:里程碑级,单独成卡
+  'CodexGoal',
 ])
 
 // compactionText 压缩提示文案(hapi SystemMessage 同款语义):微压缩报省下

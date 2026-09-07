@@ -47,11 +47,12 @@ function parseArgs(): Record<string, unknown> | null {
   return null
 }
 
-// 摘要行给一眼能认出的关键参数:命令(Bash 的 command)、路径、文件名。
+// 摘要行给一眼能认出的关键参数:命令(Bash 的 command)、路径、文件名,
+// 多智能体工具(spawn_agent 的 task_name、send_message 的 message 等)。
 const brief = computed(() => {
   const args = parseArgs()
   if (!args) return ''
-  for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query']) {
+  for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'task_name', 'target', 'message']) {
     if (typeof args[key] === 'string' && (args[key] as string)) return args[key] as string
   }
   const first = Object.values(args)[0]
@@ -203,6 +204,13 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
   if (t !== 'Write' && oldStr === '' && newStr === '') return null
   return [{ old: oldStr, new: newStr, path: filePath } as DiffBlock]
 })
+
+// codex 的改动卡(ApplyPatch/CodexDiff)结果本身是空的,把 diff 直接铺在
+// 卡片里(hapi CodexDiffView 同款观感)——只靠一行摘要 + 点弹窗,远端
+// 看起来就像"空的工具执行"。
+const inlineDiff = computed(() =>
+  diffBlocks.value && (props.call.tool === 'ApplyPatch' || props.call.tool === 'CodexDiff'),
+)
 </script>
 
 <template>
@@ -213,6 +221,13 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
       <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
       <span class="tool-state">{{ stateLabel }}</span>
     </button>
+    <!-- codex 改动卡:diff 直接铺在卡片里,不用点开就能看见改了什么 -->
+    <div v-if="inlineDiff" class="tool-inline-diff">
+      <DiffView
+        v-for="(b, i) in diffBlocks" :key="i"
+        :old="b.old" :new="b.new" :file-path="(b as any).path || codexDiffBrief || applyPatchBrief || ''"
+      />
+    </div>
     <!-- 结果里的图片:缩略图条(点击放大),弹窗里也有全量 -->
     <div v-if="imageUrls.length" class="tool-imgs">
       <button v-for="(u, i) in imageUrls" :key="u" type="button" class="tool-img" @click.stop="lightbox = u">
@@ -293,6 +308,11 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
 .tool-brief::-webkit-scrollbar { display: none; }
 .tool-state { flex: none; font-size: 11px; color: var(--lr-fg-muted); }
 .tool-card.error .tool-state { color: var(--lr-danger); }
+/* 内铺 diff:多块之间只留 1px 分隔;正文高度收紧(时间线上只是扫一眼,
+   完整内容仍在详情弹窗),超出内部滚动,不把手机时间线滚穿 */
+.tool-inline-diff { border-top: 1px solid rgba(127, 127, 127, .14); }
+.tool-inline-diff .diff-view + .diff-view { border-top: 1px solid rgba(127, 127, 127, .14); }
+.tool-inline-diff :deep(.diff-body) { max-height: 180px; }
 /* 结果缩略图条:小方图,横向可滚;点击在时间线上直接放大,不必先进详情 */
 .tool-imgs {
   display: flex; gap: 6px; padding: 6px 10px 8px;

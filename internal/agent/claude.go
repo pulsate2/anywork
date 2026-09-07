@@ -614,14 +614,27 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 			// 权限询问:单独 goroutine 处理,不阻塞读循环
 			// (claude 在等答复的同时还会继续输出 thinking/progress)。
 			go d.handleCanUseTool(msg.RequestID, msg.Request)
-		case "assistant":
-			d.handleAssistant(msg.Message)
-		case "user":
-			d.handleUserEcho(msg.Message)
+		case "assistant", "user":
+			// parent_tool_use_id 非空 = 子 agent(Task 工具)自己的流:
+			// 文本/思考/工具调用与结果都不进主时间线(hapi isSidechain 同款
+			// 语义)。主 agent 的 Task 卡本身不受影响 —— 它的 tool_use 与
+			// tool_result 都在父级,不带 parent id。顺带把子 agent 的 usage
+			// 也挡在 StatusBar 外(子 agent 上下文小得多,放进来会让占用
+			// 读数中途塌陷再弹回)。
+			if msg.ParentToolUseID != "" {
+				continue
+			}
+			if msg.Type == "assistant" {
+				d.handleAssistant(msg.Message)
+			} else {
+				d.handleUserEcho(msg.Message)
+			}
 		case "stream_event":
 			d.handleStreamEvent(msg)
 		case "result":
-			if msg.IsError {
+			// 打断的回合也是 is_error,但 result 为空:用户自己按的中断,
+			// 不报错(报了也是空 message 的错误卡)。真失败带 result 文本。
+			if msg.IsError && strings.TrimSpace(msg.Result) != "" {
 				d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(msg.Result, 4000)}})
 			}
 			// result 行的 usage 是回合最后一次 API 调用的计数,是最准的期末值。

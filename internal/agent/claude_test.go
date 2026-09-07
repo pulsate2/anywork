@@ -331,3 +331,51 @@ func waitWritten(t *testing.T, stdin *bufCloser) {
 	}
 	t.Fatal("2 秒内没等到 stdin 回写")
 }
+
+// TestClaudeSidechainFiltered parent_tool_use_id 非空的 assistant/user 行是
+// 子 agent(Task 工具)自己的流:文本/思考/工具调用/结果/usage 一律不进
+// 主时间线;主 agent 自己的 Task 卡(不带 parent id)照常透出。
+func TestClaudeSidechainFiltered(t *testing.T) {
+	d := newClaudeDriver()
+	lines := []string{
+		// 主 agent:发起 Task 工具(无 parent id)→ 正常发卡。
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-main","name":"Task","input":{"prompt":"调研去"}}]}}`,
+		// 子 agent 的 assistant 行:parent_tool_use_id 指向 Task 调用。
+		`{"type":"assistant","parent_tool_use_id":"t-main","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"子 agent 的碎碎念"},{"type":"thinking","thinking":"子 agent 的思考"}],"usage":{"input_tokens":10,"output_tokens":5}}}`,
+		// 子 agent 自己的工具调用与结果:同样带 parent id。
+		`{"type":"assistant","parent_tool_use_id":"t-main","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-sub","name":"Read","input":{"file_path":"/tmp/x"}}]}}`,
+		`{"type":"user","parent_tool_use_id":"t-main","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-sub","content":"子 agent 的读文件结果"}]}}`,
+		// Task 收尾:tool_result 在父级(不带 parent id)→ 正常回填。
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-main","content":"调研结论:可以"}]}}`,
+	}
+	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+
+	// 期望只有两张卡:Task 运行中 → Task 完成。子 agent 的四条全被过滤。
+	want := []struct {
+		id    string
+		tool  string
+		state string
+	}{
+		{"t-main", "Task", "running"},
+		{"t-main", "Task", "ok"},
+	}
+	for i, w := range want {
+		select {
+		case ev := <-d.events:
+			call, ok := ev.Payload.(*ToolCallPayload)
+			if !ok || ev.Kind != KindToolCall {
+				t.Fatalf("事件 %d: %+v(%T),想要工具卡", i, ev.Payload, ev.Payload)
+			}
+			if call.ToolUseID != w.id || call.Tool != w.tool || call.State != w.state {
+				t.Fatalf("事件 %d: %+v,想要 {%s %s %s}", i, call, w.id, w.tool, w.state)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("事件 %d:2 秒内没等到", i)
+		}
+	}
+	select {
+	case ev := <-d.events:
+		t.Fatalf("子 agent 的输出漏进了主时间线: %+v", ev.Payload)
+	case <-time.After(300 * time.Millisecond):
+	}
+}

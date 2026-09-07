@@ -29,7 +29,7 @@ const KIND_LABEL: Record<Kind, string> = {
 }
 
 function actionKind(tool: string): Kind {
-  if (tool === 'Read' || tool === 'NotebookRead' || tool === 'LS') return 'read'
+  if (tool === 'Read' || tool === 'NotebookRead' || tool === 'LS' || tool === 'view_image') return 'read'
   if (tool === 'Grep' || tool === 'Glob') return 'search'
   if (tool === 'Bash' || tool === 'CodexBash' || tool === 'shell_command' || tool === 'run_shell_command') return 'command'
   if (['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'CodexPatch', 'CodexDiff', 'ApplyPatch'].includes(tool)) return 'mutation'
