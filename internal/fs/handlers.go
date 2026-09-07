@@ -3,6 +3,7 @@ package fs
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mime"
 	"net/http"
 	"os"
@@ -29,9 +30,13 @@ func (h *Handlers) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entries)
 }
 
+// MaxPreviewSize 文本预览的大小上限:全文读进浏览器再高亮,几 MB 就开始卡,
+// 超过一律拒绝,引导下载。编辑另有更紧的 512KB 上限(前端 MAX_EDIT)。
+const MaxPreviewSize = 5 << 20
+
 func (h *Handlers) Read(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
-	f, _, binary, err := h.svc.ReadInfo(p)
+	f, size, binary, err := h.svc.ReadInfo(p)
 	if err != nil {
 		h.httpErr(w, err)
 		return
@@ -39,6 +44,10 @@ func (h *Handlers) Read(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	if binary {
 		http.Error(w, "binary cannot be read", http.StatusBadRequest)
+		return
+	}
+	if size > MaxPreviewSize {
+		http.Error(w, fmt.Sprintf("文件超过 5MB(%s),不支持预览,请下载查看", sizeHuman(size)), http.StatusRequestEntityTooLarge)
 		return
 	}
 	fi, _ := f.Stat()
@@ -225,6 +234,34 @@ func (h *Handlers) ListArchive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "truncated": truncated})
 }
 
+// SqliteInfo 数据库概览:表列表 + 每表行数(预览用,只读)。
+func (h *Handlers) SqliteInfo(w http.ResponseWriter, r *http.Request) {
+	tables, version, err := h.svc.SqliteInfo(r.URL.Query().Get("path"))
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tables": tables, "userVersion": version})
+}
+
+// SqliteRows 某表一页行数据(预览用,只读)。
+func (h *Handlers) SqliteRows(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	data, err := h.svc.SqliteRows(q.Get("path"), SqliteRowsOptions{
+		Table:  q.Get("table"),
+		Offset: offset,
+		Limit:  limit,
+	})
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, data)
+}
+
+
 func (h *Handlers) ExtractArchive(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Dest    string `json:"dest"`
@@ -278,4 +315,15 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
+}
+
+// sizeHuman 错误信息里的字节数可读化(backup 包里有个同款,但跨包引用就为这一处不值得)。
+func sizeHuman(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	if n < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%.1f MB", float64(n)/1024/1024)
 }

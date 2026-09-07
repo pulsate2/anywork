@@ -252,6 +252,8 @@ func (a *App) routes() http.Handler {
 		pr.Post("/api/fs/op", a.fs.Op)
 		pr.Get("/api/fs/archive", a.fs.CreateArchive)
 		pr.Get("/api/fs/archive/list", a.fs.ListArchive)
+		pr.Get("/api/fs/sqlite", a.fs.SqliteInfo)
+		pr.Get("/api/fs/sqlite/rows", a.fs.SqliteRows)
 		pr.Post("/api/fs/extract", a.fs.ExtractArchive)
 		pr.Post("/api/fs/compress", a.fs.Compress)
 

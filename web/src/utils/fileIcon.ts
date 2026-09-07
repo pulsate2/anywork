@@ -140,6 +140,8 @@ const extMap: Record<string, FileIcon> = {
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'svg'])
 // 压缩包同理:F2b 走条目列表而不是文本。tar.gz 只取最后一段扩展名 gz,已在集合里。
 const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'tbz2', 'xz', 'txz', 'rar', '7z'])
+// SQLite 数据库同理:走 表列表+数据表格 的专用预览,而不是文本。
+const SQLITE_EXTS = new Set(['db', 'sqlite', 'sqlite3', 'db3', 's3db'])
 
 function basename(path: string): string {
   return path.split(/[/\\]/).filter(Boolean).pop() || path
@@ -159,6 +161,10 @@ export function isImagePath(path: string): boolean {
 
 export function isArchivePath(path: string): boolean {
   return ARCHIVE_EXTS.has(extOf(path))
+}
+
+export function isSqlitePath(path: string): boolean {
+  return SQLITE_EXTS.has(extOf(path))
 }
 
 export function isMarkdownPath(path: string): boolean {

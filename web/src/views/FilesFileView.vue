@@ -7,17 +7,17 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NButton, NIcon, NSpin, NEmpty, NInput, useMessage,
+  NButton, NIcon, NSpin, NEmpty, NInput, NModal, useMessage,
 } from 'naive-ui'
 import {
-  ChevronBackOutline, SearchOutline, CreateOutline, SaveOutline,
+  ChevronBackOutline, ChevronForwardOutline, SearchOutline, CreateOutline, SaveOutline,
   CloseOutline, ChevronUpOutline, ChevronDownOutline, SwapHorizontalOutline,
   ArrowUndoOutline, ArrowRedoOutline, EyeOutline, CodeOutline, DownloadOutline,
 } from '@vicons/ionicons5'
-import { api, type FsArchiveEntry } from '@/api/client'
+import { api, type FsArchiveEntry, type FsSqliteInfo, type FsSqliteRows } from '@/api/client'
 import { highlightCode } from '@/utils/highlight'
 import { renderMarkdown } from '@/utils/markdown'
-import { fileIcon, isArchivePath, isImagePath, isMarkdownPath } from '@/utils/fileIcon'
+import { fileIcon, isArchivePath, isImagePath, isMarkdownPath, isSqlitePath } from '@/utils/fileIcon'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,8 +33,8 @@ function basename(p: string): string {
 
 const MAX_EDIT = 512 * 1024
 
-// 按扩展名一次定型:图片/压缩包都是二进制,读正文只会拿到 400。
-const kind = isImagePath(path) ? 'image' : isArchivePath(path) ? 'archive' : 'text'
+// 按扩展名一次定型:图片/压缩包/sqlite 库都是二进制,读正文只会拿到 400。
+const kind = isImagePath(path) ? 'image' : isArchivePath(path) ? 'archive' : isSqlitePath(path) ? 'sqlite' : 'text'
 const isMd = isMarkdownPath(path)
 // 搜索结果带过来的命中行号(没有则 0)。
 const targetLine = Number(route.query.line) || 0
@@ -50,6 +50,101 @@ const loading = ref(false)
 const archiveEntries = ref<FsArchiveEntry[]>([])
 const archiveTruncated = ref(false)
 
+// ---- sqlite 数据库预览 ----
+// 左侧表列表 + 右侧数据表格。行数据按页取(后端 LIMIT/OFFSET),行数未知(-1)
+// 时只能翻页到底才知道有没有更多,首页没有数据就停。
+const sqliteTables = ref<FsSqliteInfo['tables']>([])
+const sqliteTable = ref('') // 当前表名
+const sqliteColumns = ref<FsSqliteRows['columns']>([])
+const sqliteData = ref<FsSqliteRows['rows']>([])
+const sqliteTotal = ref(0) // -1 = 未知(超大表 COUNT 超时)
+const sqlitePage = ref(0)
+const sqlitePageSize = 200 // 与后端 SqliteRowsLimit 保持一致
+const sqliteCounting = ref(false) // 正在取某页数据
+
+const sqlitePages = computed(() => {
+  if (sqliteTotal.value < 0) return 0
+  return Math.max(1, Math.ceil(sqliteTotal.value / sqlitePageSize))
+})
+
+function sqliteCountText(n: number): string {
+  if (n < 0) return '行数未知'
+  return n.toLocaleString() + ' 行'
+}
+
+async function openSqliteTable(table: string) {
+  sqliteTable.value = table
+  sqlitePage.value = 0
+  await loadSqlitePage()
+}
+
+async function loadSqlitePage() {
+  sqliteCounting.value = true
+  try {
+    const out = await api.fsSqliteRows(path, sqliteTable.value, sqlitePage.value * sqlitePageSize)
+    sqliteColumns.value = out.columns
+    sqliteData.value = out.rows
+    sqliteTotal.value = out.total
+  } catch (e: any) {
+    message.error(`读取表失败:${e?.message || e || '未知错误'}`)
+    sqliteData.value = []
+  } finally {
+    sqliteCounting.value = false
+  }
+}
+
+async function sqliteGoto(delta: number) {
+  const next = sqlitePage.value + delta
+  if (next < 0) return
+  // 行数未知(-1)时允许一直往后翻,由"本页为空"止步。
+  if (sqliteTotal.value >= 0 && next >= sqlitePages.value) return
+  sqlitePage.value = next
+  await loadSqlitePage()
+  if (sqliteTotal.value < 0 && !sqliteData.value.length && next > 0) {
+    // 翻过头了:退回上一页,并把它当最后一页。
+    sqlitePage.value = next - 1
+    await loadSqlitePage()
+  }
+}
+
+// 单元格显示:BLOB(后端 "blob:" 前缀)截短显示;NULL 显示为 NULL 斜体占位。
+function sqliteCellText(v: number | boolean | string | null): string {
+  if (v === null) return 'NULL'
+  if (typeof v === 'string' && v.startsWith('blob:')) {
+    const b64 = v.slice(5)
+    return `[BLOB ${Math.floor(b64.length * 3 / 4)} 字节]`
+  }
+  return String(v)
+}
+
+// ---- 单元格详情弹窗 ----
+// 格子受 max-width + ellipsis 截断,点开看完整值。BLOB 给 base64 原文(可复制)。
+interface CellDetail {
+  column: string
+  type: string
+  value: number | boolean | string | null
+  blob: null | string // BLOB 的 base64 原文;非 blob 为 null
+  text: string // 完整可读文本(BLOB 格子为空,详情区另行展示)
+}
+const cellDetail = ref<CellDetail | null>(null)
+
+function openCellDetail(rowIdx: number, colIdx: number) {
+  const col = sqliteColumns.value[colIdx]
+  if (!col) return
+  const v = sqliteData.value[rowIdx]?.[colIdx]
+  if (v === undefined) return
+  const isBlob = typeof v === 'string' && v.startsWith('blob:')
+  cellDetail.value = {
+    column: col.name,
+    type: col.type || '',
+    value: v,
+    blob: isBlob ? v.slice(5) : null,
+    text: isBlob ? '' : v === null ? 'NULL' : String(v),
+  }
+}
+
+
+
 async function load() {
   if (!path) {
     loadError.value = '缺少文件路径参数'
@@ -62,6 +157,10 @@ async function load() {
       const out = await api.fsArchiveList(path)
       archiveEntries.value = out.entries
       archiveTruncated.value = out.truncated
+    } else if (kind === 'sqlite') {
+      const out = await api.fsSqliteInfo(path)
+      sqliteTables.value = out.tables
+      if (out.tables.length) await openSqliteTable(out.tables[0].name)
     } else if (kind === 'text') {
       content.value = await api.fsRead(path)
       editText.value = content.value
@@ -621,7 +720,11 @@ onMounted(load)
 
     <!-- 主体 -->
     <n-spin :show="loading" class="fv-body">
-      <div v-if="loadError" class="fv-error">{{ loadError }}</div>
+      <div v-if="loadError" class="fv-error">
+        {{ loadError }}
+        <!-- 文本类被拒(如超过 5MB)时工具栏没有下载钮,这里补一条退路。 -->
+        <a v-if="kind === 'text'" class="fv-error-dl" :href="api.fsDownloadUrl(path)">下载文件</a>
+      </div>
 
       <!-- 图片(F2a):走下载端点的 inline 模式,会话 Cookie 由浏览器自动带上。 -->
       <div v-else-if="kind === 'image'" class="fv-image">
@@ -653,6 +756,66 @@ onMounted(load)
         </div>
       </div>
 
+      <!-- sqlite 数据库:左侧表列表 + 右侧数据表格,只读分页。 -->
+      <div v-else-if="kind === 'sqlite'" class="fv-sqlite">
+        <div class="sq-side">
+          <div class="sq-side-head">表</div>
+          <div v-if="!sqliteTables.length" class="sq-empty">数据库中没有表</div>
+          <button v-for="t in sqliteTables" :key="t.name" class="sq-table"
+            :class="{ current: t.name === sqliteTable }" :title="t.name"
+            @click="t.name !== sqliteTable && openSqliteTable(t.name)">
+            <span class="sq-table-name">{{ t.name }}</span>
+            <span class="sq-table-count">{{ sqliteCountText(t.count) }}</span>
+          </button>
+        </div>
+        <div class="sq-main">
+          <div class="sq-head">
+            <span class="sq-table-title">{{ sqliteTable }}</span>
+            <span v-if="sqliteTotal >= 0" class="sq-total">{{ sqliteTotal.toLocaleString() }} 行</span>
+            <span v-else class="sq-total sq-unknown">行数未知</span>
+          </div>
+          <div class="sq-grid-wrap">
+            <n-spin :show="sqliteCounting">
+              <n-empty v-if="!sqliteData.length" :description="sqliteTable ? '表中没有数据' : '选择左侧的表'" style="padding: 24px" />
+              <table v-else class="sq-grid">
+                <thead>
+                  <tr>
+                    <th v-for="c in sqliteColumns" :key="c.name" :title="c.type || ''">
+                      {{ c.name }}<span v-if="c.type" class="sq-coltype">{{ c.type }}</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, i) in sqliteData" :key="i">
+                    <td v-for="(cell, j) in row" :key="j"
+                      :class="{ 'sq-null': cell === null, 'sq-num': typeof cell === 'number' }"
+                      role="button" :tabindex="0"
+                      :title="`查看完整值:${sqliteCellText(cell)}`"
+                      @click="openCellDetail(i, j)" @keydown.enter="openCellDetail(i, j)">
+                      {{ sqliteCellText(cell) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </n-spin>
+          </div>
+          <div class="sq-pager">
+            <n-button size="small" quaternary :disabled="sqlitePage === 0 || sqliteCounting"
+              title="上一页" aria-label="上一页" @click="sqliteGoto(-1)">
+              <template #icon><n-icon :component="ChevronBackOutline" /></template>
+            </n-button>
+            <span class="sq-page">
+              {{ sqlitePage + 1 }}<template v-if="sqliteTotal >= 0"> / {{ sqlitePages }}</template>
+            </span>
+            <n-button size="small" quaternary
+              :disabled="(sqliteTotal >= 0 && sqlitePage + 1 >= sqlitePages) || sqliteCounting"
+              title="下一页" aria-label="下一页" @click="sqliteGoto(1)">
+              <template #icon><n-icon :component="ChevronForwardOutline" /></template>
+            </n-button>
+          </div>
+        </div>
+      </div>
+
       <n-empty v-else-if="!editing && !content" description="文件内容为空" style="padding: 24px" />
 
       <!-- markdown 渲染视图(F7):只读态可切,渲染 HTML 由 markdown-it 生成(html: false)。 -->
@@ -672,6 +835,21 @@ onMounted(load)
         </div>
       </div>
     </n-spin>
+
+    <!-- 单元格详情:格子被 ellipsis 截断,点开看全量值(BLOB 给 base64 原文)。 -->
+    <n-modal :show="!!cellDetail" preset="card" :title="cellDetail?.column" class="sq-cell-modal"
+      @update:show="(v: boolean) => !v && (cellDetail = null)">
+      <div v-if="cellDetail" class="sq-detail">
+        <div v-if="cellDetail.type" class="sq-detail-type">{{ cellDetail.type }}</div>
+        <div v-if="cellDetail.blob !== null" class="sq-detail-body mono">
+          {{ cellDetail.blob }}
+          <div class="sq-detail-hint">BLOB 的 base64 编码</div>
+        </div>
+        <div v-else class="sq-detail-body mono" :class="{ null: cellDetail.value === null }">
+          {{ cellDetail.text }}
+        </div>
+      </div>
+    </n-modal>
   </div>
 </template>
 
@@ -721,6 +899,9 @@ onMounted(load)
   margin: 8px 0; padding: 8px 12px; border-radius: 4px;
   color: var(--lr-danger, #d03050); background: rgba(208, 48, 80, 0.1);
   font-size: 13px;
+}
+.fv-error-dl {
+  margin-left: 10px; color: var(--lr-accent, #4078f2); white-space: nowrap;
 }
 /* 图片预览:按容器宽度自适应,超高时容器滚动;棋盘底衬托透明像素。 */
 .fv-image {
@@ -777,6 +958,142 @@ onMounted(load)
 .fa-size {
   flex: none; font-size: 12px; color: var(--lr-fg-muted);
   font-family: ui-monospace, monospace; white-space: nowrap;
+}
+/* sqlite 数据库预览:左侧表列表 + 右侧数据表格 */
+.fv-sqlite {
+  display: flex; gap: 8px;
+  flex: 1; min-height: 0;
+  padding: 4px 0 8px;
+  overflow: hidden; /* 滚动下沉到 .sq-side 和 .sq-grid-wrap 各自处理 */
+}
+.sq-side {
+  flex: none; width: 220px;
+  overflow-y: auto;
+  border-right: 1px solid rgba(127, 127, 127, 0.12);
+}
+.sq-side-head {
+  padding: 6px 2px; font-size: 12px; color: var(--lr-fg-muted);
+}
+.sq-empty {
+  padding: 12px 2px; font-size: 12px; color: var(--lr-fg-muted);
+}
+.sq-table {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  width: 100%; min-height: 30px; padding: 4px 6px;
+  border: 0; background: none; border-radius: 6px;
+  font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.sq-table:active { background: rgba(127, 127, 127, 0.16); }
+.sq-table.current { background: rgba(64, 120, 242, 0.14); color: var(--lr-accent); }
+.sq-table-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, monospace;
+}
+.sq-table-count {
+  flex: none; font-size: 11px; color: var(--lr-fg-muted); white-space: nowrap;
+}
+.sq-main {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
+}
+.sq-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 4px 2px 6px;
+}
+.sq-table-title {
+  font-family: ui-monospace, monospace; font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sq-total { font-size: 12px; color: var(--lr-fg-muted); }
+.sq-unknown { color: var(--lr-danger, #d03050); }
+.sq-grid-wrap {
+  flex: 1; min-height: 0; overflow: auto;
+  border-radius: 4px;
+}
+/* 表格:粘性表头随滚动;单元格等宽字体,与代码区观感一致 */
+.sq-grid {
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.sq-grid th, .sq-grid td {
+  padding: 4px 10px;
+  border: 1px solid rgba(127, 127, 127, 0.2);
+  white-space: nowrap; /* 宽表靠 .sq-grid-wrap 横向滚动 */
+  text-align: left;
+  max-width: 420px; overflow: hidden; text-overflow: ellipsis;
+}
+.sq-grid thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--lr-bg);
+  font-weight: 600;
+}
+.sq-coltype {
+  margin-left: 5px; font-size: 10px; font-weight: 400;
+  color: var(--lr-fg-muted);
+}
+.sq-null { font-style: italic; color: var(--lr-fg-muted); }
+.sq-num { text-align: right; }
+/* 格子可点:截断的值点开看详情。触屏目标高度别用 td 上直接垫 padding 撑 ——
+   44px 下限会破坏行内基线(见 naive 触控那条记忆),靠 td 自身的 4px 上下留白 +
+   行密度已经够点;hover 给个底色提示可点。 */
+.sq-grid td { cursor: pointer; }
+.sq-grid td:hover { background: rgba(127, 127, 127, 0.1); }
+.sq-grid td:focus-visible { outline: 2px solid var(--lr-accent); outline-offset: -2px; }
+/* 单元格详情弹窗 */
+.sq-cell-modal { width: min(640px, 92vw); }
+.sq-detail { display: flex; flex-direction: column; gap: 6px; }
+.sq-detail-type {
+  font-size: 12px; color: var(--lr-fg-muted);
+  font-family: ui-monospace, monospace;
+}
+.sq-detail-body {
+  padding: 8px 10px; border-radius: 4px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: 12px; line-height: 1.6;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 60vh; overflow: auto;
+}
+.sq-detail-body.null { font-style: italic; color: var(--lr-fg-muted); }
+.sq-detail-body.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.sq-detail-hint {
+  margin-top: 6px; font-size: 11px; color: var(--lr-fg-muted);
+}
+.sq-pager {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 0 0;
+}
+.sq-page {
+  font-size: 12px; color: var(--lr-fg-muted);
+  font-family: ui-monospace, monospace;
+}
+/* 手机端(<768px,与 main.css 的导航断点一致):左右结构放不下,
+   表列表改成顶部横向滚动的胶囊条,数据表格纵向接在下面。
+   侧栏/主区的 DOM 不动,纯 CSS 换排:桌面左右、手机上下。 */
+@media (max-width: 767px) {
+  .fv-sqlite { flex-direction: column; gap: 4px; }
+  .sq-side {
+    width: auto;
+    display: flex; align-items: center; gap: 4px;
+    overflow-x: auto; overflow-y: hidden; /* 单行胶囊条,横向滑选表 */
+    border-right: 0;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.12);
+    padding: 2px 2px 6px;
+    flex: none;
+  }
+  .sq-side-head { display: none; } /* 胶囊本身就是表名,标题条是重复 */
+  .sq-empty { flex: none; padding: 8px; font-size: 12px; color: var(--lr-fg-muted); }
+  .sq-table {
+    flex: none; width: auto;
+    border-radius: 14px;
+    padding: 0 10px;
+    min-height: 32px;
+    background: rgba(127, 127, 127, 0.1);
+  }
+  .sq-table-name { max-width: 140px; }
+  .sq-table-count { font-size: 10px; }
+  /* 表格单元格收窄留白;列多时照旧横向滚动,只是每列别那么宽 */
+  .sq-grid th, .sq-grid td { padding: 4px 8px; max-width: 220px; }
 }
 /* 代码编辑器:单个滚动容器承载 行号栏 + 高亮 pre + 透明 textarea。 */
 .code-editor {

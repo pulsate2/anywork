@@ -103,6 +103,14 @@ export const api = {
     return fetch('/api/fs/upload', { method: 'POST', body: fd, credentials: 'same-origin' })
   },
   fsArchiveUrl: (path: string) => `/api/fs/archive?path=${encodeURIComponent(path)}`,
+  // sqlite 数据库预览:概览(表列表+行数)与某表一页行。只读,后端拒绝一切非 SELECT。
+  fsSqliteInfo: (path: string) =>
+    request<FsSqliteInfo>('GET', `/api/fs/sqlite?path=${encodeURIComponent(path)}`),
+  fsSqliteRows: (path: string, table: string, offset = 0, limit?: number) => {
+    const qs = new URLSearchParams({ path, table, offset: String(offset) })
+    if (limit) qs.set('limit', String(limit))
+    return request<FsSqliteRows>('GET', `/api/fs/sqlite/rows?${qs.toString()}`)
+  },
   fsDownloadUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}`,
   // 图片预览走同一个下载端点,inline=1 让后端改用 Content-Disposition: inline(仅图片白名单生效)。
   fsInlineUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}&inline=1`,
@@ -413,6 +421,32 @@ export interface FsArchiveEntry {
 export interface FsArchiveList {
   entries: FsArchiveEntry[]
   truncated: boolean
+}
+
+// ---- SQLite 预览 ----
+// count = -1 表示行数未知(超大表 COUNT 超时,后端放弃)。
+export interface FsSqliteTable {
+  name: string
+  count: number
+}
+
+export interface FsSqliteInfo {
+  tables: FsSqliteTable[]
+  userVersion: number
+}
+
+export interface FsSqliteColumn {
+  name: string
+  type?: string
+}
+
+// 单元格 JSON 值:number / boolean / string / null;"blob:" 前缀的 string 是二进制。
+export type FsSqliteCell = number | boolean | string | null
+
+export interface FsSqliteRows {
+  columns: FsSqliteColumn[]
+  rows: FsSqliteCell[][]
+  total: number
 }
 
 export interface Workspace {
