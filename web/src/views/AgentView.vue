@@ -1188,8 +1188,11 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- 任务清单(hapi SessionStatusPanel 同款):会话级状态,钉在 header 下,
-      永远最新;Task 套件/TodoWrite 的事件都汇进这里,时间线不出卡 -->
-      <details v-if="sessionTasks.length" class="task-panel">
+      永远最新;Task 套件/TodoWrite 的事件都汇进这里,时间线不出卡。
+      全部完成后整块隐藏:codex 的模型多半不会真调 update_plan([]) 关计划
+      (口头说"已关闭"),claude 的清单全完成也一直挂着 —— 完成即收,
+      有新计划(或空快照清空后重建)再出现 -->
+      <details v-if="sessionTasks.length && taskDone < sessionTasks.length" class="task-panel">
         <summary>
           <span class="task-panel-title">任务清单</span>
           <span class="task-panel-count">{{ taskDone }}/{{ sessionTasks.length }}</span>
