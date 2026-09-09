@@ -2,12 +2,12 @@
 // 二级页面:查看单个文件的 差异 / 全文 视图。
 // 一级(GitView 文件列表)点某文件 → 路由到本页,查询参数带 path/scope/file/ref/root。
 // 差异 = git diff 该文件的有色行;文件 = fsRead 全文。未跟踪文件无 diff,默认文件视图。
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton, NIcon, NSpin, NEmpty, NAlert, NTag,
 } from 'naive-ui'
-import { ChevronBackOutline, GitCompareOutline, DocumentTextOutline } from '@vicons/ionicons5'
+import { ChevronBackOutline, GitCompareOutline, DocumentTextOutline, ReturnDownForwardOutline } from '@vicons/ionicons5'
 import { api } from '@/api/client'
 import { parseDiff, type DiffBlock } from '@/utils/diff'
 import { highlightCode } from '@/utils/highlight'
@@ -34,6 +34,13 @@ const diffError = ref('')
 const fileContent = ref('')
 const fileLoading = ref(false)
 const fileError = ref('')
+// 自动换行:默认关(横向滚动,行号/符号列 sticky 贴左是精确对齐的读法);
+// 长行多的 diff 在手机上滚来滚去烦,打开后正文按屏宽折行。随路由参数
+// 持久化,返回列表再进来不丢。
+const wrapping = ref(route.query.wrap === '1')
+watch(() => wrapping.value, (v) => {
+  router.replace({ query: { ...route.query, wrap: v ? '1' : '0' } })
+})
 
 async function loadDiff() {
   diffLoading.value = true
@@ -139,15 +146,25 @@ function goBack() {
         <n-tag size="tiny" :bordered="false" type="info">{{ scopeTag }}</n-tag>
       </div>
       <div class="fv-tabs">
+        <!-- 自动换行:差异与文件两个视图都可用(两个视图都是等宽正文,长行都烦)。
+             工具栏是图标钮,跟着用图标:开=Return(U 形回车箭头,折行语义)高亮,
+             关=同图标灰态。title/aria-label 兜底提示。 -->
+        <n-button quaternary size="small"
+          :type="wrapping ? 'primary' : 'default'"
+          :title="wrapping ? '自动换行:开' : '自动换行:关'" aria-label="自动换行"
+          @click="wrapping = !wrapping">
+          <template #icon><n-icon :component="ReturnDownForwardOutline" /></template>
+        </n-button>
+        <!-- 窄屏只显示图标(文字用 media query 隐藏),桌面留文字 -->
         <n-button size="small" :type="mode === 'diff' ? 'primary' : 'default'" :disabled="scope === 'untracked'"
           title="差异" aria-label="差异" @click="switchMode('diff')">
           <template #icon><n-icon :component="GitCompareOutline" /></template>
-          差异
+          <span class="fv-tab-label">差异</span>
         </n-button>
         <n-button size="small" :type="mode === 'file' ? 'primary' : 'default'"
           title="文件" aria-label="文件" @click="switchMode('file')">
           <template #icon><n-icon :component="DocumentTextOutline" /></template>
-          文件
+          <span class="fv-tab-label">文件</span>
         </n-button>
       </div>
     </div>
@@ -164,7 +181,7 @@ function goBack() {
             <span class="dh-add">+{{ diffBlock.adds }}</span>
             <span class="dh-del">-{{ diffBlock.dels }}</span>
           </div>
-          <div class="diff-scroll" :style="{ '--dl-no-w': noWidth }">
+          <div class="diff-scroll" :class="{ wrap: wrapping }" :style="{ '--dl-no-w': noWidth }">
             <div class="diff-inner">
               <div v-for="(l, i) in diffRows" :key="i" class="dl" :class="l.kind">
                 <span class="dl-no">{{ l.kind === 'hunk' ? '@@' : (l.no ?? '') }}</span>
@@ -181,7 +198,7 @@ function goBack() {
     <div v-else class="fv-file">
       <n-spin :show="fileLoading">
         <n-alert v-if="fileError" type="error" :bordered="false" :title="fileError" style="margin: 8px 0" />
-        <div v-else-if="fileContent !== ''" class="file-body">
+        <div v-else-if="fileContent !== ''" class="file-body" :class="{ wrap: wrapping }">
           <!-- 代码高亮:v-html 渲染 hljs 产出的 HTML。着色令牌色由下方 .hljs-* 规则定义。 -->
           <code v-html="highlighted"></code>
         </div>
@@ -215,7 +232,11 @@ function goBack() {
   font-family: ui-monospace, monospace; font-size: 13px; font-weight: 600;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.fv-tabs { display: flex; gap: 4px; flex: none; }
+.fv-tabs { display: flex; align-items: center; gap: 4px; flex: none; }
+/* 窄屏:切换钮只留图标(文字塞不下时 title 还能兜底提示) */
+@media (max-width: 767px) {
+  .fv-tab-label { display: none; }
+}
 /* 差异:整块是一张卡(参考稿的 .diff-container)。卡负责边框/圆角,overflow: hidden
    让里面的行底被圆角裁掉;横向滚动交给内层 .diff-scroll,纵向交给文档滚动 —— 卡自己
    不能滚,否则吸顶条就没得吸了。
@@ -291,6 +312,16 @@ function goBack() {
   user-select: none;
 }
 .dl-body { flex: 1; white-space: pre; padding: 0 8px 0 2px; }
+/* 自动换行开:正文按屏宽折行(保留缩进的前导空格),卡片不再横向滚 ——
+   没有横向滚动后行号/符号列的 sticky 失去意义,顺便取消左内边距让正文
+   占满卡宽。折行后续行顶到正文列起头,行号列不被拉宽。 */
+.diff-scroll.wrap { overflow-x: visible; }
+.diff-scroll.wrap .diff-inner { width: auto; min-width: 100%; }
+.diff-scroll.wrap .dl { align-items: stretch; }
+.diff-scroll.wrap .dl-body {
+  white-space: pre-wrap; overflow-wrap: break-word;
+  padding-right: 8px;
+}
 /* 加/删行:行底 + 行号槽两档,值严格照参考稿(#ccffcc/#aaffaa、#ffcccc/#ffaaaa)。
    删行连正文一起染 #b71c1c,也是参考稿的做法;加行正文留卡面深字。 */
 .dl.add { background: var(--lr-diff-add-bg); }
@@ -308,16 +339,21 @@ function goBack() {
 }
 .dl.meta { color: #57606a; }
 /* 文件内容:等宽可滚读;外层 .file-body 管横向滚动,内层 code 管代码字体与换行。
-   hljs 多数输出<span class="hljs-*">,块级 code 保证每个令牌行内衔接且背景铺满。 */
+   hljs 多数输出<span class="hljs-*">,块级 code 保证每个令牌行内衔接且背景铺满。
+   自动换行开:不再横向滚,正文按屏宽折行(保留缩进的前导空格)。 */
 .file-body {
   margin: 0; overflow: auto;
   padding: 8px 0;
 }
+.file-body.wrap { overflow-x: hidden; }
 .file-body code {
   display: block;
   font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
   color: var(--lr-fg);
   white-space: pre; word-break: break-word;
+}
+.file-body.wrap code {
+  white-space: pre-wrap; overflow-wrap: break-word;
 }
 </style>
 

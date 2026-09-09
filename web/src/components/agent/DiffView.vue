@@ -40,9 +40,9 @@ const deletions = computed(() => rows.value.filter((r) => r.kind === 'del').leng
   <div class="diff-view">
     <div class="diff-head">
       <span class="diff-path">{{ filePath || 'Diff' }}</span>
-      <span class="diff-stats">
-        <span class="diff-badge add">+{{ additions }}</span>
-        <span class="diff-badge del">-{{ deletions }}</span>
+      <span v-if="additions || deletions" class="diff-stats">
+        <span v-if="additions" class="diff-badge add">+{{ additions }}</span>
+        <span v-if="deletions" class="diff-badge del">-{{ deletions }}</span>
       </span>
     </div>
     <div class="diff-body">

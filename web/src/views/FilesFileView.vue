@@ -4,7 +4,7 @@
 // 从搜索结果点进来时还带 line(命中行号)与 q/regex/case(一级用的关键词和开关),
 // 进页面后把关键词的全部命中标出来,当前项落在命中行上 —— 不只是滚到那一行。
 // 图片走 <img>、压缩包走条目列表,都不读正文;markdown 只读时可切换渲染视图。
-import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton, NIcon, NSpin, NEmpty, NInput, NModal, useMessage,
@@ -13,6 +13,7 @@ import {
   ChevronBackOutline, ChevronForwardOutline, SearchOutline, CreateOutline, SaveOutline,
   CloseOutline, ChevronUpOutline, ChevronDownOutline, SwapHorizontalOutline,
   ArrowUndoOutline, ArrowRedoOutline, EyeOutline, CodeOutline, DownloadOutline,
+  ReturnDownForwardOutline,
 } from '@vicons/ionicons5'
 import { api, type FsArchiveEntry, type FsSqliteInfo, type FsSqliteRows } from '@/api/client'
 import { highlightCode } from '@/utils/highlight'
@@ -225,6 +226,13 @@ function openArchiveRow(row: ArchiveRow) {
 // 从搜索结果进来时默认给源码(命中标记只存在于源码视图),否则 markdown 默认渲染态。
 const mdRendered = ref(isMd && !targetLine && !initialQ)
 const mdHtml = computed(() => (mdRendered.value ? renderMarkdown(content.value) : ''))
+
+// 自动换行:默认关(横向滚动 + 行号对齐是源码的精确读法);长行多的文件在手机上
+// 滚来滚去烦,打开后按屏宽折行。随路由参数持久化,返回列表再进来不丢(同 GitFileView)。
+const wrapping = ref(route.query.wrap === '1')
+watch(() => wrapping.value, (v) => {
+  router.replace({ query: { ...route.query, wrap: v ? '1' : '0' } })
+})
 
 // ---- 编辑模式 ----
 const editing = ref(false)
@@ -586,6 +594,108 @@ const gutterLines = computed<number[]>(() => {
 // 补一个换行后,pre 的行框数恒等于 split('\n').length,与行号列、textarea 三边对齐。
 const displayHtml = computed<string>(() => renderHighlight(displayText.value) + '\n')
 
+// ---- wrap 模式的行号对齐 ----
+// 折行把一个逻辑行摊成 N 个视觉行,自然堆叠的行号栏会整体窜位。量 DOM:
+// 对每个逻辑行起点建 Range,取它相对 pre 顶部的 y(即该逻辑行首个视觉行),
+// 把「本行 y 到下一行 y」写成行号 span 的高度 —— 行号栏总高恒等于 pre 高,
+// 纵向滚动天然同步,行号钉在所属逻辑行的首个视觉行上。displayHtml 变化
+// (编辑每敲一字)或容器尺寸变化(转屏/窗口缩放)后都要重算,统一走 rAF
+// 合并到帧,同一帧内多次触发只算一次。
+function syncWrapGutter() {
+  const gutter = gutterEl.value
+  const pre = preEl.value?.querySelector('pre')
+  if (!gutter || !pre) return
+  const spans = Array.from(gutter.children) as HTMLElement[]
+  const text = displayText.value
+  if (!spans.length || !text) return
+  const lineH = parseFloat(getComputedStyle(pre).lineHeight) || 18
+  // 逻辑行起点在全文中的字符偏移,与行号 span 一一对应。
+  const lineStarts: number[] = [0]
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) lineStarts.push(i + 1)
+  }
+  if (lineStarts.length !== spans.length) return // displayHtml 还没跟上,等下一拍
+  // hljs/mark 把正文切成多段 text node,Range 要落在具体节点上,先建偏移索引。
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT)
+  const nodes: Text[] = []
+  const nodeStarts: number[] = []
+  let total = 0
+  while (walker.nextNode()) {
+    const t = walker.currentNode as Text
+    if (!t.data) continue
+    nodes.push(t)
+    nodeStarts.push(total)
+    total += t.data.length
+  }
+  const point = (off: number): [Text, number] | null => {
+    for (let i = 0; i < nodes.length; i++) {
+      if (off <= nodeStarts[i] + nodes[i].data.length) return [nodes[i], off - nodeStarts[i]]
+    }
+    return null
+  }
+  const range = document.createRange()
+  const preTop = pre.getBoundingClientRect().top
+  const tops: number[] = []
+  let prevTop = 0
+  for (let i = 0; i < lineStarts.length; i++) {
+    const from = point(lineStarts[i])
+    const end = i + 1 < lineStarts.length ? lineStarts[i + 1] : text.length
+    const to = point(end)
+    let top = -1
+    if (from && to) {
+      try {
+        range.setStart(from[0], from[1])
+        range.setEnd(to[0], to[1])
+      } catch { /* 节点边界异常就走兜底 */ }
+      // rects 按视觉行拆,首块就是该逻辑行的第一行;空行只有零高度的折叠矩形,
+      // 拿不到就按"上一行顶 + 一行行高"兜底。
+      const rects = range.getClientRects()
+      if (rects.length) top = rects[0].top - preTop
+    }
+    if (top < 0) top = prevTop + lineH
+    tops.push(top)
+    prevTop = top
+  }
+  const preH = pre.getBoundingClientRect().height
+  for (let i = 0; i < spans.length; i++) {
+    const next = i + 1 < tops.length ? tops[i + 1] : preH
+    spans[i].style.height = `${Math.max(lineH, next - tops[i])}px`
+  }
+}
+
+function clearWrapGutter() {
+  const gutter = gutterEl.value
+  if (!gutter) return
+  for (const s of gutter.children) (s as HTMLElement).style.height = ''
+}
+
+let wrapPending = false
+function scheduleWrapGutter() {
+  if (wrapPending) return
+  wrapPending = true
+  requestAnimationFrame(() => {
+    wrapPending = false
+    if (wrapping.value) syncWrapGutter()
+  })
+}
+
+watch([displayHtml, wrapping], () => {
+  if (!wrapping.value) {
+    clearWrapGutter()
+    return
+  }
+  scheduleWrapGutter()
+})
+
+// 折行点跟容器宽走:转屏/窗口缩放要重算。
+let wrapObserver: ResizeObserver | null = null
+onMounted(() => {
+  if (!editorEl.value || typeof ResizeObserver === 'undefined') return
+  wrapObserver = new ResizeObserver(scheduleWrapGutter)
+  wrapObserver.observe(editorEl.value)
+})
+onBeforeUnmount(() => wrapObserver?.disconnect())
+
 // ---- 替换(仅编辑模式) ----
 // 查找词与正则/大小写开关都取上面那条查找行,这里只管「替换为」。
 const replaceText = ref('')
@@ -665,6 +775,15 @@ onMounted(load)
             :title="mdRendered ? '看源码' : '看渲染'" :aria-label="mdRendered ? '看源码' : '看渲染'"
             @click="mdRendered = !mdRendered">
             <template #icon><n-icon :component="mdRendered ? CodeOutline : EyeOutline" /></template>
+          </n-button>
+          <!-- 自动换行:只作用于源码编辑器(markdown 渲染视图本来就折行,二进制类没有正文)。
+               工具栏全是图标钮,跟着用图标:开=Return(U 形回车箭头,折行语义)高亮,
+               关=同图标灰态。title/aria-label 兜底提示。 -->
+          <n-button v-if="kind === 'text' && !mdRendered" quaternary size="small"
+            :type="wrapping ? 'primary' : 'default'"
+            :title="wrapping ? '自动换行:开' : '自动换行:关'" aria-label="自动换行"
+            @click="wrapping = !wrapping">
+            <template #icon><n-icon :component="ReturnDownForwardOutline" /></template>
           </n-button>
           <n-button v-if="kind !== 'text'" quaternary size="small" tag="a" :href="api.fsDownloadUrl(path)"
             title="下载" aria-label="下载">
@@ -822,7 +941,7 @@ onMounted(load)
       <div v-else-if="mdRendered" class="md-body" v-html="mdHtml"></div>
 
       <!-- 预览/编辑 共用编辑器:高亮 <pre> 打底 + 透明 <textarea> 覆盖,行号在左侧粘性栏。 -->
-      <div v-else ref="editorEl" class="code-editor" @mousedown="onEditorMouseDown">
+      <div v-else ref="editorEl" class="code-editor" :class="{ wrap: wrapping }" @mousedown="onEditorMouseDown">
         <div ref="gutterEl" class="ce-gutter">
           <span v-for="n in gutterLines" :key="n">{{ n }}</span>
         </div>
@@ -1159,6 +1278,24 @@ onMounted(load)
 .ce-input::selection { background: rgba(64, 120, 242, 0.35); }
 /* 只读(预览)态:仍可点选/滚动,但光标不闪烁可输入 */
 .ce-input[readonly] { user-select: none; }
+
+/* 自动换行开:编辑器不再横向滚。核心在 .ce-body 收回容器宽 —— 基础样式的
+   flex: 1 0 auto + width: max-content 是"贴合内容宽"的布局,不收回的话
+   pre-wrap 仍按不折行的全文宽度把 body 撑出容器,正文被 overflow-x: hidden
+   裁掉而不是折行(开成了"锁屏")。flex-basis 归 0 + min-width: 0 才真正
+   钉死在容器宽上,pre-wrap 就地折行。高亮层 pre 与覆盖层 textarea 必须用
+   同一条 white-space/overflow-wrap:两层折点一旦不一致,光标就与文字错开
+   (叠层对齐是这套编辑器的命根子)。
+   行号栏保留:折行后一个逻辑行占多个视觉行,行号改钉在所属逻辑行的首个
+   视觉行上 —— 每行的视觉高度由 syncWrapGutter() 量 DOM 写进行号 span。 */
+.code-editor.wrap { overflow-x: hidden; }
+.code-editor.wrap .ce-body { flex: 1 1 0; min-width: 0; width: auto; }
+.code-editor.wrap .ce-body pre,
+.code-editor.wrap .ce-input {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
 </style>
 
 <!-- 语法高亮令牌色 + 命中标记:非 scoped。v-html 注入的 <span class="hljs-*"> 与

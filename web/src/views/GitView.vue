@@ -414,12 +414,12 @@ const diffTitle = computed(() => {
 
 // numstatOf 改动行右侧的 +N -N。后端给的口径:暂存行是 HEAD→索引的量,工作区行是
 // 索引→工作区的量,正好对得上各自的"查看"弹窗。二进制(-1)和未跟踪(0)不算数,不显示;
-// 全 0 的纯改名/清空暂存显示 `+0 -0`,和 diff 弹窗一致。
+// 纯改名/清空暂存的全 0 也不显示 —— 一个孤零零的 +0 没有信息量。
 function numstatOf(e: GitEntry): string {
   const a = e.add ?? 0
   const d = e.del ?? 0
-  if (a < 0 || d < 0 || (a === 0 && d === 0)) return ''
-  return `+${a} -${d}`
+  if (a <= 0 && d <= 0) return ''
+  return `${a > 0 ? `+${a} ` : ''}${d > 0 ? `-${d}` : ''}`
 }
 
 // 跳二级页看某个文件的差异/全文。scope: worktree|staged|commit|untracked。
@@ -844,7 +844,7 @@ watch(() => store.currentPath, (p) => {
                 <div v-for="e in status.conflicted" :key="e.path" class="git-file">
                   <span class="git-xy danger">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path">{{ e.path }}</span>
-                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span class="na">+{{ e.add }}</span> <span class="nd">-{{ e.del }}</span></span>
+                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span v-if="e.add" class="na">+{{ e.add }}</span> <span v-if="e.del" class="nd">-{{ e.del }}</span></span>
                   <n-button class="git-btn" size="tiny" quaternary title="撤回改动(回到 HEAD)"
                     aria-label="撤回改动" @click="restoreEntry(e, 'all')">
                     <n-icon :component="ArrowUndoOutline" />
@@ -863,7 +863,7 @@ watch(() => store.currentPath, (p) => {
                 <div v-for="e in status.staged" :key="e.path" class="git-file">
                   <span class="git-xy add">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path" @click="goFile('staged', e.path)">{{ e.path }}</span>
-                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span class="na">+{{ e.add }}</span> <span class="nd">-{{ e.del }}</span></span>
+                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span v-if="e.add" class="na">+{{ e.add }}</span> <span v-if="e.del" class="nd">-{{ e.del }}</span></span>
                   <n-button class="git-btn" size="tiny" quaternary title="撤回改动(回到 HEAD)"
                     aria-label="撤回改动" @click="restoreEntry(e, 'all')">
                     <n-icon :component="ArrowUndoOutline" />
@@ -886,7 +886,7 @@ watch(() => store.currentPath, (p) => {
                 <div v-for="e in status.unstaged" :key="e.path" class="git-file">
                   <span class="git-xy">{{ e.x }}{{ e.y }}</span>
                   <span class="git-path" :title="e.path" @click="goFile('worktree', e.path)">{{ e.path }}</span>
-                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span class="na">+{{ e.add }}</span> <span class="nd">-{{ e.del }}</span></span>
+                  <span v-if="numstatOf(e)" class="git-nums" :title="numstatOf(e)"><span v-if="e.add" class="na">+{{ e.add }}</span> <span v-if="e.del" class="nd">-{{ e.del }}</span></span>
                   <n-button class="git-btn" size="tiny" quaternary title="撤回改动" aria-label="撤回改动"
                     @click="restoreEntry(e, 'worktree')">
                     <n-icon :component="ArrowUndoOutline" />
@@ -961,8 +961,8 @@ watch(() => store.currentPath, (p) => {
         <div v-for="f in diffFiles" :key="f.path" class="diff-file list-row" role="button" tabindex="0"
           @click="goFile(diffScope, f.path, diffCommit?.hash)" @keydown.enter="goFile(diffScope, f.path, diffCommit?.hash)">
           <span class="diff-path" :title="f.path">{{ f.path }}</span>
-          <span class="diff-add">+{{ f.adds }}</span>
-          <span class="diff-del">-{{ f.dels }}</span>
+          <span v-if="f.adds" class="diff-add">+{{ f.adds }}</span>
+          <span v-if="f.dels" class="diff-del">-{{ f.dels }}</span>
           <n-icon class="diff-go" :component="ChevronForwardOutline" />
         </div>
       </div>
