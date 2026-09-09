@@ -366,6 +366,8 @@ type claudeLine struct {
 	CompactError  string `json:"compact_error"`
 	// system/task_notification:后台任务完成/Monitor 事件的摘要与状态词。
 	Summary string `json:"summary"`
+	// system/task_notification:失败的后台命令的输出文件(尾部内容进 Event)。
+	OutputFile string `json:"output_file"`
 	// system/api_error / turn_duration / away_summary 的载荷。
 	Content       json.RawMessage     `json:"content"` // away_summary 的 recap
 	RetryAttempt  int                 `json:"retryAttempt"`
@@ -419,13 +421,14 @@ type claudeUsage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
-// emitUsage 把 usage 块归一成 KindUsage 事件(claude 的 input_tokens 不含
-// 缓存,上下文占用 = input + cache_read + cache_creation)。全零不发声。
+// emitUsage 把 usage 块归一成 KindUsage 事件。上下文占用按 claude CLI 自己的
+// 口径 = input + cache_read(不计 cache_creation:缓存写入是一次性成本,token
+// 并不驻留上下文,计进去会把占用顶过 100%,比如 247k/200k)。全零不发声。
 func (d *claudeDriver) emitUsage(u *claudeUsage, model string, window int) {
 	if u == nil {
 		return
 	}
-	ctx := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	ctx := u.InputTokens + u.CacheReadInputTokens
 	if ctx+u.OutputTokens <= 0 {
 		return
 	}
@@ -560,11 +563,16 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 				// 后台任务(Bash run_in_background / Monitor)完成或产出事件:
 				// claude 在空闲间隙注入,不透出的话远程端会以为任务还在跑。
 				// 与 XML 形态共用 seenNotify 去重(event 为空时键一致)。
-				if msg.Summary != "" && !d.seenNotify(msg.Summary+"|"+msg.Status+"|") {
+				event := ""
+				if msg.Status == "failed" && msg.OutputFile != "" {
+					event = readNotifyOutput(msg.OutputFile, msg.Status)
+				}
+				if msg.Summary != "" && !d.seenNotify(msg.Summary+"|"+msg.Status+"|"+event) {
 					d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
 						Type:   "task_notification",
 						Text:   truncate(msg.Summary, 2000),
 						Status: msg.Status,
+						Event:  truncate(event, 8000),
 					}})
 				}
 			} else if msg.Subtype == "api_error" {
@@ -616,12 +624,13 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 			go d.handleCanUseTool(msg.RequestID, msg.Request)
 		case "assistant", "user":
 			// parent_tool_use_id 非空 = 子 agent(Task 工具)自己的流:
-			// 文本/思考/工具调用与结果都不进主时间线(hapi isSidechain 同款
-			// 语义)。主 agent 的 Task 卡本身不受影响 —— 它的 tool_use 与
-			// tool_result 都在父级,不带 parent id。顺带把子 agent 的 usage
-			// 也挡在 StatusBar 外(子 agent 上下文小得多,放进来会让占用
+			// 文本/思考不进主时间线(hapi isSidechain 同款语义),但工具调用
+			// 带 parentToolUseId 透出 —— 前端挂到父 Task 卡下当"过程"展示,
+			// 否则子 agent 跑半天远程端只看到一张静止的 Agent 卡。usage
+			// 仍然挡在 StatusBar 外(子 agent 上下文小得多,放进来会让占用
 			// 读数中途塌陷再弹回)。
 			if msg.ParentToolUseID != "" {
+				d.handleSubagentTools(msg.Message, msg.ParentToolUseID)
 				continue
 			}
 			if msg.Type == "assistant" {
@@ -649,6 +658,14 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 				}
 			}
 			d.emitUsage(msg.Usage, m, window)
+			// 回合统计:实测 CLI 不发 subtype=turn_duration 的 system 行,耗时
+			// 在 result 行上(duration_ms)—— 前端 StatusBar 完成后显示本次时长、
+			// ⏱️ 时间线行都靠这条。total_cost_usd 不透出:对包月/充值用户是
+			// 无意义的小数,显示出来只会让人困惑。
+			d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
+				Type:       "turn_duration",
+				DurationMs: msg.Duration,
+			}})
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
 		case "error":
 			d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(line, 4000)}})
@@ -690,7 +707,10 @@ func (d *claudeDriver) handleAssistant(m *claudeMsg) {
 			d.toolNames[b.ID] = b.Name
 			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
 				Tool: b.Name,
-				Args: truncate(string(b.Input), 16*1024),
+				// 参数用 truncateJSON:Edit/Write 的 diff 靠前端 parse 这段 JSON,
+				// 盲切产生的非法 JSON 会让 diff 整个不渲染。60KB 给 store 的
+				// 64KB payloadLimit 留出事件包装的余量。
+				Args: truncateJSON(string(b.Input), 60*1024),
 				// state=running:结果在下一条 user(tool_result)里,前端按 toolUseID 配对成同一张卡。
 				ToolUseID: b.ID,
 				State:     "running",
@@ -739,10 +759,47 @@ func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
 	}
 }
 
-// maybeTaskNotificationXML 旧形态的后台通知:作为 user 消息注入的
+// handleSubagentTools 子 agent 的工具调用 → 挂到父 Task 卡的过程事件。
+// 只取 tool_use / tool_result 块:文本/思考不透(子 agent 的推理对主时间线
+// 是噪音,前端只要知道它在读哪个文件、跑哪条命令)。与主时间线共用
+// tool_call 形态,差异只在 ParentToolUseID 字段。
+func (d *claudeDriver) handleSubagentTools(m *claudeMsg, parent string) {
+	if m == nil {
+		return
+	}
+	var blocks []contentBlock
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return
+	}
+	for _, b := range blocks {
+		switch b.Type {
+		case "tool_use":
+			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+				Tool:            b.Name,
+				ToolUseID:       b.ID,
+				ParentToolUseID: parent,
+				Args:            truncateJSON(string(b.Input), 8*1024),
+				State:           "running",
+			}})
+		case "tool_result":
+			result := toolResultText(b.Content)
+			if b.IsError && result != "" {
+				result = "错误: " + result
+			}
+			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+				ToolUseID:       b.ToolUseID,
+				ParentToolUseID: parent,
+				Result:          truncate(result, 4*1024),
+				State:           map[bool]string{true: "error", false: "ok"}[b.IsError],
+			}})
+		}
+	}
+}
+
+// maybeTaskNotificationXML 后台通知:作为 user 消息注入的
 // <task-notification><summary>…</summary><status>…</status><event>…</event>
-// </task-notification>(hapi eventParsing 同款解析;Monitor 事件带 <event>
-// 具体行、无 <status>)。非此形态(普通回显)静默跳过。
+// <output-file>…</output-file></task-notification>(hapi eventParsing 同款解析;
+// Monitor 事件带 <event> 具体行、无 <status>)。非此形态(普通回显)静默跳过。
 // transcript tailer 与 stdout user-echo 两条路径都走这里,seenNotify 去重。
 func (d *claudeDriver) maybeTaskNotificationXML(text string) {
 	trimmed := strings.TrimSpace(text)
@@ -755,6 +812,9 @@ func (d *claudeDriver) maybeTaskNotificationXML(text string) {
 	}
 	status := xmlTagValue(trimmed, "status")
 	event := xmlTagValue(trimmed, "event")
+	if event == "" {
+		event = readNotifyOutput(xmlTagValue(trimmed, "output-file"), status)
+	}
 	if d.seenNotify(summary + "|" + status + "|" + event) {
 		return
 	}
@@ -762,8 +822,41 @@ func (d *claudeDriver) maybeTaskNotificationXML(text string) {
 		Type:   "task_notification",
 		Text:   truncate(summary, 2000),
 		Status: status,
-		Event:  truncate(event, 2000),
+		Event:  truncate(event, 8000),
 	}})
+}
+
+// readNotifyOutput 后台命令失败时的输出捞取:通知 XML 里带 <output-file>
+// 指向任务的完整输出文件,claude 不经流转发给 stdout —— 不读它,远程端只
+// 能看到退出码一行,失败原因(测试输出/编译错误)全在文件里。只对 failed 读:
+// completed 的输出常驻磁盘(日志/服务),没必要搬进事件。
+func readNotifyOutput(path, status string) string {
+	if path == "" || status != "failed" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	out := strings.TrimSpace(string(b))
+	if out == "" {
+		return ""
+	}
+	// 只搬尾部 8KB:失败输出常见"跑了一半才挂",头部没诊断价值,
+	// 事件 payload 也没地方装几 MB 的日志。
+	const tail = 8 * 1024
+	if len(out) > tail {
+		cut := len(out) - tail
+		// 找一个行首落点再对齐 UTF-8 边界,别把半行糊在"已截断"后面。
+		for cut < len(out) && out[cut] != '\n' && out[cut]&0xC0 != 0x80 {
+			cut++
+		}
+		for cut < len(out) && out[cut]&0xC0 == 0x80 {
+			cut++
+		}
+		out = "…(已截断)\n" + out[cut:]
+	}
+	return out
 }
 
 // seenNotify 通知去重(双路径防双发):没见过就记下并返回 false。

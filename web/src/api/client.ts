@@ -269,6 +269,8 @@ export interface AgentEvent {
 export interface AgentToolCall {
   tool: string
   toolUseId?: string
+  // 非空 = 子 agent(Task 工具)的内部工具调用:挂在父 Task 卡下当"过程"。
+  parentToolUseId?: string
   args?: string
   result?: string
   // tool_result 里 image 块落盘后的文件名,取 /api/agent/sessions/{id}/files/{name}。

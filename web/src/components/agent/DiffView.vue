@@ -68,8 +68,9 @@ const deletions = computed(() => rows.value.filter((r) => r.kind === 'del').leng
   font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
 }
 .diff-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.diff-stats { display: flex; gap: 6px; }
-.diff-badge { padding: 0 6px; border-radius: 999px; font-size: 10px; line-height: 16px; }
+/* flex: none + nowrap:路径很长时统计徽章不许被压缩成"挤压扁"的一团 */
+.diff-stats { display: flex; gap: 6px; flex: none; }
+.diff-badge { padding: 0 6px; border-radius: 999px; font-size: 10px; line-height: 16px; white-space: nowrap; }
 .diff-badge.add { background: rgba(34, 197, 94, .16); color: var(--lr-ok); }
 .diff-badge.del { background: rgba(220, 38, 38, .14); color: var(--lr-danger); }
 

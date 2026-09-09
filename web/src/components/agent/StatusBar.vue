@@ -1,13 +1,18 @@
 <script setup lang="ts">
 // 输入框上方的状态行(hapi StatusBar / claude code 风格):左侧状态点+文案
-// (思考中随机动词 + ✻ 转动),旁边上下文用量条(点击弹详情);右侧模型、
+// (思考中随机动词),旁边上下文用量条(点击弹详情);右侧模型、
 // 思考强度、权限模式。回合状态从聊天头挪到这里。
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, onBeforeUnmount } from 'vue'
 import { NPopover } from 'naive-ui'
 import type { AgentApp, AgentUsage } from '@/api/client'
 
 const props = defineProps<{
   state: 'running' | 'idle' | 'dead'
+  // 回合起始时刻(父组件从落库的 status 事件取的 epoch ms):计时锚定在它
+  // 上面,刷新/退出重进后接着跳而不是从 0 重来。缺省(老会话)才本地起表。
+  turnStartedAt?: number
+  // 最近一回合的执行时长(idle 时展示:完成后底部仍报本次耗时,claude code 同款)。
+  lastTurnMs?: number
   pendingApproval?: boolean
   // agent 的提问还挂着(AskUserQuestion 选项卡未答):优先显示"等待回答"。
   pendingAsk?: boolean
@@ -31,15 +36,50 @@ watch(() => props.state, (s) => {
   if (s === 'running') verb.value = VERBS[Math.floor(Math.random() * VERBS.length)]
 })
 
+// 思考中计时(claude code 同款动词旁的秒数):优先锚定父组件给的服务端
+// 起始时刻(刷新/重进后接着跳),没有才本地从 0 起表。等待审批/回答也算
+// 在时长里(回合没结束)。离开 running 停表不清零,最后一次时长留在文本
+// 里,下回合重新计。锚点晚到(历史加载完才有 createdAt)时换锚不重跳。
+const elapsed = ref(0)
+let startedAt = 0
+let timer: ReturnType<typeof setInterval> | null = null
+function stopTimer() {
+  if (timer) { clearInterval(timer); timer = null }
+}
+function restartTimer() {
+  // Date.now() 可能落后于服务端时钟(钟差),负数按 0 算。
+  startedAt = props.turnStartedAt || Date.now()
+  elapsed.value = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  stopTimer()
+  timer = setInterval(() => { elapsed.value = Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) }, 1000)
+}
+watch([() => props.state, () => props.turnStartedAt], ([s]) => {
+  if (s === 'running') restartTimer()
+  else stopTimer()
+}, { immediate: true })
+onBeforeUnmount(stopTimer)
+
+function fmtElapsed(sec: number): string {
+  if (sec < 60) return `${sec}s`
+  const m = Math.floor(sec / 60)
+  return m < 60 ? `${m}m${String(sec % 60).padStart(2, '0')}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
+}
+
 const status = computed(() => {
   if (props.pendingAsk) return { text: '等待回答', tone: 'warn', pulse: true }
   if (props.pendingApproval) return { text: '等待审批', tone: 'warn', pulse: true }
   // 压缩进行中:回合其实还在跑,但值得单独说出来(claude code 的 Compacting…)
   if (props.compacting) return { text: '压缩上下文…', tone: 'busy', pulse: true }
-  if (props.state === 'running') return { text: `${verb.value}…`, tone: 'busy', pulse: true }
-  // hapi 同款:进程活着就"在线"(绿),进程没了"离线"(灰,发消息可复活)
+  if (props.state === 'running') {
+    // 计时只在忙态显示;等审批/回答时表已停,后面那截等待时间不计(claude 同款口径)。
+    const t = props.pendingAsk || props.pendingApproval ? '' : ` ${fmtElapsed(elapsed.value)}`
+    return { text: `${verb.value}…${t}`, tone: 'busy', pulse: true }
+  }
+  // hapi 同款:进程活着就"在线"(绿),进程没了"离线"(灰,发消息可复活)。
+  // idle 时带上刚结束那回合的耗时(时间线上也有 ⏱️ 行,底部这里是常驻一眼可见)。
   if (props.state === 'dead') return { text: '离线', tone: 'dead', pulse: false }
-  return { text: '在线', tone: 'idle', pulse: false }
+  const t = props.lastTurnMs ? ` ${fmtElapsed(Math.round(props.lastTurnMs / 1000))}` : ''
+  return { text: `在线${t}`, tone: 'idle', pulse: false }
 })
 
 // ---- 上下文用量 ----
@@ -98,15 +138,13 @@ const perm = computed(() => PERM_LABELS[props.permissionMode || ''])
   <div class="statusbar">
     <div class="sb-left">
       <span class="sb-dot" :class="[status.tone, { pulse: status.pulse }]" />
-      <span v-if="status.tone === 'busy'" class="sb-verb"><span class="sb-spin">✻</span>{{ status.text }}</span>
+      <span v-if="status.tone === 'busy'" class="sb-verb">{{ status.text }}</span>
       <span v-else class="sb-text" :class="status.tone">{{ status.text }}</span>
-      <!-- 上下文用量:条 + 百分比 + token 数,点击弹明细(hapi 同款) -->
+      <!-- 上下文用量:纯文字标签(百分比 + token 数),点击弹明细;不再画
+           进度条 —— 一根 44px 的条在手机上白占一行宽 -->
       <n-popover v-if="ctx" trigger="click" placement="top-start" :show-arrow="false">
         <template #trigger>
-          <button type="button" class="sb-ctx" :class="ctx.tone">
-            <span class="sb-ctx-bar"><span class="sb-ctx-fill" :style="{ width: ctx.pct + '%' }" /></span>
-            <span class="sb-ctx-label">{{ ctx.label }}</span>
-          </button>
+          <button type="button" class="sb-ctx" :class="ctx.tone">{{ ctx.label }}</button>
         </template>
         <div class="sb-ctx-detail">
           <div v-if="ctx.details.cacheRead">缓存读取 {{ ctx.details.cacheRead }}</div>
@@ -144,27 +182,19 @@ const perm = computed(() => PERM_LABELS[props.permissionMode || ''])
 .sb-text.idle { color: var(--lr-fg-muted); }
 .sb-text.warn { color: var(--lr-warn); }
 .sb-text.dead { color: var(--lr-fg-muted); }
-/* 思考中:claude code 同款 ✻ 转动 + 动词 */
-.sb-verb { white-space: nowrap; color: #3b82f6; display: inline-flex; align-items: center; gap: 4px; }
-.sb-spin { display: inline-block; animation: sb-rotate 2.4s linear infinite; font-size: 11px; }
-@keyframes sb-rotate { to { transform: rotate(360deg); } }
+/* 思考中:动词 + 计时;跑动态由左侧状态点的 pulse 动画表达 */
+.sb-verb { white-space: nowrap; color: #3b82f6; display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
 
-/* 上下文用量按钮:透明按钮,条+文字;>70% 黄、>90% 红 */
+/* 上下文用量:纯文字标签;>70% 黄、>90% 红 */
 .sb-ctx {
-  display: inline-flex; align-items: center; gap: 6px;
   appearance: none; border: 0; background: transparent;
   font: inherit; font-size: 11px; padding: 2px 0; min-height: 24px;
   cursor: pointer; color: var(--lr-fg-muted);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
   -webkit-tap-highlight-color: transparent;
 }
 .sb-ctx.warn { color: var(--lr-warn); }
 .sb-ctx.danger { color: var(--lr-danger); }
-.sb-ctx-bar {
-  flex: none; width: 44px; height: 3px; border-radius: 2px;
-  background: rgba(127, 127, 127, .25); overflow: hidden;
-}
-.sb-ctx-fill { display: block; height: 100%; border-radius: 2px; background: currentColor; }
-.sb-ctx-label { white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 .sb-model { white-space: nowrap; font-size: 11px; color: var(--lr-fg-muted); max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .sb-effort { white-space: nowrap; font-size: 11px; color: var(--lr-fg-muted); }

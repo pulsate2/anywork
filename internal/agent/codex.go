@@ -46,6 +46,9 @@ type codexDriver struct {
 	// 最近一次 thread/goal/updated 的 objective+status(去重键)。goal 通知
 	// 每个 token 计数变化都推一遍,只有目标/状态真的变了才发卡。
 	lastGoalKey string
+	// 回合起始时刻(0 = 没在跑):结束时算时长发 turn_duration,与 claude
+	// 的回合统计同款,前端 StatusBar 之外的时间线也看得到每回合耗时。
+	turnStart time.Time
 	// 多智能体工具调用的去重与配对:两条通道(v2 的 rawResponseItem/completed
 	// 裸函数调用、v1 的 collabagenttoolcall item)会报同一 call_id,只认先到
 	// 的;names 记进行中的调用(call_id → 工具名),output 来了收卡即忘。
@@ -297,6 +300,33 @@ func (d *codexDriver) emitCompactIdle() {
 	if idle {
 		d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
 	}
+}
+
+// turnBegin / turnEnd 回合耗时统计:begin 记起始时刻,end 发 turn_duration
+// (与 claude driver 同一事件形态,前端时间线直接渲染"回合完成 · Ns")。
+// 两种通知格式(老 turn/* 与新包装 task_*)都会走到,begin 幂等:已在跑的
+// 回合重复 begin 不重置计时,免得两格式各发一遍把时长算掉一半。
+func (d *codexDriver) turnBegin() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.turnStart.IsZero() {
+		return
+	}
+	d.turnStart = time.Now()
+}
+
+func (d *codexDriver) turnEnd() {
+	d.mu.Lock()
+	start := d.turnStart
+	d.turnStart = time.Time{}
+	d.mu.Unlock()
+	if start.IsZero() {
+		return
+	}
+	d.emit(Event{Kind: KindSystemInfo, Payload: &SystemInfoPayload{
+		Type:       "turn_duration",
+		DurationMs: float64(time.Since(start).Milliseconds()),
+	}})
 }
 
 // ApplySettings 运行中调整:存进 driver,下一回合 turn/start 生效(原生支持)。
@@ -936,11 +966,13 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 				d.turnID = turnID
 				d.mu.Unlock()
 			}
+			d.turnBegin()
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
 		case "task_complete", "turn_aborted":
 			d.mu.Lock()
 			d.turnID = ""
 			d.mu.Unlock()
+			d.turnEnd()
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
 		case "context_compacted":
 			// 上下文压缩完成(新版包装事件):不带 token 细节。
@@ -950,6 +982,7 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 			d.mu.Lock()
 			d.turnID = ""
 			d.mu.Unlock()
+			d.turnEnd()
 			if !m.WillRetry {
 				msg := m.Error
 				if msg == "" {
@@ -1077,6 +1110,7 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		d.mu.Lock()
 		d.lastTurnDiff = "" // 回合开始:diff 计数归零
 		d.mu.Unlock()
+		d.turnBegin()
 		d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
 
 	case "turn/diff/updated":
@@ -1123,6 +1157,7 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		d.mu.Lock()
 		d.turnID = "" // 回合结束(含打断):清掉,下次 Interrupt 不至于拿旧 id
 		d.mu.Unlock()
+		d.turnEnd()
 		switch status {
 		case "interrupted", "cancelled", "canceled":
 			// 打断不算失败:安静回到 idle。
@@ -1258,7 +1293,7 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
 				Tool:      "Bash",
 				ToolUseID: itemID,
-				Args:      truncate(string(b), 16*1024),
+				Args:      truncateJSON(string(b), 16*1024),
 				State:     "running",
 			}})
 		} else {
@@ -1291,7 +1326,8 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
 				Tool:      "ApplyPatch",
 				ToolUseID: itemID,
-				Args:      truncate(args, 60*1024),
+				// truncateJSON:保持合法 JSON,前端按结构解析 per-file diff。
+				Args:      truncateJSON(args, 60*1024),
 				State:     "running",
 			}})
 		} else {
@@ -1352,7 +1388,7 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
 				Tool:      tool,
 				ToolUseID: itemID,
-				Args:      truncate(string(args), 16*1024),
+				Args:      truncateJSON(string(args), 16*1024),
 				State:     "running",
 			}})
 		} else {

@@ -96,10 +96,13 @@ type Event struct {
 type ToolCallPayload struct {
 	Tool      string   `json:"tool"`
 	ToolUseID string   `json:"toolUseId,omitempty"`
-	Args      string   `json:"args"`             // JSON 序列化并截断后的参数
-	Result    string   `json:"result,omitempty"` // 文本化并截断后的结果
-	Images    []string `json:"images,omitempty"` // image 块的文件名
-	State     string   `json:"state"`            // running | ok | error
+	// ParentToolUseID 非空 = 子 agent(Task 工具)的内部工具调用:前端把它
+	// 挂到父 Task 卡下面当"过程"展示,不进主时间线。
+	ParentToolUseID string   `json:"parentToolUseId,omitempty"`
+	Args            string   `json:"args"`             // JSON 序列化并截断后的参数
+	Result          string   `json:"result,omitempty"` // 文本化并截断后的结果
+	Images          []string `json:"images,omitempty"` // image 块的文件名
+	State           string   `json:"state"`            // running | ok | error
 }
 
 // PermissionReqPayload KindPermissionReq 的负载。
@@ -124,9 +127,9 @@ type StatusPayload struct {
 }
 
 // UsagePayload KindUsage 的负载。Context 是"当前上下文占用"(claude =
-// input+cache_read+cache_creation;codex 的 input 本就含缓存),前端拿它
-// 对模型上下文窗口算百分比。Window 是真实窗口大小(claude result 的
-// modelUsage 透传;0 = 没给,前端回落启发式)。
+// input+cache_read,cache_creation 不算 —— 缓存写入的 token 不驻留上下文;
+// codex 的 input 本就含缓存),前端拿它对模型上下文窗口算百分比。Window 是
+// 真实窗口大小(claude result 的 modelUsage 透传;0 = 没给,前端回落启发式)。
 type UsagePayload struct {
 	Context   int    `json:"context"`
 	Output    int    `json:"output,omitempty"`
@@ -576,4 +579,50 @@ func truncate(s string, limit int) string {
 		cut--
 	}
 	return s[:cut] + "…(已截断)"
+}
+
+// truncateJSON 工具参数的截断:保持 JSON 合法。盲切字节会切进字符串中间,
+// 前端 parse 失败后整段退回纯文本,Edit/Write 的 diff 渲染跟着丢。这里解析后
+// 把超长字符串值各自截短、重新序列化 —— 结构与短字段(file_path、old_string
+// 边界等)全保留,前端照常取得到;截不进限额时退回信封形态兜底。
+func truncateJSON(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return truncateEnvelope(s, limit)
+	}
+	// 每个字符串值单独限长 limit/2:单值再大也不连累整个结构,剩余额度留给别的字段。
+	b, err := json.Marshal(capStringValues(v, limit/2))
+	if err != nil || len(b) > limit {
+		return truncateEnvelope(s, limit)
+	}
+	return string(b)
+}
+
+// capStringValues 递归截短对象里过长的字符串值(map/array/嵌套都走一遍)。
+func capStringValues(v any, cap int) any {
+	switch t := v.(type) {
+	case string:
+		if len(t) > cap {
+			return truncate(t, cap)
+		}
+	case map[string]any:
+		for k, val := range t {
+			t[k] = capStringValues(val, cap)
+		}
+	case []any:
+		for i, val := range t {
+			t[i] = capStringValues(val, cap)
+		}
+	}
+	return v
+}
+
+// truncateEnvelope 非法 JSON/截不进限额时的兜底:与 marshalPayload 同款信封,
+// 保证落库的始终是合法 JSON,原文前缀以纯文本可见。
+func truncateEnvelope(s string, limit int) string {
+	raw, _ := json.Marshal(truncate(s, limit))
+	return `{"truncated":true,"raw":` + string(raw) + `}`
 }

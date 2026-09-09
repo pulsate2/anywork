@@ -102,6 +102,9 @@ interface Card {
   key: string
   kind: 'user' | 'assistant' | 'reasoning' | 'tool' | 'toolgroup' | 'approval' | 'askuser' | 'error' | 'system'
   text?: string
+  // 思考块的生成耗时(相邻事件的 createdAt 差):claude code 的思考
+  // 过程摘要在收尾时同样报时长,这里对齐。
+  thinkMs?: number
   call?: AgentToolCall
   // 系统提示线(上下文压缩/api_error/回合统计等):居中淡色一行,不占聊天气泡。
   compaction?: AgentCompaction
@@ -118,6 +121,9 @@ interface Card {
   extraReqs?: AgentPermissionReq[]
   // 工具卡内嵌审批:同工具的审批请求并进这张工具卡(Write 两卡合一)。
   pendingReq?: AgentPermissionReq
+  // 子 agent(Task/Agent 工具)的过程:parentToolUseId 指向本卡的
+  // toolUseId,按到达顺序合并(同 toolUseId 的 running/result 配对)。
+  steps?: AgentToolCall[]
 }
 
 // 卡片由此派生之前先声明已决记录(上面的 computed 引用它)。
@@ -257,7 +263,8 @@ const cards = computed<Card[]>(() => {
   const askIndex = new Map<string, number>() // ask reqId → out 下标
   // 隐藏的任务类工具的 toolUseId:它们的结果事件(tool 名可能为空)一并隐藏。
   const hiddenToolIds = new Set<string>()
-  for (const ev of messages.value) {
+  for (let i = 0; i < messages.value.length; i++) {
+    const ev = messages.value[i]
     switch (ev.kind) {
       case 'user':
         if (typeof ev.payload === 'string' && ev.payload) out.push({ key: `m${ev.seq}`, kind: 'user', text: ev.payload })
@@ -274,7 +281,21 @@ const cards = computed<Card[]>(() => {
         if (typeof ev.payload === 'string' && ev.payload) out.push({ key: `m${ev.seq}`, kind: 'assistant', text: ev.payload })
         break
       case 'reasoning':
-        if (typeof ev.payload === 'string' && ev.payload) out.push({ key: `m${ev.seq}`, kind: 'reasoning', text: ev.payload })
+        // 思考耗时 = 生成跨度:前一条事件(用户消息/权限答复/上一工具)到
+        // 本条的时间差。不能量"本条→下一条"—— thinking 完整消息与其后的
+        // 正文/工具调用同一秒落库,那个差恒为 0(DB 实测)。
+        if (typeof ev.payload === 'string' && ev.payload) {
+          let ms = 0
+          for (let j = i - 1; j >= 0; j--) {
+            const prev = messages.value[j]
+            if (prev.kind === 'reasoning_delta' || prev.kind === 'assistant_delta') continue
+            const t0 = Date.parse(prev.createdAt)
+            const t1 = Date.parse(ev.createdAt)
+            if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) ms = t1 - t0
+            break
+          }
+          out.push({ key: `m${ev.seq}`, kind: 'reasoning', text: ev.payload, thinkMs: ms })
+        }
         break
       case 'error': {
         const p = ev.payload as { message?: string } | null
@@ -315,6 +336,22 @@ const cards = computed<Card[]>(() => {
       }
       case 'tool_call': {
         const p = ev.payload as AgentToolCall
+        // 子 agent 的过程事件:挂到父 Task/Agent 卡(按 parentToolUseId 找),
+        // 不进主时间线。父卡可能还没到(事件顺序异常/历史截断),丢掉就好 ——
+        // 过程是锦上添花,不值得为它单开卡。
+        if (p.parentToolUseId) {
+          const host = toolIndex.get(p.parentToolUseId)
+          if (host !== undefined && out[host].steps) {
+            const steps = out[host].steps!
+            const i = p.toolUseId ? steps.findIndex((s) => s.toolUseId === p.toolUseId) : -1
+            if (i >= 0) {
+              steps[i] = { ...steps[i]!, result: p.result, state: p.state }
+            } else {
+              steps.push(p)
+            }
+          }
+          break
+        }
         // Task 套件与 TodoWrite 不出卡:状态汇进顶部 sessionTasks 面板。
         // 结果事件的 tool 可能为空串(claude 老数据:tool_result 不带名),
         // 靠记录下来的 toolUseId 追溯隐藏,否则会兜底单开一张卡漏进时间线。
@@ -331,7 +368,9 @@ const cards = computed<Card[]>(() => {
           }
           break
         }
-        out.push({ key: `m${ev.seq}`, kind: 'tool', call: p })
+        // 子 agent 宿主卡(Task/Agent)预置 steps,过程事件有地方挂。
+        const isSubagentHost = p.tool === 'Task' || p.tool === 'Agent' || p.tool === 'CodexAgent'
+        out.push({ key: `m${ev.seq}`, kind: 'tool', call: p, ...(isSubagentHost ? { steps: [] } : {}) })
         if (p.toolUseId) toolIndex.set(p.toolUseId, out.length - 1)
         break
       }
@@ -434,7 +473,6 @@ function sysinfoText(p: AgentSystemInfo): string {
       const dur = sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`
       const parts = [`回合完成 · ${dur}`]
       if (p.turns) parts.push(`${p.turns} 轮`)
-      if (p.costUsd) parts.push(`$${p.costUsd.toFixed(2)}`)
       return parts.join(' · ')
     }
     case 'away_summary':
@@ -492,6 +530,26 @@ function groupToolCards(cards: Card[]): Card[] {
   return out
 }
 
+// fmtThink 思考耗时文案(思考过程摘要用):秒/分秒,两三秒的短思考只报秒。
+function fmtThink(ms: number): string {
+  const sec = Math.max(1, Math.round(ms / 1000))
+  return sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`
+}
+
+// 最近一次回合的执行时长(StatusBar 在 idle 时展示,像 claude code 底部那样
+// 完成后仍报本次耗时):取最后一条 turn_duration 事件,而非本地秒表 ——
+// 刷新/重进历史会话同样拿得到。
+const lastTurnMs = computed<number | undefined>(() => {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const ev = messages.value[i]
+    if (ev.kind === 'system_info') {
+      const p = ev.payload as AgentSystemInfo | null
+      if (p?.type === 'turn_duration') return p.durationMs
+    }
+  }
+  return undefined
+})
+
 // 回合状态:会话存活时看最后一条 status 事件,死了就是 dead。
 const turnState = computed<'running' | 'idle' | 'dead'>(() => {
   if (!selected.value || selected.value.status === 'dead') return 'dead'
@@ -500,6 +558,22 @@ const turnState = computed<'running' | 'idle' | 'dead'>(() => {
     if (ev.kind === 'status') return (ev.payload as { state?: string })?.state === 'running' ? 'running' : 'idle'
   }
   return 'idle'
+})
+
+// 当前回合的起始时刻:running 那条 status 事件落库的 createdAt。计时锚定在
+// 服务端时间上,页面刷新/退出重进后不从头重跳;没有(老会话缺事件)才回落
+// 到 StatusBar 本地起表。
+const turnStartedAt = computed<number | undefined>(() => {
+  if (turnState.value !== 'running') return undefined
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const ev = messages.value[i]
+    if (ev.kind === 'status') {
+      if ((ev.payload as { state?: string })?.state !== 'running') return undefined
+      const t = Date.parse(ev.createdAt)
+      return Number.isFinite(t) ? t : undefined
+    }
+  }
+  return undefined
 })
 
 // 压缩进行中(claude code 底部 Compacting… 同款):从后往前找,先碰到
@@ -608,10 +682,14 @@ const hasOlder = ref(false)
 const loadingOlder = ref(false)
 
 // 手机上聊天视图盖住列表;桌面两栏并排(CSS 处理,这里只管状态)。
+// messagesLoading:历史拉取期间时间线显示加载指示,而不是"会话已就绪"
+// 的空态文案(新会话里那条误导 —— 打开老会话时它先闪一下再被内容顶掉)。
+const messagesLoading = ref(false)
 async function openSession(id: string) {
   if (selectedId.value && selectedId.value !== id) ws.unsubscribe(selectedId.value)
   selectedId.value = id
   messages.value = []
+  messagesLoading.value = true
   streamText.value = ''
   streamThink.value = ''
   decided.value.clear()
@@ -626,6 +704,8 @@ async function openSession(id: string) {
     hasOlder.value = got.length >= MSG_PAGE && got[0].seq > 1
   } catch (e: any) {
     message.error(e?.message || '加载历史失败')
+  } finally {
+    messagesLoading.value = false
   }
   ws.subscribe(id)
   scrollBottom(true)
@@ -671,6 +751,32 @@ function scrollBottom(force = false) {
   nextTick(() => { el.scrollTop = el.scrollHeight })
 }
 watch(() => cards.value.length, () => scrollBottom())
+
+// ---- 不在底部时的"新消息"浮标 ----
+// 视口距底 >120px 视为"在翻历史":此时新事件到达不跟底,改为计数 + 底部
+// 浮一条"有 x 条新消息 ↓";点它(或自己滚回底部)清零。手机上信息流
+// 从顶部看起,agent 跑着时不断有新事件,没有这条浮标就永远不知道底下
+// 已经堆了多少。
+const newMsgCount = ref(0)
+const scrolledUp = ref(false)
+function onTimelineScroll() {
+  const el = timelineEl.value
+  if (!el) return
+  const up = el.scrollHeight - el.scrollTop - el.clientHeight > 120
+  // 用户滚回底部:浮标即刻消失(顺滑,不必等事件)。
+  if (!up && newMsgCount.value) newMsgCount.value = 0
+  scrolledUp.value = up
+}
+// 新事件到达时若在翻历史:计数 +1;已滚到底则照旧跟底。maxSeq(新事件
+// 落库)与 cards 长度(卡片形态变化,如 tool_result 配对成功)都算,
+// 但同一事件可能两者都变 —— 用 maxSeq 计数即可覆盖,cards 只负责跟底。
+watch(maxSeq, () => {
+  if (scrolledUp.value) newMsgCount.value++
+})
+function jumpToBottom() {
+  newMsgCount.value = 0
+  scrollBottom(true)
+}
 
 // ---- 发送 / 排队 / 打断 / 审批 ----
 const sending = ref(false)
@@ -1239,11 +1345,18 @@ onBeforeUnmount(() => {
         </div>
       </details>
 
-      <div ref="timelineEl" class="chat-timeline">
+      <div ref="timelineEl" class="chat-timeline" @scroll.passive="onTimelineScroll">
+        <!-- 不在底部时的新消息浮标:贴在时间线底缘(输入区上方),点击跳底 -->
+        <button v-if="newMsgCount" type="button" class="new-msg-pill" @click="jumpToBottom">
+          有 {{ newMsgCount }} 条新消息 ↓
+        </button>
         <div v-if="hasOlder" class="load-older">
           <n-button size="tiny" quaternary :loading="loadingOlder" @click="loadOlder">加载更早的消息</n-button>
         </div>
-        <n-empty v-if="!cards.length" description="会话已就绪,发第一条消息开始" class="chat-empty" />
+        <n-empty v-if="messagesLoading" class="chat-empty" description="加载会话记录…">
+          <template #icon><n-spin size="medium" /></template>
+        </n-empty>
+        <n-empty v-else-if="!cards.length" description="会话已就绪,发第一条消息开始" class="chat-empty" />
         <div v-for="c in cards" :key="c.key" class="chat-row" :class="c.kind">
           <!-- 用户气泡:点击在下方浮现复制键(再点收起);✓ 一闪即回 -->
           <div v-if="c.kind === 'user'" class="user-bubble-wrap">
@@ -1260,16 +1373,17 @@ onBeforeUnmount(() => {
           </div>
           <div v-else-if="c.kind === 'assistant'" class="agent-plain agent-md-body" v-html="renderMarkdown(c.text || '')" />
           <details v-else-if="c.kind === 'reasoning'" class="reasoning">
-            <summary>思考过程</summary>
+            <summary>思考过程{{ c.thinkMs ? ` · ${fmtThink(c.thinkMs)}` : '' }}</summary>
             <div class="reasoning-body">{{ c.text }}</div>
           </details>
           <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" :session-id="selectedId || undefined" />
           <ToolCallCard
             v-else-if="c.kind === 'tool' && c.call" :call="c.call" :session-id="selectedId || undefined"
-            :pending-req="c.pendingReq" :pending-resolved="c.resolved ?? null"
+            :steps="c.steps" :pending-req="c.pendingReq" :pending-resolved="c.resolved ?? null"
             :approve-busy="c.pendingReq ? approveBusy === c.pendingReq.reqId : false"
             @decide="(allow, session) => c.pendingReq && decide(c.pendingReq.reqId, allow, session)"
           />
+          <!-- 子 agent 过程已并入上面的父卡(steps),不再另起一张卡 -->
           <ApprovalCard
             v-else-if="c.kind === 'approval' && c.req"
             :req="c.req" :resolved="c.resolved ?? null" :busy="approveBusy === c.req.reqId"
@@ -1331,6 +1445,8 @@ onBeforeUnmount(() => {
       <!-- 状态行(hapi StatusBar 同款位置):回合状态 + 上下文用量都从聊天头挪到这里 -->
       <StatusBar
         :state="turnState"
+        :turn-started-at="turnStartedAt"
+        :last-turn-ms="lastTurnMs"
         :pending-approval="pendingApproval"
         :pending-ask="pendingAsk"
         :compacting="compacting"
@@ -1636,6 +1752,19 @@ onBeforeUnmount(() => {
   padding: 12px 2px;
   display: flex; flex-direction: column; gap: 10px;
 }
+/* 新消息浮标:sticky 钉在时间线滚动容器底缘(随内容滚但一直贴底),
+   与跟底逻辑/输入区互不遮挡;主题主色底 + 白字,一眼可见 */
+.new-msg-pill {
+  position: sticky; bottom: 4px; z-index: 5;
+  align-self: center;
+  margin: 4px auto 0;
+  appearance: none; border: 0; border-radius: 16px;
+  padding: 5px 14px; min-height: 30px;
+  background: var(--lr-accent); color: #fff;
+  font: inherit; font-size: 12px; font-weight: 500;
+  cursor: pointer; box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
+  -webkit-tap-highlight-color: transparent;
+}
 .chat-empty { padding: 60px 0; }
 .load-older { display: flex; justify-content: center; }
 
@@ -1685,6 +1814,9 @@ onBeforeUnmount(() => {
 .chat-row > * { min-width: 0; }
 .chat-row.user { justify-content: flex-end; }
 .chat-row.tool, .chat-row.toolgroup, .chat-row.approval, .chat-row.reasoning, .chat-row.error { justify-content: stretch; }
+/* 卡类元素宽度统一拉满整行:不设的话 flex 子项按内容收缩,短命令的卡窄、
+   长命令的卡宽,时间线上长短不齐 */
+.chat-row.tool > *, .chat-row.toolgroup > *, .chat-row.approval > *, .chat-row.reasoning > * { width: 100%; }
 
 /* 顶部任务面板(hapi SessionStatusPanel 同款):钉在 header 下的折叠面板,
    永远显示最新任务快照;Task 套件/TodoWrite 的事件都汇进这里 */

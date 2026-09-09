@@ -2,7 +2,7 @@
 // 工具调用单行卡片:一行摘要(工具名 + 关键参数 + 状态),点击弹窗看全量详情
 // (编辑类工具是行级 diff,其余是参数原文与结果)。长输出不再把手机滚穿,
 // 详情是明确动作。审批请求仍内嵌在行下方,不跟着弹窗走。
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { NModal } from 'naive-ui'
 import { api, type AgentPermissionReq, type AgentToolCall } from '@/api/client'
 import DiffView from './DiffView.vue'
@@ -10,6 +10,9 @@ import ApprovalCard from './ApprovalCard.vue'
 
 const props = defineProps<{
   call: AgentToolCall
+  // 子 agent 步骤(Task/Agent 卡的过程):嵌在本卡内部,不再另起一张卡 ——
+  // 父卡与过程是一体的时间线单元。
+  steps?: AgentToolCall[]
   // 会话 id:tool_result 的 image 块经 /api/agent/sessions/{id}/files/{name} 取。
   sessionId?: string
   // 内嵌审批:同工具的审批请求并进工具卡(Write/Edit 审批与调用同卡呈现)。
@@ -21,6 +24,83 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'decide', allow: boolean, session: boolean): void }>()
 
 const open = ref(false)
+
+// ---- 子 agent 步骤(嵌在本卡里,不另起卡) ----
+// 列表展开态:父卡在跑默认展开(实时看子 agent 在做什么),完成默认收起;
+// 用户手动点过就不再跟父卡状态走。
+const stepsOpen = ref(props.call.state === 'running')
+watch(() => props.call.state, (s) => {
+  if (s === 'running') stepsOpen.value = true
+})
+
+// 子 agent 单条的目标摘要(Read 的 file_path、Bash 的 command…)。
+function stepBrief(c: AgentToolCall): string {
+  try {
+    const args = c.args ? JSON.parse(c.args) : null
+    if (args && typeof args === 'object') {
+      for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'description']) {
+        const v = (args as Record<string, unknown>)[key]
+        if (typeof v === 'string' && v) return v
+      }
+    }
+  } catch { /* 截断的 args:留空 */ }
+  return ''
+}
+
+// 步骤单条详情(与主卡详情同款):编辑类给 diff,其余给参数 + 结果。
+const stepDetail = ref<AgentToolCall | null>(null)
+const stepDetailOpen = computed({
+  get: () => !!stepDetail.value,
+  set: (v: boolean) => { if (!v) stepDetail.value = null },
+})
+
+function stepParseArgs(c: AgentToolCall): Record<string, unknown> | null {
+  try {
+    const v = c.args ? JSON.parse(c.args) : null
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : null
+  } catch { return null }
+}
+
+const stepDetailDiff = computed<DiffBlock[] | null>(() => {
+  const c = stepDetail.value
+  if (!c) return null
+  const t = c.tool
+  if (t !== 'Edit' && t !== 'MultiEdit' && t !== 'Write' && t !== 'NotebookEdit') return null
+  const args = stepParseArgs(c)
+  if (!args) return null
+  const filePath = typeof args.file_path === 'string' ? args.file_path : ''
+  if (t === 'MultiEdit' && Array.isArray(args.edits)) {
+    const blocks: DiffBlock[] = []
+    for (const e of args.edits) {
+      if (e && typeof e === 'object' && typeof (e as any).old_string === 'string' && typeof (e as any).new_string === 'string') {
+        blocks.push({ old: (e as any).old_string, new: (e as any).new_string, path: filePath } as DiffBlock)
+      }
+    }
+    return blocks.length ? blocks : null
+  }
+  const content = typeof args.content === 'string' ? args.content
+    : typeof args.code_content === 'string' ? args.code_content : ''
+  const oldStr = typeof args.old_string === 'string' ? args.old_string : ''
+  const newStr = t === 'Write' ? content : (typeof args.new_string === 'string' ? args.new_string : '')
+  if (t !== 'Write' && oldStr === '' && newStr === '') return null
+  return [{ old: oldStr, new: newStr, path: filePath } as DiffBlock]
+})
+
+const stepDetailArgs = computed(() => {
+  const raw = stepDetail.value?.args
+  if (!raw) return ''
+  try {
+    const v = JSON.parse(raw)
+    if (v && typeof v === 'object') return JSON.stringify(v, null, 2)
+  } catch { /* 截断的 JSON:原样 */ }
+  return raw
+})
+
+const stepDetailImages = computed<string[]>(() =>
+  props.sessionId && stepDetail.value?.images?.length
+    ? stepDetail.value.images.map((n) => api.agentFileUrl(props.sessionId!, n))
+    : [],
+)
 
 // tool_result 里 image 块的缩略图地址(有会话 id 且带图才有)。
 const imageUrls = computed<string[]>(() =>
@@ -35,9 +115,12 @@ const lightboxOpen = computed({
   set: (v: boolean) => { if (!v) lightbox.value = null },
 })
 
-const stateLabel = computed(() =>
-  props.call.state === 'running' ? '运行中' : props.call.state === 'error' ? '出错' : '完成',
-)
+const stateLabel = computed(() => {
+  // 拒绝的调用不会真跑:结论直接就是"已拒绝"(替代旧的"出错"),
+  // 不再在卡下另挂一张"已拒绝"审批条。
+  if (props.pendingResolved && !props.pendingResolved.allow) return '已拒绝'
+  return props.call.state === 'running' ? '运行中' : props.call.state === 'error' ? '出错' : '完成'
+})
 
 function parseArgs(): Record<string, unknown> | null {
   try {
@@ -47,12 +130,40 @@ function parseArgs(): Record<string, unknown> | null {
   return null
 }
 
+// 截断兜底:后端信封形态 {"truncated":true,"raw":"…前缀…"} 的参数虽 parse 不回
+// 结构,diff/摘要都取不到字段,但 raw 前缀是合法 JSON 的开头 —— 再 parse 一次,
+// 能解出对象就把已到手的部分当参数用(仅丢了被截字段的后半,前面字段仍可渲染)。
+function parseArgsLenient(): Record<string, unknown> | null {
+  const strict = parseArgs()
+  if (strict) return strict
+  const raw = props.call.args
+  if (!raw) return null
+  // raw 是被截断的 JSON 字符串原文(自身带引号与转义):先解出一层拿到原文,
+  // 剥掉截断提示后补一个收尾引号,常能把外层对象解出来 —— 截断多落在字符串
+  // 值中间,补上引号和收尾括号后其余字段(如 file_path)完整可用。
+  try {
+    const env = JSON.parse(raw) as { truncated?: boolean; raw?: string }
+    if (!env || env.truncated !== true || typeof env.raw !== 'string') return null
+    let body = env.raw
+    const cut = body.lastIndexOf('…(已截断)')
+    if (cut >= 0) body = body.slice(0, cut)
+    for (const patched of [body + '"}', body + '"', body]) {
+      try {
+        const v = JSON.parse(patched)
+        if (v && typeof v === 'object') return v as Record<string, unknown>
+      } catch { /* 下一种补法 */ }
+      }
+  } catch { /* 不是信封形态 */ }
+  return null
+}
+
 // 摘要行给一眼能认出的关键参数:命令(Bash 的 command)、路径、文件名,
-// 多智能体工具(spawn_agent 的 task_name、send_message 的 message 等)。
+// 多智能体工具(spawn_agent 的 task_name、send_message 的 message 等),
+// 子 agent(Agent/Task 的 description、TaskOutput 的 task_id)。
 const brief = computed(() => {
   const args = parseArgs()
   if (!args) return ''
-  for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'task_name', 'target', 'message']) {
+  for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'task_name', 'description', 'task_id', 'target', 'message']) {
     if (typeof args[key] === 'string' && (args[key] as string)) return args[key] as string
   }
   const first = Object.values(args)[0]
@@ -92,7 +203,7 @@ const applyPatchBrief = computed(() => {
 const command = computed(() => brief.value || props.call.args || '')
 
 // ---- 编辑类工具的 diff ----
-interface DiffBlock { old: string; new: string }
+interface DiffBlock { old: string; new: string; path?: string }
 
 // Edit: old_string → new_string;Write: 全新内容(old 为空);
 // MultiEdit: edits 数组逐个展开,连续拼接(顺序即生效顺序)。
@@ -176,7 +287,7 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
   const t = props.call.tool
   if (t === 'ApplyPatch') return patchDiff.value
   if (t === 'CodexDiff') {
-    const args = parseArgs()
+    const args = parseArgsLenient()
     if (args && typeof args.unified_diff === 'string') {
       const blocks = parseUnifiedDiff(args.unified_diff)
       return blocks.length ? blocks : null
@@ -184,7 +295,7 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
     return null
   }
   if (t !== 'Edit' && t !== 'MultiEdit' && t !== 'Write' && t !== 'NotebookEdit') return null
-  const args = parseArgs()
+  const args = parseArgsLenient()
   if (!args) return null
   const filePath = typeof args.file_path === 'string' ? args.file_path : ''
   if (t === 'MultiEdit' && Array.isArray(args.edits)) {
@@ -221,6 +332,25 @@ const inlineDiff = computed(() =>
       <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
       <span class="tool-state">{{ stateLabel }}</span>
     </button>
+    <!-- 子 agent 过程:嵌在父卡内的一体区块(不另起卡)。头部一行开关,
+         单条可点看详情;每条上下两行(工具名一行、摘要换行下一行) -->
+    <div v-if="steps?.length" class="steps">
+      <button type="button" class="steps-toggle" @click="stepsOpen = !stepsOpen">
+        <span class="steps-caret" :class="{ open: stepsOpen }" />过程({{ steps.length }})
+      </button>
+      <div v-if="stepsOpen" class="steps-body">
+        <button
+          v-for="(c, i) in steps" :key="c.toolUseId || i" type="button"
+          class="steps-item" :class="c.state" @click="stepDetail = c"
+        >
+          <div class="steps-line">
+            <span class="steps-dot" />
+            <span class="steps-name">{{ c.tool || '工具' }}</span>
+          </div>
+          <div v-if="stepBrief(c)" class="steps-brief">{{ stepBrief(c) }}</div>
+        </button>
+      </div>
+    </div>
     <!-- codex 改动卡:diff 直接铺在卡片里,不用点开就能看见改了什么 -->
     <div v-if="inlineDiff" class="tool-inline-diff">
       <DiffView
@@ -234,10 +364,11 @@ const inlineDiff = computed(() =>
         <img :src="u" :alt="`图片 ${i + 1}`" loading="lazy" />
       </button>
     </div>
-    <!-- 内嵌审批:compact 省掉命令摘要行(头部本来就显示着);留在时间线上,弹窗打开也能答复 -->
+    <!-- 内嵌审批:compact 省掉命令摘要行(头部本来就显示着);留在时间线上,弹窗打开也能答复。
+         已答复的不再渲染 —— 结论并进卡头的状态词(允许→完成,拒绝→出错),一卡一行一个结论 -->
     <ApprovalCard
-      v-if="pendingReq"
-      :req="pendingReq" :resolved="pendingResolved ?? null" :busy="approveBusy" compact
+      v-if="pendingReq && !pendingResolved"
+      :req="pendingReq" :busy="approveBusy" compact
       class="tool-approval"
       @decide="(allow, session) => emit('decide', allow, session)"
     />
@@ -259,6 +390,23 @@ const inlineDiff = computed(() =>
         <div v-else-if="call.state === 'running'" class="tool-wait">等待结果…</div>
         <div v-if="imageUrls.length" class="tool-imgs">
           <img v-for="(u, i) in imageUrls" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
+        </div>
+      </div>
+    </n-modal>
+    <!-- 子 agent 单条详情:与主卡详情同款(diff/参数/结果/图片) -->
+    <n-modal v-model:show="stepDetailOpen" preset="card" :title="stepDetail?.tool || '工具'" class="tool-modal">
+      <div class="tool-detail">
+        <template v-if="stepDetailDiff">
+          <DiffView
+            v-for="(b, i) in stepDetailDiff" :key="i"
+            :old="b.old" :new="b.new" :file-path="b.path || ''"
+          />
+        </template>
+        <pre v-else-if="stepDetailArgs" class="tool-block">{{ stepDetailArgs }}</pre>
+        <pre v-if="stepDetail?.result" class="tool-block result">{{ stepDetail.result }}</pre>
+        <div v-else-if="stepDetail?.state === 'running'" class="tool-wait">等待结果…</div>
+        <div v-if="stepDetailImages.length" class="tool-imgs">
+          <img v-for="(u, i) in stepDetailImages" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
         </div>
       </div>
     </n-modal>
@@ -308,6 +456,45 @@ const inlineDiff = computed(() =>
 .tool-brief::-webkit-scrollbar { display: none; }
 .tool-state { flex: none; font-size: 11px; color: var(--lr-fg-muted); }
 .tool-card.error .tool-state { color: var(--lr-danger); }
+
+/* ---- 子 agent 过程(嵌在父卡内的区块) ---- */
+.steps { border-top: 1px solid rgba(127, 127, 127, .14); }
+.steps-toggle {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; min-height: 32px; padding: 4px 10px;
+  appearance: none; border: 0; background: transparent;
+  font: inherit; font-size: 12px; color: var(--lr-fg-muted);
+  cursor: pointer; text-align: left;
+  -webkit-tap-highlight-color: transparent;
+}
+.steps-caret {
+  flex: none; width: 1em; text-align: center;
+  opacity: .7; transition: transform .15s ease;
+  /* 收起 ">";展开旋转 90° 朝下 */
+}
+.steps-toggle .steps-caret::before { content: '›'; font-weight: 600; }
+.steps-caret.open { transform: rotate(90deg); }
+.steps-body { padding: 0 0 4px; }
+/* 每条可点(弹窗看该次参数与结果);上下两行,不左右挤 */
+.steps-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  width: 100%; padding: 5px 10px 5px 22px;
+  appearance: none; border: 0; background: transparent;
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  min-height: 38px;
+}
+.steps-item:hover { background: rgba(127, 127, 127, .06); }
+.steps-line { display: flex; align-items: center; gap: 6px; align-self: stretch; }
+.steps-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--lr-ok); }
+.steps-item.error .steps-dot { background: var(--lr-danger); }
+.steps-item.running .steps-dot { background: var(--lr-warn); animation: tool-pulse 1.2s ease-in-out infinite; }
+.steps-name { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg); }
+.steps-brief {
+  align-self: stretch;
+  white-space: normal; overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
+}
 /* 内铺 diff:多块之间只留 1px 分隔;正文高度收紧(时间线上只是扫一眼,
    完整内容仍在详情弹窗),超出内部滚动,不把手机时间线滚穿 */
 .tool-inline-diff { border-top: 1px solid rgba(127, 127, 127, .14); }

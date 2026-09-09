@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Git 视图:状态/暂存/分文件 diff/提交/分支切换/选远端推送/提交历史翻页。
 // 仓库路径 = 当前工作区。
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, h } from 'vue'
 import {
   NButton, NIcon, NInput, NList, NListItem, NEmpty, NSpin, NModal,
   NSelect, NCheckbox, NForm, NFormItem, NTag, NTabs, NTabPane,
@@ -49,6 +49,12 @@ const activeTab = ref('changes')
 // 未跟踪文件没有 diff(git diff 不看它们),点开直接进二级页并默认切到"文件"视图。
 function openUntracked(e: GitEntry) {
   goFile('untracked', e.path)
+}
+
+// git 输出是多行命令日志,naive dialog 的字符串内容会渲染成 <p> 折掉换行,
+// 所以包一层 <pre> 走 render 函数。dialog 渲染在 body 上,样式放非 scoped 块。
+function showOutDialog(title: string, out: string) {
+  dialog.info({ title, content: () => h('pre', { class: 'git-out-dialog' }, out) })
 }
 
 const commitMsg = ref('')
@@ -372,7 +378,7 @@ async function runRevert(c: GitCommit) {
   try {
     const res = await api.gitRevert(repoPath.value, 'revert', c.hash)
     message.success('已回滚')
-    if (res.out.trim()) dialog.info({ title: '回滚结果', content: res.out })
+    if (res.out.trim()) showOutDialog('回滚结果', res.out)
     await reload()
   } catch (e: any) {
     if (isNoIdentity(e)) {
@@ -521,7 +527,7 @@ async function doPush() {
     showPush.value = false
     message.success('已推送')
     // git push 的进度走 stderr,out 常常是空的。
-    if (res.out.trim()) dialog.info({ title: '推送结果', content: res.out })
+    if (res.out.trim()) showOutDialog('推送结果', res.out)
     await reload()
   } catch (e: any) {
     message.error(e?.message || '推送失败')
@@ -534,7 +540,7 @@ async function doPull() {
   try {
     const res = await api.gitPull(repoPath.value)
     message.success('已拉取')
-    if (res.out.trim()) dialog.info({ title: '拉取结果', content: res.out })
+    if (res.out.trim()) showOutDialog('拉取结果', res.out)
     await load()
   } catch (e: any) {
     message.error(e?.message || '拉取失败')
@@ -550,7 +556,7 @@ async function doFetch() {
     // fetch 的进度全在 stderr,out 基本是空的;真正的结果是刷新后的 ↓behind。
     const b = status.value?.behind ?? 0
     message.success(b > 0 ? `已获取,落后 ${b} 个提交` : '已获取,没有新提交')
-    if (res.out.trim()) dialog.info({ title: '获取结果', content: res.out })
+    if (res.out.trim()) showOutDialog('获取结果', res.out)
   } catch (e: any) {
     message.error(e?.message || '获取失败')
   } finally {
@@ -1277,4 +1283,17 @@ watch(() => store.currentPath, (p) => {
 .remote-url { grid-column: 1 / -1; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
 
+</style>
+
+<!-- dialog 渲染在 body 上,scoped 样式作用不到;git 输出日志的 <pre> 放这里 -->
+<style>
+.git-out-dialog {
+  margin: 0; padding: 8px 10px;
+  border: 1px solid rgba(127, 127, 127, 0.14); border-radius: var(--lr-radius);
+  background: rgba(127, 127, 127, 0.06);
+  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 60vh; overflow: auto;
+  color: var(--lr-fg);
+}
 </style>

@@ -36,7 +36,9 @@ type Status struct {
 	Reverting bool `json:"reverting"`
 }
 
-// Status 返回当前仓库的状态(porcelain=v1 -b)。
+// Status 返回当前仓库的状态(porcelain=v1 -b -uall)。
+// -uall:未跟踪目录逐文件列出,而不是折叠成一条目录记录 —— 前端要按文件
+// 暂存/删除/进二级页,折叠形态对不上。
 func (s *Service) Status(p string) (Status, error) {
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
@@ -45,7 +47,7 @@ func (s *Service) Status(p string) (Status, error) {
 	if !info.Repo {
 		return Status{}, ErrNotRepo
 	}
-	out, err := s.run(info.Root, nil, "status", "--porcelain=v1", "-b")
+	out, err := s.run(info.Root, nil, "status", "--porcelain=v1", "-b", "-uall")
 	if err != nil {
 		return Status{}, err
 	}

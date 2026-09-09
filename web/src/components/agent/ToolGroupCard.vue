@@ -7,6 +7,7 @@
 import { computed, ref } from 'vue'
 import { NModal } from 'naive-ui'
 import { api, type AgentToolCall } from '@/api/client'
+import DiffView from './DiffView.vue'
 
 const props = defineProps<{
   calls: AgentToolCall[]
@@ -78,7 +79,8 @@ function callTarget(c: AgentToolCall): string | null {
   if (kind === 'search') return safeLabel(argString(args, ['pattern', 'query']))
   if (kind === 'command') return safeLabel(argString(args, ['command', 'cmd']))
   if (kind === 'web') return safeLabel(argString(args, ['url', 'query']))
-  return safeLabel(argString(args, ['file_path', 'path', 'pattern', 'query', 'command', 'url', 'name']))
+  // other 覆盖子 agent(Agent/Task 的 description)与 TaskOutput(task_id)。
+  return safeLabel(argString(args, ['description', 'file_path', 'path', 'pattern', 'query', 'command', 'url', 'task_id', 'name']))
 }
 
 // 主导意图:组内出现最多的类型(平票先到先得,hapi getPrimaryIntent 同款)。
@@ -158,11 +160,41 @@ function rowTarget(c: AgentToolCall): string {
 }
 
 // ---- 组内单条的详情弹窗 ----
-// 详情 = 参数 + 结果 + 结果图片,组内工具全是只读类,没有 diff 分支。
+// 详情 = diff(编辑类)+ 参数 + 结果 + 结果图片。编辑类工具(Edit/Write 等)
+// 被 grouping 收进组卡时,详情弹窗同样给行级 diff,与单张工具卡一致 ——
+// 否则折叠形态下 Edit 的改动内容只剩一坨 JSON,和"修改文件"的语义对不上。
 const detail = ref<AgentToolCall | null>(null)
 const detailOpen = computed({
   get: () => !!detail.value,
   set: (v: boolean) => { if (!v) detail.value = null },
+})
+
+interface DiffBlock { old: string; new: string; path?: string }
+
+// 详情里编辑类工具的 diff 块(逻辑与 ToolCallCard.diffBlocks 的编辑分支一致)。
+const detailDiff = computed<DiffBlock[] | null>(() => {
+  const c = detail.value
+  if (!c) return null
+  const t = c.tool
+  if (t !== 'Edit' && t !== 'MultiEdit' && t !== 'Write' && t !== 'NotebookEdit') return null
+  const args = parseArgs(c)
+  if (!args) return null
+  const filePath = typeof args.file_path === 'string' ? args.file_path : ''
+  if (t === 'MultiEdit' && Array.isArray(args.edits)) {
+    const blocks: DiffBlock[] = []
+    for (const e of args.edits) {
+      if (e && typeof e === 'object' && typeof (e as any).old_string === 'string' && typeof (e as any).new_string === 'string') {
+        blocks.push({ old: (e as any).old_string, new: (e as any).new_string })
+      }
+    }
+    return blocks.length ? blocks : null
+  }
+  const content = typeof args.content === 'string' ? args.content
+    : typeof args.code_content === 'string' ? args.code_content : ''
+  const oldStr = typeof args.old_string === 'string' ? args.old_string : ''
+  const newStr = t === 'Write' ? content : (typeof args.new_string === 'string' ? args.new_string : '')
+  if (t !== 'Write' && oldStr === '' && newStr === '') return null
+  return [{ old: oldStr, new: newStr, path: filePath }]
 })
 
 // 参数展示:可解析的 JSON 缩进两格(键值一目了然),截断的非法 JSON 原样贴。
@@ -192,7 +224,9 @@ const lightboxOpen = computed({
 <template>
   <div class="group-card" :class="state">
     <button type="button" class="group-head" @click="open = !open">
-      <span class="group-dot" />
+      <!-- 折叠开关用箭头:收起 ›,展开旋转 90° 朝下(圆点换掉,状态已有右侧
+           「完成/运行中/出错」承担,圆点信息重复) -->
+      <span class="group-caret" :class="{ open }" />
       <span class="group-title">{{ title }} · {{ calls.length }} 项</span>
       <span v-if="brief" class="group-brief">{{ brief }}</span>
       <span class="group-state">{{ stateLabel }}</span>
@@ -211,7 +245,13 @@ const lightboxOpen = computed({
          ToolCallCard 非 scoped 块的全局规则 —— 两个组件总在 AgentView 一起挂载 -->
     <n-modal v-model:show="detailOpen" preset="card" :title="detail?.tool || '工具'" class="tool-modal">
       <div class="tool-detail">
-        <pre v-if="detailArgs" class="tool-block">{{ detailArgs }}</pre>
+        <template v-if="detailDiff">
+          <DiffView
+            v-for="(b, i) in detailDiff" :key="i"
+            :old="b.old" :new="b.new" :file-path="b.path || ''"
+          />
+        </template>
+        <pre v-else-if="detailArgs" class="tool-block">{{ detailArgs }}</pre>
         <pre v-if="detail?.result" class="tool-block result">{{ detail.result }}</pre>
         <div v-else-if="detail?.state === 'running'" class="tool-wait">等待结果…</div>
         <div v-if="detailImages.length" class="tool-imgs">
@@ -242,10 +282,13 @@ const lightboxOpen = computed({
   cursor: pointer; text-align: left;
   -webkit-tap-highlight-color: transparent;
 }
-.group-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--lr-warn); }
-.group-card.ok .group-dot { background: var(--lr-ok); }
-.group-card.error .group-dot { background: var(--lr-danger); }
-.group-card.running .group-dot { animation: group-pulse 1.2s ease-in-out infinite; }
+/* 折叠箭头:收起 ›,展开旋转 90° 朝下 */
+.group-caret {
+  flex: none; width: 1em; text-align: center;
+  opacity: .7; transition: transform .15s ease;
+}
+.group-caret::before { content: '›'; font-weight: 600; }
+.group-caret.open { transform: rotate(90deg); }
 @keyframes group-pulse { 50% { opacity: .35; } }
 .group-title { flex: none; font-weight: 600; font-size: 12px; }
 .group-brief {

@@ -333,8 +333,9 @@ func waitWritten(t *testing.T, stdin *bufCloser) {
 }
 
 // TestClaudeSidechainFiltered parent_tool_use_id 非空的 assistant/user 行是
-// 子 agent(Task 工具)自己的流:文本/思考/工具调用/结果/usage 一律不进
-// 主时间线;主 agent 自己的 Task 卡(不带 parent id)照常透出。
+// 子 agent(Task 工具)自己的流:文本/思考/usage 不进主时间线;工具调用与
+// 结果带 parentToolUseId 透出(前端挂到父 Task 卡下当"过程"),主 agent 的
+// Task 卡(不带 parent id)照常透出。
 func TestClaudeSidechainFiltered(t *testing.T) {
 	d := newClaudeDriver()
 	lines := []string{
@@ -350,14 +351,18 @@ func TestClaudeSidechainFiltered(t *testing.T) {
 	}
 	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
 
-	// 期望只有两张卡:Task 运行中 → Task 完成。子 agent 的四条全被过滤。
+	// 主时间线两张卡(Task 运行中 → 完成),子 agent 的工具过程挂 parent id
+	// 穿插其间,文本/思考/usage 不露面。
 	want := []struct {
-		id    string
-		tool  string
-		state string
+		id     string
+		tool   string
+		state  string
+		parent string
 	}{
-		{"t-main", "Task", "running"},
-		{"t-main", "Task", "ok"},
+		{"t-main", "Task", "running", ""},
+		{"t-sub", "Read", "running", "t-main"},
+		{"t-sub", "", "ok", "t-main"},
+		{"t-main", "Task", "ok", ""},
 	}
 	for i, w := range want {
 		select {
@@ -369,13 +374,16 @@ func TestClaudeSidechainFiltered(t *testing.T) {
 			if call.ToolUseID != w.id || call.Tool != w.tool || call.State != w.state {
 				t.Fatalf("事件 %d: %+v,想要 {%s %s %s}", i, call, w.id, w.tool, w.state)
 			}
+			if call.ParentToolUseID != w.parent {
+				t.Fatalf("事件 %d: parentToolUseId=%q,想要 %q", i, call.ParentToolUseID, w.parent)
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("事件 %d:2 秒内没等到", i)
 		}
 	}
 	select {
 	case ev := <-d.events:
-		t.Fatalf("子 agent 的输出漏进了主时间线: %+v", ev.Payload)
+		t.Fatalf("子 agent 的文本/思考/usage 漏进了主时间线: %+v", ev.Payload)
 	case <-time.After(300 * time.Millisecond):
 	}
 }

@@ -992,7 +992,17 @@ function up() {
 </template>
 
 <style scoped>
-.fs-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
+/* 只有标题/工具栏这一行吸顶(GitFileView .fv-head 同款):文档滚动模型下
+   top: 0 即贴视口顶,负 margin 拉通整行宽,背景遮住底下滚过的列表条目。
+   面包屑/搜索/排序/批量条随页面正常滚走,不占常驻高度。 */
+.fs-header {
+	position: sticky; top: 0; z-index: 20;
+	display: flex; align-items: flex-start; justify-content: space-between;
+	margin: calc(-1 * var(--lr-page-pad)) calc(-1 * var(--lr-page-pad)) 8px calc(-1 * var(--lr-page-pad-left));
+	padding: var(--lr-page-pad) var(--lr-page-pad) 2px var(--lr-page-pad-left);
+	background: var(--lr-bg);
+	box-shadow: 0 1px 0 rgba(127, 127, 127, 0.2);
+}
 .fs-header h2 { margin: 0; font-size: 20px; }
 .fs-ws { color: var(--lr-fg-muted); font-size: 12px; margin-top: 2px; }
 .fs-toolbar { display: flex; gap: 2px; }
