@@ -1,18 +1,19 @@
 <script setup lang="ts">
 // Agent 会话远控:会话列表 + 聊天时间线(DESIGN-AGENT.md)。普通聊天风格:
 // 消息气泡、工具调用折叠卡、审批卡;REST 操作 + WS 推送(断线 afterSeq 补差)。
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
 import { AddOutline, CheckboxOutline, CopyOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
-import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
+import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentResumableSession, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
 import { useImmersive } from '@/utils/immersive'
 import { useWorkspaceStore } from '@/stores/workspace'
 import ToolCallCard from '@/components/agent/ToolCallCard.vue'
 import ToolGroupCard from '@/components/agent/ToolGroupCard.vue'
+import ToolDetailModal from '@/components/agent/ToolDetailModal.vue'
 import ApprovalCard from '@/components/agent/ApprovalCard.vue'
 import AskUserCard from '@/components/agent/AskUserCard.vue'
 import Composer from '@/components/agent/Composer.vue'
@@ -414,6 +415,32 @@ const cards = computed<Card[]>(() => {
   return groupToolCards(out)
 })
 
+// ---- 工具详情弹窗(全局唯一,视图层) ----
+// 单卡头部 / 组卡行 / 子过程条目点击都打开同一个弹窗。挂在视图层是因为
+// 实时回合里卡片会重组(审批请求把卡拆出组、答复后并回,tool_use 追加
+// 改变分组),卡片内部挂的弹窗会随卡片卸载而消失 —— 之前 bash 卡
+// 「点开就关」就是这么来的。
+const detailCall = ref<AgentToolCall | null>(null)
+// 弹窗展示"活"的对象:按 toolUseId 从 cards 里取当前最新那份 —— 结构重组
+// 换了对象引用、结果晚到回填,弹窗内容都跟着时间线走,而不是定格在
+// 点开那一刻的快照。找不到(理论上不会)退回快照。
+const liveDetail = computed<AgentToolCall | null>(() => {
+  const c = detailCall.value
+  if (!c) return null
+  if (!c.toolUseId) return c
+  for (const card of cards.value) {
+    if (card.kind === 'tool') {
+      if (card.call?.toolUseId === c.toolUseId) return card.call
+      const step = card.steps?.find((s) => s.toolUseId === c.toolUseId)
+      if (step) return step
+    } else if (card.kind === 'toolgroup') {
+      const m = card.groupCalls?.find((g) => g.toolUseId === c.toolUseId)
+      if (m) return m
+    }
+  }
+  return c
+})
+
 // ---- 工具卡聚合(hapi buildVisibleChatBlocks 的精简版) ----
 // 连续 ≥2 张"可组"工具卡(混排不限同类)合一张 ToolGroupCard。
 // 聚合规则(hapi buildVisibleChatBlocks 同款):连续的工具卡混排聚合成一张
@@ -634,11 +661,24 @@ const ws = new AgentWS((e) => {
     // 任何持久化事件都意味着当前流式块已收尾(完整消息就是下一个事件)。
     streamText.value = ''
     streamThink.value = ''
+    // 排队消息的入队/出队:不落库(无 seq),不走 seq 去重。出队有两种
+    // 来源 —— 服务端回合结束放行(随后的 user 事件照常到达)与撤回。
+    if (ev.kind === 'queued_add') {
+      const p = ev.payload as AgentQueuedMsg | null
+      if (p && !queued.value.some((q) => q.id === p.id)) queued.value.push(p)
+      return
+    }
+    if (ev.kind === 'queued_remove') {
+      const p = ev.payload as { id: number } | null
+      if (p) queued.value = queued.value.filter((q) => q.id !== p.id)
+      return
+    }
     // seq 去重:REST 响应已本地追加过,推送与补差重合的也在这里丢掉。
     if (ev.seq <= maxSeq.value) return
     messages.value.push(ev)
   } else if (e.type === 'exit') {
-    // exit 只发给会话订阅者:正在看这个会话才收得到,顺手清排队消息。
+    // exit 只发给会话订阅者:正在看这个会话才收得到。排队消息不动 ——
+    // 队列在服务端,进程死了也还在,复活后的回合结束会接着放行。
     if (e.sessionId !== selectedId.value) return
     streamText.value = ''
     streamThink.value = ''
@@ -660,7 +700,7 @@ const ws = new AgentWS((e) => {
 function markDead(id: string) {
   const s = sessions.value.find((x) => x.id === id)
   if (s) s.status = 'dead'
-  if (id === selectedId.value) queued.value = []
+  // 排队消息不清:队列在服务端持久化,会话复活后回合结束会接着放行。
 }
 
 async function catchUp() {
@@ -671,6 +711,8 @@ async function catchUp() {
     for (const ev of got) {
       if (ev.seq > maxSeq.value) messages.value.push(ev)
     }
+    // 排队事件不落库,seq 补差找不回:断线期间的入队/放行/撤回重拉一遍。
+    queued.value = await api.agentQueue(id)
   } catch { /* 下次重连再补 */ }
 }
 
@@ -702,6 +744,8 @@ async function openSession(id: string) {
     messages.value = got
     // 拉满一页且最旧一条不是 seq 1,说明前面还有更早的。
     hasOlder.value = got.length >= MSG_PAGE && got[0].seq > 1
+    // 排队消息在服务端:打开会话补齐本地队列(页面退出/换设备不丢)。
+    queued.value = await api.agentQueue(id)
   } catch (e: any) {
     message.error(e?.message || '加载历史失败')
   } finally {
@@ -780,9 +824,11 @@ function jumpToBottom() {
 
 // ---- 发送 / 排队 / 打断 / 审批 ----
 const sending = ref(false)
-// 回合进行中发出的消息排队等下一个空闲:agent 一次只吃一条,
-// 插话会被 codex 当 steer / claude 语义不明,排队是最不会出错的形态。
-const queued = ref<string[]>([])
+// 回合进行中发出的消息进服务端队列(agent_queue 表):回合结束由服务端
+// 放行,页面退出/换设备队列都还在 —— 此前队列只活在浏览器内存里,关了
+// 页面排队消息就没了。前端只负责展示、入队、撤回,放行不归前端管
+// (放行的 user 事件与 queued_remove 推送照常从 WS 到达)。
+const queued = ref<AgentQueuedMsg[]>([])
 // 排队气泡入列也要跟底(声明在 queued 之后,别再犯 TDZ)。
 watch(() => queued.value.length, () => scrollBottom())
 
@@ -796,10 +842,43 @@ watch(() => pendingBubbles.value.length, () => scrollBottom())
 function send(text: string) {
   if (!selectedId.value) return
   if (turnState.value === 'running') {
-    queued.value.push(text)
+    enqueue(text)
     return
   }
   doSend(text)
+}
+
+// 入队:消息交给服务端排队。会话恰好已空闲(前端 running 状态滞后)时
+// 服务端会直接发出 —— 响应里区分两种结果,直发的事件照 doSend 的样子进
+// 时间线。
+async function enqueue(text: string) {
+  const id = selectedId.value
+  if (!id) return
+  try {
+    const res = await api.agentEnqueue(id, text)
+    if (res.queued && res.item) {
+      // WS 推送可能先到(queued_add 按 id 去重),这里兜底补上。
+      if (!queued.value.some((q) => q.id === res.item!.id)) queued.value.push(res.item)
+    } else if (res.event && res.event.seq > maxSeq.value) {
+      messages.value.push(res.event)
+    }
+  } catch (e: any) {
+    message.error(e?.message || '排队失败')
+  }
+}
+
+// 撤回一条排队消息(发出前);服务端删成功后本地跟着删(queued_remove
+// 推送也可能先到,filter 幂等)。
+async function cancelQueued(q: AgentQueuedMsg) {
+  const id = selectedId.value
+  if (!id) return
+  try {
+    await api.agentQueueCancel(id, q.id)
+  } catch (e: any) {
+    message.error(e?.message || '撤回失败')
+    return
+  }
+  queued.value = queued.value.filter((x) => x.id !== q.id)
 }
 
 async function doSend(text: string) {
@@ -887,22 +966,26 @@ async function copySent(key: string, text: string) {
   }
 }
 
-// 回合结束(idle)自动放行队首一条;该条发出后状态会转 running,
-// 下一次 idle 再放行下一条 —— 逐条串行,天然限速。
-watch(turnState, (st) => {
-  if (st === 'idle' && queued.value.length && !sending.value) {
-    doSend(queued.value.shift()!)
-  }
-})
+// (排队消息的放行在服务端:pump 收到 idle 逐条发,前端不再参与 ——
+// 关着页面队列也照常消化,打开时 GET /queue 补齐即可。)
 
+// 打断的即时反馈:int断指令本身 CLI ~20ms 就收到,但回合要收尾(在途
+// API 调用、子 agent 清理)才回 idle,这段窗口状态行/按钮没变化就像
+// 「按了没反应、卡一会」。发出即标 stopping,回合回到 idle/dead 清掉。
+const stopping = ref(false)
 async function interrupt() {
   if (!selectedId.value) return
+  stopping.value = true
   try {
     await api.agentInterrupt(selectedId.value)
   } catch (e: any) {
+    stopping.value = false
     message.error(e?.message || '打断失败')
   }
 }
+// 回合结束(或进程死了)清打断标记;新回合(running)也清 —— 队列放行的
+// 下一条消息开跑时,上一回合的打断标记不该留着。
+watch(turnState, (st) => { if (st !== 'running') stopping.value = false })
 
 const approveBusy = ref('')
 async function decide(reqId: string, allow: boolean, session = false) {  if (!selectedId.value) return
@@ -1096,10 +1179,45 @@ const createPerm = ref('ask')
 const createModel = ref('')
 const createEffort = ref('none')
 const creating = ref(false)
+// 恢复已有会话:下拉框选中项的 external id(空 = 新会话)。列表是该目录下
+// CLI 的原生会话(终端里跑过的也算),按修改时间倒序。
+const createResume = ref<string | null>(null)
+const resumable = ref<AgentResumableSession[]>([])
+const resumableLoading = ref(false)
+
+const resumeOptions = computed(() =>
+  resumable.value.map((r) => ({
+    label: r.title || '(无标题会话)',
+    value: r.id,
+    time: timeAgo(r.updatedAt),
+  })),
+)
+
+// 选项里标题与时间左右排(列表时代的样子,收进下拉框里)。
+function renderResumeLabel(option: { label?: string; time?: string }) {
+  return h('div', { class: 'resume-opt' }, [
+    h('span', { class: 'resume-title' }, option.label || ''),
+    h('span', { class: 'resume-time' }, option.time || ''),
+  ])
+}
 
 const workspaceOptions = computed(() =>
   wsStore.list.map((w) => ({ label: w.name, value: w.path })),
 )
+
+// agent 或目录变了重拉列表;弹窗开着才拉。
+watch([createApp, createWorkspace, createModal], async ([app, ws, open]) => {
+  createResume.value = null
+  if (!open || !ws) return
+  resumableLoading.value = true
+  try {
+    resumable.value = await api.agentResumable(app, ws)
+  } catch {
+    resumable.value = [] // 列表拉不到不影响建新会话
+  } finally {
+    resumableLoading.value = false
+  }
+})
 
 function openCreate() {
   createApp.value = 'claude'
@@ -1107,18 +1225,24 @@ function openCreate() {
   createPerm.value = 'ask'
   createModel.value = ''
   createEffort.value = 'none'
+  createResume.value = null
   createModal.value = true
 }
 
 async function createSession() {
   creating.value = true
   try {
+    const resume = resumable.value.find((r) => r.id === createResume.value)
     const sess = await api.agentSessionCreate({
       app: createApp.value,
       workspace: createWorkspace.value || wsStore.root,
       permissionMode: createPerm.value,
       model: createModel.value.trim() || undefined,
       effort: createEffort.value === 'none' ? undefined : createEffort.value,
+      // 恢复原生会话:external id 直传,标题用列表里提炼的(否则要等
+      // 第一条消息才有标题,而续聊的第一条消息往往不是会话主题)。
+      resumeExternal: resume?.id,
+      title: resume?.title,
     })
     createModal.value = false
     await loadSessions()
@@ -1376,11 +1500,12 @@ onBeforeUnmount(() => {
             <summary>思考过程{{ c.thinkMs ? ` · ${fmtThink(c.thinkMs)}` : '' }}</summary>
             <div class="reasoning-body">{{ c.text }}</div>
           </details>
-          <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" :session-id="selectedId || undefined" />
+          <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" @detail="detailCall = $event" />
           <ToolCallCard
             v-else-if="c.kind === 'tool' && c.call" :call="c.call" :session-id="selectedId || undefined"
             :steps="c.steps" :pending-req="c.pendingReq" :pending-resolved="c.resolved ?? null"
             :approve-busy="c.pendingReq ? approveBusy === c.pendingReq.reqId : false"
+            @detail="detailCall = $event"
             @decide="(allow, session) => c.pendingReq && decide(c.pendingReq.reqId, allow, session)"
           />
           <!-- 子 agent 过程已并入上面的父卡(steps),不再另起一张卡 -->
@@ -1428,13 +1553,13 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
-        <!-- 排队中的消息:回合结束自动逐条发出,发出前可撤回 -->
-        <div v-for="(q, i) in queued" :key="`q${i}`" class="chat-row user">
+        <!-- 排队中的消息:服务端队列,回合结束自动逐条放行,发出前可撤回 -->
+        <div v-for="q in queued" :key="`q${q.id}`" class="chat-row user">
           <div class="bubble user queued-bubble">
-            <div class="queued-text">{{ q }}</div>
+            <div class="queued-text">{{ q.text }}</div>
             <div class="queued-ops">
               <span class="queued-tag">排队中</span>
-              <button type="button" class="queued-cancel" @click="queued.splice(i, 1)">撤回</button>
+              <button type="button" class="queued-cancel" @click="cancelQueued(q)">撤回</button>
             </div>
           </div>
         </div>
@@ -1445,6 +1570,7 @@ onBeforeUnmount(() => {
       <!-- 状态行(hapi StatusBar 同款位置):回合状态 + 上下文用量都从聊天头挪到这里 -->
       <StatusBar
         :state="turnState"
+        :stopping="stopping"
         :turn-started-at="turnStartedAt"
         :last-turn-ms="lastTurnMs"
         :pending-approval="pendingApproval"
@@ -1458,6 +1584,7 @@ onBeforeUnmount(() => {
       />
       <Composer
         :running="turnState === 'running'"
+        :stopping="stopping"
         :disabled="turnState === 'dead' && !selected.externalId"
         :ask-pending="pendingAsk"
         :sending="sending"
@@ -1481,6 +1608,21 @@ onBeforeUnmount(() => {
         </div>
         <label>工作目录</label>
         <n-select v-model:value="createWorkspace" :options="workspaceOptions" placeholder="选择工作区" />
+        <label>恢复已有会话(可选)</label>
+        <n-select
+          v-model:value="createResume"
+          :options="resumeOptions"
+          :render-label="renderResumeLabel"
+          :loading="resumableLoading"
+          :disabled="!resumableLoading && !resumable.length"
+          :placeholder="resumableLoading ? '正在读取该目录的会话…' : resumable.length ? '选择要恢复的会话' : `该目录下没有${createApp === 'claude' ? ' Claude Code' : ' Codex'}的会话`"
+          clearable
+        />
+        <div class="form-hint">
+          {{ createResume
+            ? '将恢复选中的会话继续对话(此前的时间线不回放,上下文在)'
+            : '不选则新建空白会话;列表含终端里跑过的,按修改时间倒序' }}
+        </div>
         <label>权限</label>
         <div class="seg">
           <button v-for="o in permOptions" :key="o.value" type="button"
@@ -1505,7 +1647,7 @@ onBeforeUnmount(() => {
       <template #footer>
         <div class="modal-foot">
           <n-button @click="createModal = false">取消</n-button>
-          <n-button type="primary" :loading="creating" @click="createSession()">创建</n-button>
+          <n-button type="primary" :loading="creating" @click="createSession()">{{ createResume ? '恢复会话' : '创建' }}</n-button>
         </div>
       </template>
     </n-modal>
@@ -1584,6 +1726,8 @@ onBeforeUnmount(() => {
         </div>
       </template>
     </n-modal>
+    <!-- 工具详情弹窗:视图层全局唯一(卡片只 emit),不随卡片重组卸载 -->
+    <ToolDetailModal :call="liveDetail" :session-id="selectedId || undefined" @close="detailCall = null" />
   </div>
 </template>
 
@@ -1628,6 +1772,11 @@ onBeforeUnmount(() => {
 .agent-md-body .hljs-number, .agent-md-body .hljs-literal, .agent-md-body .hljs-deletion { color: #b76b01; }
 .agent-md-body .hljs-title, .agent-md-body .hljs-built_in { color: #286983; }
 .agent-md-body .hljs-type, .agent-md-body .hljs-class { color: #4078f2; }
+/* 新建会话"恢复已有会话"下拉框的自定义选项(render-label 是脚本 h() 出来的,
+   不带 scoped 属性,样式必须放非 scoped 块,同 v-html 的道理) */
+.resume-opt { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.resume-opt .resume-title { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resume-opt .resume-time { font-size: 12px; color: var(--lr-fg-muted); flex-shrink: 0; }
 </style>
 
 <style scoped>

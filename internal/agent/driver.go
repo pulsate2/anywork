@@ -73,6 +73,10 @@ type Driver interface {
 	Done() <-chan struct{}
 	// ExitErr 进程退出原因;Done 未关闭前调用无意义。
 	ExitErr() error
+	// ExitDetail 进程异常退出时值得透给用户的可读原因(stderr 尾部)。
+	// 正常退出、被杀、或进程生前已自行报过错(resume 失败等)时为空,
+	// 交给 pump 在收尾时决定是否补一张 error 卡。
+	ExitDetail() string
 	// Close 终止进程树并释放资源。幂等。
 	Close() error
 }

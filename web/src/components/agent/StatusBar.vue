@@ -8,6 +8,8 @@ import type { AgentApp, AgentUsage } from '@/api/client'
 
 const props = defineProps<{
   state: 'running' | 'idle' | 'dead'
+  // 打断已发出、等回合收尾:状态文案换成「正在停止…」(见 AgentView.interrupt)。
+  stopping?: boolean
   // 回合起始时刻(父组件从落库的 status 事件取的 epoch ms):计时锚定在它
   // 上面,刷新/退出重进后接着跳而不是从 0 重来。缺省(老会话)才本地起表。
   turnStartedAt?: number
@@ -70,6 +72,8 @@ const status = computed(() => {
   if (props.pendingApproval) return { text: '等待审批', tone: 'warn', pulse: true }
   // 压缩进行中:回合其实还在跑,但值得单独说出来(claude code 的 Compacting…)
   if (props.compacting) return { text: '压缩上下文…', tone: 'busy', pulse: true }
+  // 打断收尾窗口优先于动词:让「按了停止」立刻有回音。
+  if (props.state === 'running' && props.stopping) return { text: '正在停止…', tone: 'warn', pulse: true }
   if (props.state === 'running') {
     // 计时只在忙态显示;等审批/回答时表已停,后面那截等待时间不计(claude 同款口径)。
     const t = props.pendingAsk || props.pendingApproval ? '' : ` ${fmtElapsed(elapsed.value)}`

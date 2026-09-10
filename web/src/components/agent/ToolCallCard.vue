@@ -1,7 +1,9 @@
 <script setup lang="ts">
-// 工具调用单行卡片:一行摘要(工具名 + 关键参数 + 状态),点击弹窗看全量详情
-// (编辑类工具是行级 diff,其余是参数原文与结果)。长输出不再把手机滚穿,
-// 详情是明确动作。审批请求仍内嵌在行下方,不跟着弹窗走。
+// 工具调用单行卡片:一行摘要(工具名 + 关键参数 + 状态),点击打开详情弹窗
+// (AgentView 层的 ToolDetailModal,卡片只 emit —— 卡片会随回合实时重组,
+// 弹窗挂卡片内部会跟着被卸载)。编辑类 diff / 参数原文 / 结果都在弹窗里;
+// codex 改动卡(ApplyPatch/CodexDiff)的 diff 例外,直接铺在卡内。
+// 审批请求内嵌在行下方,子 agent 过程(steps)嵌在卡内。
 import { computed, ref, watch } from 'vue'
 import { NModal } from 'naive-ui'
 import { api, type AgentPermissionReq, type AgentToolCall } from '@/api/client'
@@ -21,9 +23,12 @@ const props = defineProps<{
   approveBusy?: boolean
 }>()
 
-const emit = defineEmits<{ (e: 'decide', allow: boolean, session: boolean): void }>()
-
-const open = ref(false)
+// detail:打开全局详情弹窗(AgentView 层的 ToolDetailModal)。弹窗不挂在
+// 卡片内部 —— 实时回合里卡片会在 单卡↔组卡 间重组,卡片一卸载弹窗就没了。
+const emit = defineEmits<{
+  (e: 'decide', allow: boolean, session: boolean): void
+  (e: 'detail', call: AgentToolCall): void
+}>()
 
 // ---- 子 agent 步骤(嵌在本卡里,不另起卡) ----
 // 列表展开态:父卡在跑默认展开(实时看子 agent 在做什么),完成默认收起;
@@ -46,61 +51,6 @@ function stepBrief(c: AgentToolCall): string {
   } catch { /* 截断的 args:留空 */ }
   return ''
 }
-
-// 步骤单条详情(与主卡详情同款):编辑类给 diff,其余给参数 + 结果。
-const stepDetail = ref<AgentToolCall | null>(null)
-const stepDetailOpen = computed({
-  get: () => !!stepDetail.value,
-  set: (v: boolean) => { if (!v) stepDetail.value = null },
-})
-
-function stepParseArgs(c: AgentToolCall): Record<string, unknown> | null {
-  try {
-    const v = c.args ? JSON.parse(c.args) : null
-    return v && typeof v === 'object' ? (v as Record<string, unknown>) : null
-  } catch { return null }
-}
-
-const stepDetailDiff = computed<DiffBlock[] | null>(() => {
-  const c = stepDetail.value
-  if (!c) return null
-  const t = c.tool
-  if (t !== 'Edit' && t !== 'MultiEdit' && t !== 'Write' && t !== 'NotebookEdit') return null
-  const args = stepParseArgs(c)
-  if (!args) return null
-  const filePath = typeof args.file_path === 'string' ? args.file_path : ''
-  if (t === 'MultiEdit' && Array.isArray(args.edits)) {
-    const blocks: DiffBlock[] = []
-    for (const e of args.edits) {
-      if (e && typeof e === 'object' && typeof (e as any).old_string === 'string' && typeof (e as any).new_string === 'string') {
-        blocks.push({ old: (e as any).old_string, new: (e as any).new_string, path: filePath } as DiffBlock)
-      }
-    }
-    return blocks.length ? blocks : null
-  }
-  const content = typeof args.content === 'string' ? args.content
-    : typeof args.code_content === 'string' ? args.code_content : ''
-  const oldStr = typeof args.old_string === 'string' ? args.old_string : ''
-  const newStr = t === 'Write' ? content : (typeof args.new_string === 'string' ? args.new_string : '')
-  if (t !== 'Write' && oldStr === '' && newStr === '') return null
-  return [{ old: oldStr, new: newStr, path: filePath } as DiffBlock]
-})
-
-const stepDetailArgs = computed(() => {
-  const raw = stepDetail.value?.args
-  if (!raw) return ''
-  try {
-    const v = JSON.parse(raw)
-    if (v && typeof v === 'object') return JSON.stringify(v, null, 2)
-  } catch { /* 截断的 JSON:原样 */ }
-  return raw
-})
-
-const stepDetailImages = computed<string[]>(() =>
-  props.sessionId && stepDetail.value?.images?.length
-    ? stepDetail.value.images.map((n) => api.agentFileUrl(props.sessionId!, n))
-    : [],
-)
 
 // tool_result 里 image 块的缩略图地址(有会话 id 且带图才有)。
 const imageUrls = computed<string[]>(() =>
@@ -197,10 +147,6 @@ const applyPatchBrief = computed(() => {
   const base = files[0].split('/').pop() || files[0]
   return files.length > 1 ? `${base} (+${files.length - 1})` : base
 })
-
-// 完整命令/参数值(弹窗里用):能解析出 command 等关键值就单取它,
-// 解析不出再贴 args 原文。
-const command = computed(() => brief.value || props.call.args || '')
 
 // ---- 编辑类工具的 diff ----
 interface DiffBlock { old: string; new: string; path?: string }
@@ -326,7 +272,7 @@ const inlineDiff = computed(() =>
 
 <template>
   <div class="tool-card" :class="call.state">
-    <button type="button" class="tool-head" @click="open = true">
+    <button type="button" class="tool-head" @click="emit('detail', call)">
       <span class="tool-dot" />
       <span class="tool-name">{{ call.tool || '工具' }}</span>
       <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
@@ -341,7 +287,7 @@ const inlineDiff = computed(() =>
       <div v-if="stepsOpen" class="steps-body">
         <button
           v-for="(c, i) in steps" :key="c.toolUseId || i" type="button"
-          class="steps-item" :class="c.state" @click="stepDetail = c"
+          class="steps-item" :class="c.state" @click="emit('detail', c)"
         >
           <div class="steps-line">
             <span class="steps-dot" />
@@ -372,45 +318,8 @@ const inlineDiff = computed(() =>
       class="tool-approval"
       @decide="(allow, session) => emit('decide', allow, session)"
     />
-    <n-modal v-model:show="open" preset="card" :title="call.tool || '工具'" class="tool-modal">
-      <div class="tool-detail">
-        <template v-if="diffBlocks">
-          <DiffView
-            v-for="(b, i) in diffBlocks" :key="i"
-            :old="b.old" :new="b.new"
-            :file-path="(b as any).path || (i === 0 ? (codexDiffBrief || brief) : '')"
-          />
-        </template>
-        <!-- ApplyPatch 解析不出 diff(形态未知)时兜底列文件 -->
-        <div v-else-if="patchFiles" class="patch-files">
-          <div v-for="(f, i) in patchFiles" :key="i" class="patch-file">{{ f }}</div>
-        </div>
-        <pre v-else-if="command" class="tool-block">{{ command }}</pre>
-        <pre v-if="call.result" class="tool-block result">{{ call.result }}</pre>
-        <div v-else-if="call.state === 'running'" class="tool-wait">等待结果…</div>
-        <div v-if="imageUrls.length" class="tool-imgs">
-          <img v-for="(u, i) in imageUrls" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
-        </div>
-      </div>
-    </n-modal>
-    <!-- 子 agent 单条详情:与主卡详情同款(diff/参数/结果/图片) -->
-    <n-modal v-model:show="stepDetailOpen" preset="card" :title="stepDetail?.tool || '工具'" class="tool-modal">
-      <div class="tool-detail">
-        <template v-if="stepDetailDiff">
-          <DiffView
-            v-for="(b, i) in stepDetailDiff" :key="i"
-            :old="b.old" :new="b.new" :file-path="b.path || ''"
-          />
-        </template>
-        <pre v-else-if="stepDetailArgs" class="tool-block">{{ stepDetailArgs }}</pre>
-        <pre v-if="stepDetail?.result" class="tool-block result">{{ stepDetail.result }}</pre>
-        <div v-else-if="stepDetail?.state === 'running'" class="tool-wait">等待结果…</div>
-        <div v-if="stepDetailImages.length" class="tool-imgs">
-          <img v-for="(u, i) in stepDetailImages" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
-        </div>
-      </div>
-    </n-modal>
-    <!-- 点亮的原图:独立小弹窗,Cookie 认同所以 <img src> 直连 -->
+    <!-- 点亮的原图:独立小弹窗,Cookie 认同所以 <img src> 直连。
+         详情弹窗在 AgentView 层(ToolDetailModal),卡片只 emit。 -->
     <n-modal v-model:show="lightboxOpen" preset="card" class="tool-modal" title="图片">
       <img v-if="lightbox" :src="lightbox" class="tool-lightbox" alt="图片" />
     </n-modal>

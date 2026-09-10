@@ -6,6 +6,7 @@ package agent
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -49,6 +50,12 @@ const (
 	// KindSessionStatus 会话状态变化(running/idle/dead;仅推送给列表
 	// 观察者,不落库 —— 列表状态实时刷新用)。
 	KindSessionStatus = "session_status"
+	// KindQueuedAdd / KindQueuedRemove 排队消息的入队/出队(放行或撤回)。
+	// 队列是会话的瞬态状态,不进 agent_messages —— 持久化在 agent_queue 表,
+	// 前端打开会话时 GET 补齐,多端经 WS 同步;此前队列只活在浏览器内存里,
+	// 页面一关排队消息就没了。
+	KindQueuedAdd    = "queued_add"
+	KindQueuedRemove = "queued_remove"
 )
 
 // 会话状态。
@@ -94,8 +101,8 @@ type Event struct {
 // Images 是 tool_result 里 image 块落盘后的文件名(前端经
 // /api/agent/sessions/{id}/files/{name} 取)。
 type ToolCallPayload struct {
-	Tool      string   `json:"tool"`
-	ToolUseID string   `json:"toolUseId,omitempty"`
+	Tool      string `json:"tool"`
+	ToolUseID string `json:"toolUseId,omitempty"`
 	// ParentToolUseID 非空 = 子 agent(Task 工具)的内部工具调用:前端把它
 	// 挂到父 Task 卡下面当"过程"展示,不进主时间线。
 	ParentToolUseID string   `json:"parentToolUseId,omitempty"`
@@ -216,6 +223,13 @@ type SessionStatusPayload struct {
 // ErrorPayload KindError 的负载。
 type ErrorPayload struct {
 	Message string `json:"message"`
+}
+
+// QueuedPayload KindQueuedAdd/KindQueuedRemove 的负载;Remove 只带 ID。
+type QueuedPayload struct {
+	ID        int64  `json:"id"`
+	Text      string `json:"text,omitempty"`
+	CreatedAt string `json:"createdAt,omitempty"`
 }
 
 // Session 一条 agent_sessions 记录。
@@ -407,7 +421,7 @@ func (s *Store) Messages(sessionID string, afterSeq int64, limit int) ([]Event, 
 	if err != nil {
 		return nil, err
 	}
-	return scanEvents(rows, sessionID)
+	return scanRows(rows, sessionID)
 }
 
 // MessagesTail 最新 limit 条(升序):打开会话先看最近的,更早的往前翻页。
@@ -430,9 +444,8 @@ func (s *Store) MessagesBefore(sessionID string, beforeSeq int64, limit int) ([]
 	return scanEvents(rows, sessionID)
 }
 
-// scanEvents 收集行并按 seq 升序返回(Tail/Before 的 DESC 查询在这里倒回来,
-// 前端拿到的一律升序,直接拼进时间线)。
-func scanEvents(rows *sql.Rows, sessionID string) ([]Event, error) {
+// scanRows 收集行,保持查询本身的顺序。
+func scanRows(rows *sql.Rows, sessionID string) ([]Event, error) {
 	defer rows.Close()
 	list := []Event{}
 	for rows.Next() {
@@ -448,15 +461,28 @@ func scanEvents(rows *sql.Rows, sessionID string) ([]Event, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	return list, nil
+}
+
+// scanEvents DESC 查询(Tail/Before)收集后倒回升序:前端拿到的一律升序,
+// 直接拼进时间线。
+func scanEvents(rows *sql.Rows, sessionID string) ([]Event, error) {
+	list, err := scanRows(rows, sessionID)
+	if err != nil {
+		return nil, err
+	}
 	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
 		list[i], list[j] = list[j], list[i]
 	}
 	return list, nil
 }
 
-// DeleteSession 删除单条会话:记录、消息、附件目录一起走。
+// DeleteSession 删除单条会话:记录、消息、排队消息、附件目录一起走。
 func (s *Store) DeleteSession(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM agent_messages WHERE session_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM agent_queue WHERE session_id=?`, id); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(`DELETE FROM agent_sessions WHERE id=?`, id); err != nil {
@@ -466,6 +492,84 @@ func (s *Store) DeleteSession(id string) error {
 		_ = os.RemoveAll(filepath.Join(s.FilesDir, id))
 	}
 	return nil
+}
+
+// ---- 排队消息(agent_queue) ----
+
+// QueueItem 一条排队消息,id 升序即入队顺序。
+type QueueItem struct {
+	ID        int64  `json:"id"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// Enqueue 入队一条。id 手工分配(对齐 AppendMessage 的 seq 做法):
+// pgx 不支持 LastInsertId,且 SQLite/PG 共用同一套 SQL。
+// 并发入队的撞号由 Manager 侧的 queueMu 串行化避免。
+func (s *Store) Enqueue(sessionID, text string) (*QueueItem, error) {
+	var id int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id),0)+1 FROM agent_queue`).Scan(&id); err != nil {
+		return nil, err
+	}
+	item := &QueueItem{ID: id, Text: text, CreatedAt: nowISO()}
+	if _, err := s.db.Exec(`INSERT INTO agent_queue(id, session_id, text, created_at) VALUES(?,?,?,?)`,
+		item.ID, sessionID, item.Text, item.CreatedAt); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+// Queued 某会话的全部排队消息(升序)。
+func (s *Store) Queued(sessionID string) ([]QueueItem, error) {
+	rows, err := s.db.Query(`SELECT id, text, created_at FROM agent_queue
+		WHERE session_id=? ORDER BY id`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []QueueItem{}
+	for rows.Next() {
+		var it QueueItem
+		if err := rows.Scan(&it.ID, &it.Text, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+// PopQueued 取出并删除最早一条(放行)。取与删放同一个事务:放行与撤回
+// 并发时同一条只会被一边拿到。空队列返回 nil。
+func (s *Store) PopQueued(sessionID string) (*QueueItem, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	var it QueueItem
+	err = tx.QueryRow(`SELECT id, text, created_at FROM agent_queue
+		WHERE session_id=? ORDER BY id LIMIT 1`, sessionID).Scan(&it.ID, &it.Text, &it.CreatedAt)
+	if err != nil {
+		tx.Rollback()
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM agent_queue WHERE id=?`, it.ID); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return &it, tx.Commit()
+}
+
+// CancelQueued 撤回一条;id 已不在队列(已放行/已撤回)返回 false。
+func (s *Store) CancelQueued(sessionID string, id int64) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM agent_queue WHERE session_id=? AND id=?`, sessionID, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // MarkDead 启动时把遗留的 running/idle 会话标死(Go 进程重启,内存态全没了)。

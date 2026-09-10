@@ -77,13 +77,17 @@ func (h *Handlers) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// Create POST /api/agent/sessions {app, workspace, resume?, permissionMode?}
+// Create POST /api/agent/sessions {app, workspace, resume?, resumeExternal?, permissionMode?}
 // CLI 不存在回 409(前端提示先装);workspace 用 workspaces 表里的 path。
+// resume = 续聊的 anywork 会话 id;resumeExternal = 直接给 external id
+// (恢复终端里跑过的原生会话,列表见 Resumable)。
 func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		App            string `json:"app"`
 		Workspace      string `json:"workspace"`
 		Resume         string `json:"resume"`
+		ResumeExternal string `json:"resumeExternal"`
+		Title          string `json:"title"`
 		PermissionMode string `json:"permissionMode"`
 		Model          string `json:"model"`
 		Effort         string `json:"effort"`
@@ -99,6 +103,8 @@ func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
 		App:            body.App,
 		Workspace:      body.Workspace,
 		ResumeID:       body.Resume,
+		ResumeExternal: body.ResumeExternal,
+		Title:          body.Title,
 		PermissionMode: body.PermissionMode,
 		Model:          body.Model,
 		Effort:         body.Effort,
@@ -234,6 +240,81 @@ func mapOrNil(m *map[string][]string) map[string][]string {
 		return nil
 	}
 	return *m
+}
+
+// ---- 排队消息 ----
+
+// Resumable GET /api/agent/resumable?app=&workspace= —— 某目录下指定 agent
+// 的原生 CLI 会话(claude 转录 / codex rollout),按修改时间倒序。创建新会话
+// 时挑一个恢复(resumeExternal);含终端里跑过的会话,不限 anywork 自己建的。
+func (h *Handlers) Resumable(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	app := q.Get("app")
+	if app == "" {
+		app = AppClaude
+	}
+	list, err := h.mgr.Resumable(app, q.Get("workspace"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// Queue GET /api/agent/sessions/{id}/queue —— 当前排队消息(升序)。
+// 打开会话时补齐本地队列;排队消息持久化在服务端,页面退出不丢。
+func (h *Handlers) Queue(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if sess, err := h.store.GetSession(id); err != nil || sess == nil {
+		http.Error(w, "会话不存在", http.StatusNotFound)
+		return
+	}
+	items, err := h.store.Queued(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// EnqueueMsg POST /api/agent/sessions/{id}/queue {text} —— 回合进行中发消息
+// 走排队。会话恰好空闲时不排队直接发(响应里区分两种结果):
+//   - {"queued":true,"item":{id,text,createdAt}}  已入队
+//   - {"queued":false,"event":{…}}                直接发出(形状同 SendMessage)
+func (h *Handlers) EnqueueMsg(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
+		http.Error(w, "text required", http.StatusBadRequest)
+		return
+	}
+	queued, item, ev, err := h.mgr.Enqueue(id, body.Text)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"queued": queued,
+		"item":   item,
+		"event":  ev,
+	})
+}
+
+// CancelQueued DELETE /api/agent/sessions/{id}/queue/{qid} —— 撤回一条排队消息。
+func (h *Handlers) CancelQueued(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	qid, err := strconv.ParseInt(chi.URLParam(r, "qid"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad queue id", http.StatusBadRequest)
+		return
+	}
+	if err := h.mgr.CancelQueued(id, qid); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // Kill DELETE /api/agent/sessions/{id} —— 结束进程,记录保留(历史可看、可续聊)。

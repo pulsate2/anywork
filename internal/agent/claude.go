@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,10 @@ type claudeDriver struct {
 	stderrTail string // 退出原因排查用
 	closeOnce  sync.Once
 	exitErr    error
+	// sawResult 收到过 result 行(resume 失败也发 result + errors 数组,
+	// 错误已从那条路透出)。ExitDetail 据此去重:崩溃退出(没 result 行)
+	// 才补 stderr 尾部,免得 resume 失败报两张重复的错误卡。
+	sawResult atomic.Bool
 
 	events   chan Event
 	done     chan struct{}
@@ -290,6 +295,18 @@ func (d *claudeDriver) ExitErr() error {
 	return d.exitErr
 }
 
+// ExitDetail 进程异常退出时的可读原因(给 pump 透到时间线):正常退出、
+// 被杀(stderr 无输出)或已随 result 行报过错(resume 失败)时为空。
+func (d *claudeDriver) ExitDetail() string {
+	d.mu.Lock()
+	tail, err := d.stderrTail, d.exitErr
+	d.mu.Unlock()
+	if err == nil || tail == "" || d.sawResult.Load() {
+		return ""
+	}
+	return truncate(err.Error()+": "+tail, 4000)
+}
+
 func (d *claudeDriver) Close() error {
 	d.closeOnce.Do(func() {
 		// 进程组一起杀;杀完 waitExit 会关闭 done/events。
@@ -384,8 +401,12 @@ type claudeLine struct {
 	RequestID string          `json:"request_id"`
 	Request   json.RawMessage `json:"request"`
 	// result
-	Result   string       `json:"result"`
-	IsError  bool         `json:"is_error"`
+	Result  string `json:"result"`
+	IsError bool   `json:"is_error"`
+	// resume 失败等执行错误的明细:error_during_execution 的 result 文本
+	// 为空,原因全在 errors 数组里 —— 不接它,"No conversation found"
+	// 这类失败就被吞掉,远端只看到会话无声死掉。
+	Errors   []string     `json:"errors"`
 	Duration float64      `json:"duration_ms"`
 	CostUSD  float64      `json:"total_cost_usd"`
 	Usage    *claudeUsage `json:"usage"`
@@ -641,10 +662,18 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 		case "stream_event":
 			d.handleStreamEvent(msg)
 		case "result":
-			// 打断的回合也是 is_error,但 result 为空:用户自己按的中断,
-			// 不报错(报了也是空 message 的错误卡)。真失败带 result 文本。
-			if msg.IsError && strings.TrimSpace(msg.Result) != "" {
-				d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(msg.Result, 4000)}})
+			d.sawResult.Store(true)
+			// 打断的回合也是 is_error,但没有任何文本:用户自己按的中断,
+			// 不报错(报了也是空 message 的错误卡)。真失败带 result 文本;
+			// resume 失败(error_during_execution)的文本在 errors 数组里。
+			if msg.IsError {
+				reason := strings.TrimSpace(msg.Result)
+				if reason == "" && len(msg.Errors) > 0 {
+					reason = strings.Join(msg.Errors, "; ")
+				}
+				if reason != "" {
+					d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(reason, 4000)}})
+				}
 			}
 			// result 行的 usage 是回合最后一次 API 调用的计数,是最准的期末值。
 			var m string

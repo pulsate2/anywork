@@ -32,6 +32,10 @@ type liveSession struct {
 
 	mu          sync.Mutex
 	subscribers map[Subscriber]struct{}
+	// state 当前回合状态(running/idle):pump 收到状态事件时更新,
+	// Enqueue 的"空闲直发"与 releaseQueued 的"回合结束放行"都靠它判断,
+	// 抢占式置 running 关闭两边的竞争窗口(见 releaseQueued)。
+	state string
 }
 
 // Manager 管理存活 agent 会话与 WS 订阅(仿 terminal.Manager 的职责划分,
@@ -42,6 +46,11 @@ type Manager struct {
 	// watchers 列表观察者:不订具体会话,收所有会话的状态变化
 	// (会话列表实时刷新,见 handler.go 的 watch 帧)。
 	watchers map[Subscriber]struct{}
+
+	// queueMu 入队串行化:Enqueue 的 id 分配是 MAX(id)+1,不锁的话并发
+	// 入队会撞主键(对齐 liveSession.wmu 之于 AppendMessage 的角色,但
+	// 排队对死会话也要工作,锁只能放 Manager 上)。
+	queueMu sync.Mutex
 
 	store *Store
 	// Root 工作目录边界(会话 cwd 必须在内)。
@@ -70,13 +79,16 @@ func NewManager(store *Store, root string, readonly bool) *Manager {
 
 // CreateOptions 建会话参数。
 type CreateOptions struct {
-	App            string
-	Workspace      string // cwd(绝对路径或相对 root)
-	ResumeID       string // 续聊:原会话 id(anywork 的 id,不是 claude session id)
+	App       string
+	Workspace string // cwd(绝对路径或相对 root)
+	ResumeID  string // 续聊:anywork 的会话 id(取其 external_id + 工作目录)
+	Title     string
+	Model     string
+	Effort    string
+	// ResumeExternal 续聊:直接给 external id(claude session id / codex
+	// thread id)—— 恢复终端里跑过的原生会话用,会话列表来自 Resumable。
+	ResumeExternal string
 	PermissionMode string
-	Title          string
-	Model          string
-	Effort         string
 }
 
 // Create 校验参数、spawn driver、落库、启动事件泵。返回会话记录。
@@ -100,7 +112,9 @@ func (m *Manager) Create(opt CreateOptions) (*Session, error) {
 
 	// 续聊:取原会话的 external_id 作为 claude --resume 参数,
 	// 并沿用原会话的工作目录(用户在原目录里干的活,续聊不该换地方)。
-	resumeExternal := ""
+	// ResumeExternal 直接就是 external id(恢复终端里的原生会话,列表见
+	// Resumable),目录用本次指定的 —— 不换原会话的目录。
+	resumeExternal := opt.ResumeExternal
 	if opt.ResumeID != "" {
 		orig, err := m.store.GetSession(opt.ResumeID)
 		if err != nil {
@@ -163,6 +177,7 @@ func (m *Manager) Create(opt CreateOptions) (*Session, error) {
 		id:          sess.ID,
 		driver:      driver,
 		subscribers: map[Subscriber]struct{}{},
+		state:       StatusIdle,
 	}
 	m.mu.Lock()
 	m.sessions[sess.ID] = ls
@@ -226,12 +241,30 @@ func (m *Manager) pump(ls *liveSession) {
 			}
 		case KindStatus:
 			if sp, ok := ev.Payload.(*StatusPayload); ok {
+				ls.mu.Lock()
+				ls.state = sp.State
+				ls.mu.Unlock()
 				// 列表观察者同步状态(running ⇄ idle)。
 				m.notifyWatchers(ls.id, sp.State)
-				if m.NotifyTurnDone != nil && sp.State == StatusIdle {
-					go m.NotifyTurnDone(m.titleOf(ls.id))
+				if sp.State == StatusIdle {
+					if m.NotifyTurnDone != nil {
+						go m.NotifyTurnDone(m.titleOf(ls.id))
+					}
+					// 回合结束:放行一条排队消息。同步做:pump 串行,
+					// 连续两个 idle 不会挤进同一回合;页面前端不再负责
+					// 放行,队列在服务端,关了页面也照发。
+					m.releaseQueued(ls)
 				}
 			}
+		}
+	}
+
+	// 事件流关闭 = 进程退出。异常退出(resume 失败、CLI 崩溃)在时间线上
+	// 只表现为「又离线了」,原因不给出来远端根本没法排查:把 stderr 尾部
+	// 补成一张 error 卡再标死。正常退出/被杀/已报过错时 ExitDetail 为空。
+	if detail := ls.driver.ExitDetail(); detail != "" {
+		if stored, err := m.append(ls, &Event{Kind: KindError, Payload: &ErrorPayload{Message: detail}}); err == nil {
+			m.broadcast(ls, stored)
 		}
 	}
 
@@ -283,6 +316,102 @@ func (m *Manager) Send(sessionID, text string) (*Event, error) {
 	return stored, nil
 }
 
+// ---- 排队消息(agent_queue) ----
+// 队列在服务端持久化:回合进行中发的消息入队,回合结束(idle)由 pump
+// 调 releaseQueued 逐条放行。此前队列只活在浏览器内存里,页面退出
+// (关标签/换设备/断网)排队消息就没了。
+
+// Enqueue 回合进行中发消息:入服务端队列,回合结束由 pump 放行。
+// 会话恰好空闲(前端 running 状态滞后于真实回合)就不排队直接发 ——
+// 队列只该在 running 时积压,空闲时入队没人触发放行,消息会卡住。
+// 返回:queued=true 已入队(item 为入队记录);queued=false 恰好空闲
+// 直接发出了(ev 为落库的用户消息事件,形状同 Send)。
+func (m *Manager) Enqueue(sessionID, text string) (queued bool, item *QueueItem, ev *Event, err error) {
+	if m.ReadOnly {
+		return false, nil, nil, fmt.Errorf("只读模式")
+	}
+	if sess, e := m.store.GetSession(sessionID); e != nil || sess == nil {
+		return false, nil, nil, fmt.Errorf("会话不存在: %s", sessionID)
+	}
+	if ls := m.get(sessionID); ls != nil {
+		ls.mu.Lock()
+		idle := ls.state == StatusIdle
+		if idle {
+			ls.state = StatusRunning // 抢占 idle:放行路径据此让路
+		}
+		ls.mu.Unlock()
+		if idle {
+			ev, err := m.Send(sessionID, text)
+			return false, nil, ev, err
+		}
+	}
+	m.queueMu.Lock()
+	item, err = m.store.Enqueue(sessionID, text)
+	m.queueMu.Unlock()
+	if err != nil {
+		return false, nil, nil, err
+	}
+	// 多端同步:入队推给会话订阅者(死会话没有订阅者,打开时 GET 补)。
+	if ls := m.get(sessionID); ls != nil {
+		m.broadcast(ls, &Event{Kind: KindQueuedAdd, SessionID: sessionID,
+			Payload: &QueuedPayload{ID: item.ID, Text: item.Text, CreatedAt: item.CreatedAt}})
+	}
+	return true, item, nil, nil
+}
+
+// releaseQueued 放行队首一条(pump 在 idle 时同步调用)。与 Enqueue 的
+// 空闲直发路径竞争同一个 idle 槽位:两边都先抢占式置 running 再发,
+// 后到者看到 running 即退出,保证一个回合只进一条消息。
+func (m *Manager) releaseQueued(ls *liveSession) {
+	if m.ReadOnly {
+		return
+	}
+	ls.mu.Lock()
+	if ls.state != StatusIdle {
+		ls.mu.Unlock()
+		return
+	}
+	ls.state = StatusRunning // 抢占 idle
+	ls.mu.Unlock()
+
+	item, err := m.store.PopQueued(ls.id)
+	if err != nil || item == nil {
+		// 队列空(或取出失败):归还槽位,等下一个 idle 事件。
+		ls.mu.Lock()
+		if ls.state == StatusRunning {
+			ls.state = StatusIdle
+		}
+		ls.mu.Unlock()
+		return
+	}
+	// 先广播出队再发送:user 事件随后由 Send 广播,前端两项各自处理。
+	m.broadcast(ls, &Event{Kind: KindQueuedRemove, SessionID: ls.id,
+		Payload: &QueuedPayload{ID: item.ID}})
+	if _, err := m.Send(ls.id, item.Text); err != nil {
+		// 消息已由 Send 落库、错误已在时间线上;state 留给下一个状态
+		// 事件纠正(能走到这的 Send 失败基本都是进程垂死,马上就 dead)。
+	}
+}
+
+// CancelQueued 撤回一条排队消息;id 已不在队列(已放行/已撤回)报错。
+func (m *Manager) CancelQueued(sessionID string, id int64) error {
+	if m.ReadOnly {
+		return fmt.Errorf("只读模式")
+	}
+	ok, err := m.store.CancelQueued(sessionID, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("该消息已放行或已撤回")
+	}
+	if ls := m.get(sessionID); ls != nil {
+		m.broadcast(ls, &Event{Kind: KindQueuedRemove, SessionID: sessionID,
+			Payload: &QueuedPayload{ID: id}})
+	}
+	return nil
+}
+
 // revive 复活死会话:用 DB 里存的 external_id + 设置重新 spawn,挂回 sessions。
 // 运行中保存的模型/强度/权限(claude 约定"续聊时生效")正是在这里落地。
 // spawn 拿着 Manager 锁:并发复活同一会话只会有一个真跑,其它会话的操作
@@ -327,6 +456,7 @@ func (m *Manager) revive(id string) (*liveSession, error) {
 		driver:      driver,
 		subscribers: map[Subscriber]struct{}{},
 		model:       driver.CurrentModel(),
+		state:       StatusIdle,
 	}
 	m.sessions[id] = ls
 	m.store.SetStatus(id, StatusIdle)

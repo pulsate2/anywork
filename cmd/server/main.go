@@ -314,10 +314,14 @@ func (a *App) routes() http.Handler {
 
 		// Agent 会话远控(DESIGN-AGENT.md):REST 操作 + WS 单向推送。
 		pr.Get("/api/agent", a.agent.ServeWS)
+		pr.Get("/api/agent/resumable", a.agent.Resumable)
 		pr.Get("/api/agent/sessions", a.agent.List)
 		pr.Post("/api/agent/sessions", a.agent.Create)
 		pr.Get("/api/agent/sessions/{id}/messages", a.agent.Messages)
 		pr.Post("/api/agent/sessions/{id}/messages", a.agent.SendMessage)
+		pr.Get("/api/agent/sessions/{id}/queue", a.agent.Queue)
+		pr.Post("/api/agent/sessions/{id}/queue", a.agent.EnqueueMsg)
+		pr.Delete("/api/agent/sessions/{id}/queue/{qid}", a.agent.CancelQueued)
 		pr.Post("/api/agent/sessions/{id}/interrupt", a.agent.Interrupt)
 		pr.Post("/api/agent/sessions/{id}/approve", a.agent.Approve)
 		pr.Post("/api/agent/sessions/{id}/answer", a.agent.Answer)

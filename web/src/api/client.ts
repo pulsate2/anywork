@@ -195,8 +195,12 @@ export const api = {
   // ---- Agent 会话(DESIGN-AGENT.md;推送通道见 api/agent.ts) ----
   agentSessions: () => request<AgentSession[]>('GET', '/api/agent/sessions'),
   // CLI 不在服务器上时后端回 409,提示先装。resume = 要续聊的旧会话 id。
-  agentSessionCreate: (b: { app: AgentApp; workspace: string; resume?: string; permissionMode?: string; model?: string; effort?: string }) =>
+  agentSessionCreate: (b: { app: AgentApp; workspace: string; resume?: string; resumeExternal?: string; title?: string; permissionMode?: string; model?: string; effort?: string }) =>
     request<AgentSession>('POST', '/api/agent/sessions', b),
+  // 某目录下指定 agent 的原生 CLI 会话(终端里跑过的也算),按修改时间倒序;
+  // 挑一个经 agentSessionCreate 的 resumeExternal 恢复。
+  agentResumable: (app: AgentApp, workspace: string) =>
+    request<AgentResumableSession[]>('GET', `/api/agent/resumable?app=${app}&workspace=${encodeURIComponent(workspace)}`),
   // 历史拉取(返回一律升序):不带参数 = 最新一页;beforeSeq 往前翻"加载更早";
   // afterSeq 增量补差(WS 断线重连后找回丢的推送)。
   agentMessages: (id: string, opts: { afterSeq?: number; beforeSeq?: number; limit?: number } = {}) => {
@@ -209,6 +213,15 @@ export const api = {
   // 返回落库事件(带 seq):本地即时追加,与 WS 推送按 seq 去重。
   agentSend: (id: string, text: string) =>
     request<AgentEvent>('POST', `/api/agent/sessions/${id}/messages`, { text }),
+  // 排队消息(服务端持久化,页面退出不丢)。入队请求在会话恰好空闲时
+  // 不排队直接发出:响应里区分两种结果(queued=true 已入队 / event=直发)。
+  agentQueue: (id: string) => request<AgentQueuedMsg[]>('GET', `/api/agent/sessions/${id}/queue`),
+  agentEnqueue: (id: string, text: string) =>
+    request<{ queued: boolean; item: AgentQueuedMsg | null; event: AgentEvent | null }>(
+      'POST', `/api/agent/sessions/${id}/queue`, { text }),
+  // 撤回一条排队消息(发出前)。
+  agentQueueCancel: (id: string, qid: number) =>
+    request<{ ok: boolean }>('DELETE', `/api/agent/sessions/${id}/queue/${qid}`),
   agentInterrupt: (id: string) => request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/interrupt`),
   // session=true 即「本会话允许」:driver 记规则,同类请求后续自动放行。
   agentApprove: (id: string, reqId: string, allow: boolean, session = false) =>
@@ -243,6 +256,15 @@ export const api = {
 
 export type AgentApp = 'claude' | 'codex'
 
+// 一条可恢复的 CLI 原生会话:id 是 external id(claude session id /
+// codex thread id),创建时经 resumeExternal 传入;title 从转录提炼。
+export interface AgentResumableSession {
+  id: string
+  title?: string
+  app: AgentApp
+  updatedAt: string
+}
+
 // AgentEvent 的 payload 按 kind 取形状(unknown 收窄交给视图)。
 export interface AgentSession {
   id: string
@@ -263,6 +285,14 @@ export interface AgentEvent {
   seq: number
   kind: string
   payload: unknown
+  createdAt: string
+}
+
+// 一条排队消息:回合进行中发出的消息进服务端队列(页面退出不丢),
+// 回合结束由服务端逐条放行,id 升序即入队顺序。
+export interface AgentQueuedMsg {
+  id: number
+  text: string
   createdAt: string
 }
 

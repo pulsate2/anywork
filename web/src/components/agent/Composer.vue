@@ -11,6 +11,8 @@ import { api } from '@/api/client'
 
 const props = defineProps<{
   running: boolean
+  // 打断已发出、等回合收尾:按钮转「正在停止…」并进入 loading。
+  stopping?: boolean
   disabled?: boolean // 会话不在运行且无可恢复凭据
   // 有未答的提问卡:回合卡在控制请求上,这时发消息只会排队、还容易被当成
   // 回答。锁输入与发送,但保留停止(想直接打断回合是合法诉求)。
@@ -182,10 +184,11 @@ async function onFiles(files: FileList | null) {
       <div class="composer-hint">{{ uploading ? '附件上传中…' : 'Ctrl+Enter 发送' }}</div>
       <n-button
         v-if="running" class="composer-btn" type="warning" secondary
-        title="打断当前回合" @click="emit('interrupt')"
+        :loading="stopping" :title="stopping ? '正在停止,等回合收尾…' : '打断当前回合'"
+        @click="emit('interrupt')"
       >
         <template #icon><n-icon :component="StopOutline" /></template>
-        停止
+        {{ stopping ? '正在停止…' : '停止' }}
       </n-button>
       <n-button
         class="composer-btn" type="primary"

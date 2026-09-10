@@ -3,17 +3,17 @@
 // 2 张以上连续的可组工具(混排不限同类)合一张卡。标题按主导意图起
 // (查看文件/搜索内容/修改文件/运行命令/打开网页),能落到具体目标就用
 // 「查看 foo.ts」「搜索 pattern」这样的标题;混排时摘要行列出各类型计数。
-// 组内单行可再点:弹窗看该次的参数与结果(同 ToolCallCard 详情,组卡版)。
+// 组内单行可再点:打开 AgentView 层的详情弹窗(ToolDetailModal)看该次的
+// 参数与结果。弹窗不挂组卡内部 —— 实时回合里审批事件会把卡片拆出组又并
+// 回来,组卡一卸载弹窗就没了(表现为点开就关)。
 import { computed, ref } from 'vue'
-import { NModal } from 'naive-ui'
-import { api, type AgentToolCall } from '@/api/client'
-import DiffView from './DiffView.vue'
+import type { AgentToolCall } from '@/api/client'
 
 const props = defineProps<{
   calls: AgentToolCall[]
-  // 会话 id:tool_result 的 image 块经 /api/agent/sessions/{id}/files/{name} 取。
-  sessionId?: string
 }>()
+
+const emit = defineEmits<{ (e: 'detail', call: AgentToolCall): void }>()
 
 const open = ref(false)
 
@@ -159,66 +159,6 @@ function rowTarget(c: AgentToolCall): string {
   return (actionKind(c.tool) === 'read' || actionKind(c.tool) === 'mutation') ? basename(t) : t
 }
 
-// ---- 组内单条的详情弹窗 ----
-// 详情 = diff(编辑类)+ 参数 + 结果 + 结果图片。编辑类工具(Edit/Write 等)
-// 被 grouping 收进组卡时,详情弹窗同样给行级 diff,与单张工具卡一致 ——
-// 否则折叠形态下 Edit 的改动内容只剩一坨 JSON,和"修改文件"的语义对不上。
-const detail = ref<AgentToolCall | null>(null)
-const detailOpen = computed({
-  get: () => !!detail.value,
-  set: (v: boolean) => { if (!v) detail.value = null },
-})
-
-interface DiffBlock { old: string; new: string; path?: string }
-
-// 详情里编辑类工具的 diff 块(逻辑与 ToolCallCard.diffBlocks 的编辑分支一致)。
-const detailDiff = computed<DiffBlock[] | null>(() => {
-  const c = detail.value
-  if (!c) return null
-  const t = c.tool
-  if (t !== 'Edit' && t !== 'MultiEdit' && t !== 'Write' && t !== 'NotebookEdit') return null
-  const args = parseArgs(c)
-  if (!args) return null
-  const filePath = typeof args.file_path === 'string' ? args.file_path : ''
-  if (t === 'MultiEdit' && Array.isArray(args.edits)) {
-    const blocks: DiffBlock[] = []
-    for (const e of args.edits) {
-      if (e && typeof e === 'object' && typeof (e as any).old_string === 'string' && typeof (e as any).new_string === 'string') {
-        blocks.push({ old: (e as any).old_string, new: (e as any).new_string })
-      }
-    }
-    return blocks.length ? blocks : null
-  }
-  const content = typeof args.content === 'string' ? args.content
-    : typeof args.code_content === 'string' ? args.code_content : ''
-  const oldStr = typeof args.old_string === 'string' ? args.old_string : ''
-  const newStr = t === 'Write' ? content : (typeof args.new_string === 'string' ? args.new_string : '')
-  if (t !== 'Write' && oldStr === '' && newStr === '') return null
-  return [{ old: oldStr, new: newStr, path: filePath }]
-})
-
-// 参数展示:可解析的 JSON 缩进两格(键值一目了然),截断的非法 JSON 原样贴。
-const detailArgs = computed(() => {
-  const raw = detail.value?.args
-  if (!raw) return ''
-  try {
-    const v = JSON.parse(raw)
-    if (v && typeof v === 'object') return JSON.stringify(v, null, 2)
-  } catch { /* 截断的 JSON:原样 */ }
-  return raw
-})
-
-// 该次结果里的图片缩略图地址(有会话 id 且带图才有)。
-const detailImages = computed<string[]>(() =>
-  props.sessionId && detail.value?.images?.length
-    ? detail.value.images.map((n) => api.agentFileUrl(props.sessionId!, n))
-    : [],
-)
-const lightbox = ref<string | null>(null)
-const lightboxOpen = computed({
-  get: () => !!lightbox.value,
-  set: (v: boolean) => { if (!v) lightbox.value = null },
-})
 </script>
 
 <template>
@@ -232,7 +172,7 @@ const lightboxOpen = computed({
       <span class="group-state">{{ stateLabel }}</span>
     </button>
     <div v-if="open" class="group-body">
-      <button v-for="(c, i) in calls" :key="c.toolUseId || i" type="button" class="group-item" @click="detail = c">
+      <button v-for="(c, i) in calls" :key="c.toolUseId || i" type="button" class="group-item" @click="emit('detail', c)">
         <span class="item-dot" :class="c.state" />
         <span class="item-name">{{ rowLabel(c) }}</span>
         <span v-if="rowTarget(c)" class="item-target">{{ rowTarget(c) }}</span>
@@ -241,28 +181,6 @@ const lightboxOpen = computed({
       </button>
     </div>
 
-    <!-- 组内单条详情:参数 + 结果 + 图片。弹窗样式(.tool-modal 系列)复用
-         ToolCallCard 非 scoped 块的全局规则 —— 两个组件总在 AgentView 一起挂载 -->
-    <n-modal v-model:show="detailOpen" preset="card" :title="detail?.tool || '工具'" class="tool-modal">
-      <div class="tool-detail">
-        <template v-if="detailDiff">
-          <DiffView
-            v-for="(b, i) in detailDiff" :key="i"
-            :old="b.old" :new="b.new" :file-path="b.path || ''"
-          />
-        </template>
-        <pre v-else-if="detailArgs" class="tool-block">{{ detailArgs }}</pre>
-        <pre v-if="detail?.result" class="tool-block result">{{ detail.result }}</pre>
-        <div v-else-if="detail?.state === 'running'" class="tool-wait">等待结果…</div>
-        <div v-if="detailImages.length" class="tool-imgs">
-          <img v-for="(u, i) in detailImages" :key="u" :src="u" :alt="`图片 ${i + 1}`" loading="lazy" @click="lightbox = u" />
-        </div>
-      </div>
-    </n-modal>
-    <!-- 点亮的原图:独立小弹窗,Cookie 认同所以 <img src> 直连 -->
-    <n-modal v-model:show="lightboxOpen" preset="card" class="tool-modal" title="图片">
-      <img v-if="lightbox" :src="lightbox" class="tool-lightbox" alt="图片" />
-    </n-modal>
   </div>
 </template>
 

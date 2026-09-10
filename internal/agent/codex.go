@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,10 @@ type codexDriver struct {
 	effort     string // 思考强度,每回合随 turn/start 下发
 	cwd        string
 	stderrTail string
+	// 是否已经吐出过任何已归一化事件(对齐 claudeDriver.sawResult):
+	// codex 的 turn 完成与进程退出是两回事,只有进程连一行有效事件都没
+	// 输出就死掉时,stderr 尾部才值得透到时间线,否则会重复报错。
+	sawResult atomic.Bool
 	// 最近一次 turn/diff/updated 的 unified diff(整回合累计)。变化时发一张
 	// CodexDiff 工具卡,前端渲染行级 diff —— ApplyPatch 通知里只有文件名,
 	// 真正的改动内容要走这个通知(对齐 hapi 的 DiffProcessor)。
@@ -533,6 +538,18 @@ func (d *codexDriver) ExitErr() error {
 	return d.exitErr
 }
 
+// ExitDetail 进程异常退出时的可读原因(给 pump 透到时间线):正常退出、
+// 被杀或已吐出过合法事件时为空,避免与已发的错误事件重复。
+func (d *codexDriver) ExitDetail() string {
+	d.mu.Lock()
+	tail, err := d.stderrTail, d.exitErr
+	d.mu.Unlock()
+	if err == nil || tail == "" || d.sawResult.Load() {
+		return ""
+	}
+	return truncate(err.Error()+": "+tail, 4000)
+}
+
 func (d *codexDriver) Close() error {
 	d.closeOnce.Do(func() {
 		if d.cmd != nil && d.cmd.Process != nil {
@@ -697,6 +714,9 @@ func (d *codexDriver) readStdout(r io.Reader) {
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			continue
 		}
+		// 至少有一行合法 JSON-RPC:进程是活的,退出时的 stderr 尾部多半
+		// 只是噪音,不再透到时间线(见 ExitDetail)。
+		d.sawResult.Store(true)
 		switch {
 		case msg.Method == "":
 			d.handleRPCResponse(&msg)
@@ -1327,8 +1347,8 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 				Tool:      "ApplyPatch",
 				ToolUseID: itemID,
 				// truncateJSON:保持合法 JSON,前端按结构解析 per-file diff。
-				Args:      truncateJSON(args, 60*1024),
-				State:     "running",
+				Args:  truncateJSON(args, 60*1024),
+				State: "running",
 			}})
 		} else {
 			state := "ok"

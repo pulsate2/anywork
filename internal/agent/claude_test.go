@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -385,5 +386,56 @@ func TestClaudeSidechainFiltered(t *testing.T) {
 	case ev := <-d.events:
 		t.Fatalf("子 agent 的文本/思考/usage 漏进了主时间线: %+v", ev.Payload)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestClaudeResumeError resume 失败的真实形状:result 行 is_error=true、
+// result 文本为空、原因在 errors 数组里。此前只有 result 文本非空才报错,
+// 失败被静默吞掉 —— 远端只看到会话「又离线了」,无从排查。
+func TestClaudeResumeError(t *testing.T) {
+	d := newClaudeDriver()
+	line := `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","errors":["No conversation found with session ID: deadbeef"]}`
+	go d.readStdout(strings.NewReader(line + "\n"))
+
+	select {
+	case ev := <-d.events:
+		if ev.Kind != KindError {
+			t.Fatalf("kind = %s,想要 %s", ev.Kind, KindError)
+		}
+		p, ok := ev.Payload.(*ErrorPayload)
+		if !ok {
+			t.Fatalf("payload 类型 %T", ev.Payload)
+		}
+		if !strings.Contains(p.Message, "No conversation found") {
+			t.Fatalf("message = %q,应含 resume 失败原因", p.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resume 失败没透成 error 事件")
+	}
+
+	// 错误已从 result 行透出:ExitDetail 不能再拿 stderr 尾部重复报。
+	d.mu.Lock()
+	d.exitErr = errors.New("exit status 1")
+	d.stderrTail = "some stderr noise"
+	d.mu.Unlock()
+	if got := d.ExitDetail(); got != "" {
+		t.Fatalf("sawResult 后 ExitDetail 应为空,得到 %q", got)
+	}
+}
+
+// TestClaudeExitDetail 崩溃退出(没有任何 result 行)时,stderr 尾部要能
+// 透成可读原因;正常退出(ExitErr 为 nil)则不透。
+func TestClaudeExitDetail(t *testing.T) {
+	d := newClaudeDriver()
+	if got := d.ExitDetail(); got != "" {
+		t.Fatalf("未退出时 ExitDetail 应为空,得到 %q", got)
+	}
+	d.mu.Lock()
+	d.exitErr = errors.New("exit status 1")
+	d.stderrTail = "fatal: config parse failed"
+	d.mu.Unlock()
+	got := d.ExitDetail()
+	if !strings.Contains(got, "config parse failed") {
+		t.Fatalf("ExitDetail = %q,应含 stderr 尾部", got)
 	}
 }
