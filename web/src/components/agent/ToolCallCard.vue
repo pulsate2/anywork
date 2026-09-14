@@ -9,6 +9,7 @@ import { NModal } from 'naive-ui'
 import { api, type AgentPermissionReq, type AgentToolCall } from '@/api/client'
 import DiffView from './DiffView.vue'
 import ApprovalCard from './ApprovalCard.vue'
+import { ToolStatusIcon, hasToolCategory, toolCategoryIcon } from './toolIcons'
 
 const props = defineProps<{
   call: AgentToolCall
@@ -65,12 +66,18 @@ const lightboxOpen = computed({
   set: (v: boolean) => { if (!v) lightbox.value = null },
 })
 
-const stateLabel = computed(() => {
-  // 拒绝的调用不会真跑:结论直接就是"已拒绝"(替代旧的"出错"),
-  // 不再在卡下另挂一张"已拒绝"审批条。
-  if (props.pendingResolved && !props.pendingResolved.allow) return '已拒绝'
-  return props.call.state === 'running' ? '运行中' : props.call.state === 'error' ? '出错' : '完成'
+// 卡头状态(hapi ToolStatusIcon 语义):被拒与出错同归红圈叉,等审批挂锁,
+// 运行 spinner,完成绿圈勾 —— 取代原来的文字"运行中/出错/完成/已拒绝"。
+const statusState = computed(() => {
+  if (props.pendingResolved && !props.pendingResolved.allow) return 'error'
+  if (props.pendingReq && !props.pendingResolved) return 'pending'
+  return props.call.state || 'ok'
 })
+
+// 卡头分类图标(hapi 同款):读=眼/写=折角文件/命令=终端…;兜底扳手时
+// 保留工具名(子 agent / MCP 光靠扳手认不出),其余只出图标不出文字。
+const headIcon = computed(() => toolCategoryIcon(props.call.tool || ''))
+const headNamed = computed(() => !hasToolCategory(props.call.tool || ''))
 
 function parseArgs(): Record<string, unknown> | null {
   try {
@@ -273,10 +280,11 @@ const inlineDiff = computed(() =>
 <template>
   <div class="tool-card" :class="call.state">
     <button type="button" class="tool-head" @click="emit('detail', call)">
-      <span class="tool-dot" />
-      <span class="tool-name">{{ call.tool || '工具' }}</span>
+      <!-- 分类图标替代文字工具名(hapi 同款);兜底类保留名字 -->
+      <span class="tool-icon"><component :is="headIcon" /></span>
+      <span v-if="headNamed" class="tool-name">{{ call.tool || '工具' }}</span>
       <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
-      <span class="tool-state">{{ stateLabel }}</span>
+      <span class="tool-state" :class="statusState"><ToolStatusIcon :state="statusState" /></span>
     </button>
     <!-- 子 agent 过程:嵌在父卡内的一体区块(不另起卡)。头部一行开关,
          单条可点看详情;每条上下两行(工具名一行、摘要换行下一行) -->
@@ -290,7 +298,7 @@ const inlineDiff = computed(() =>
           class="steps-item" :class="c.state" @click="emit('detail', c)"
         >
           <div class="steps-line">
-            <span class="steps-dot" />
+            <span class="steps-state" :class="c.state"><ToolStatusIcon :state="c.state || 'ok'" /></span>
             <span class="steps-name">{{ c.tool || '工具' }}</span>
           </div>
           <div v-if="stepBrief(c)" class="steps-brief">{{ stepBrief(c) }}</div>
@@ -335,6 +343,19 @@ const inlineDiff = computed(() =>
 }
 /* 内嵌审批:去掉 ApprovalCard 自身的圆角边框,融进工具卡 */
 .tool-approval { border: 0; border-top: 1px solid rgba(127, 127, 127, .14); border-radius: 0; }
+/* 分类图标槽(hapi 同款 14px):颜色跟 muted,状态色只留给右侧状态图标 */
+.tool-icon {
+  flex: none; width: 14px; height: 14px;
+  color: var(--lr-fg-muted);
+}
+.tool-icon svg, .tool-state svg, .steps-state svg {
+  width: 100%; height: 100%; display: block;
+}
+/* 状态图标配色:完成=绿圈勾,出错/被拒=红圈叉,等审批=挂锁,运行中=spinner */
+.tool-state { flex: none; width: 14px; height: 14px; color: var(--lr-fg-muted); }
+.tool-state.ok { color: var(--lr-ok); }
+.tool-state.error { color: var(--lr-danger); }
+.tool-state.pending { color: var(--lr-warn); }
 .tool-card.error { border-color: rgba(220, 38, 38, .45); }
 .tool-head {
   display: flex; align-items: center; gap: 8px;
@@ -344,14 +365,6 @@ const inlineDiff = computed(() =>
   cursor: pointer; text-align: left;
   -webkit-tap-highlight-color: transparent;
 }
-.tool-dot {
-  flex: none; width: 8px; height: 8px; border-radius: 50%;
-  background: var(--lr-warn);
-}
-.tool-card.ok .tool-dot { background: var(--lr-ok); }
-.tool-card.error .tool-dot { background: var(--lr-danger); }
-.tool-card.running .tool-dot { animation: tool-pulse 1.2s ease-in-out infinite; }
-@keyframes tool-pulse { 50% { opacity: .35; } }
 .tool-name { flex: none; font-weight: 600; font-size: 12px; font-family: ui-monospace, monospace; }
 .tool-brief {
   min-width: 0; flex: 1;
@@ -363,8 +376,6 @@ const inlineDiff = computed(() =>
   font-family: ui-monospace, monospace;
 }
 .tool-brief::-webkit-scrollbar { display: none; }
-.tool-state { flex: none; font-size: 11px; color: var(--lr-fg-muted); }
-.tool-card.error .tool-state { color: var(--lr-danger); }
 
 /* ---- 子 agent 过程(嵌在父卡内的区块) ---- */
 .steps { border-top: 1px solid rgba(127, 127, 127, .14); }
@@ -395,9 +406,9 @@ const inlineDiff = computed(() =>
 }
 .steps-item:hover { background: rgba(127, 127, 127, .06); }
 .steps-line { display: flex; align-items: center; gap: 6px; align-self: stretch; }
-.steps-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--lr-ok); }
-.steps-item.error .steps-dot { background: var(--lr-danger); }
-.steps-item.running .steps-dot { background: var(--lr-warn); animation: tool-pulse 1.2s ease-in-out infinite; }
+.steps-state { flex: none; width: 12px; height: 12px; color: var(--lr-ok); }
+.steps-state.error { color: var(--lr-danger); }
+.steps-state.running { color: var(--lr-fg-muted); }
 .steps-name { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg); }
 .steps-brief {
   align-self: stretch;

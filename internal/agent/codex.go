@@ -30,7 +30,7 @@ type codexDriver struct {
 
 	nextID     int
 	pending    map[int]chan json.RawMessage       // RPC 响应
-	approvals  map[string]chan int                // reqID(itemId) → 审批结果(0 拒 / 1 允许 / 2 本会话允许)
+	approvals  map[string]*codexApproval          // reqID(itemId) → 挂起审批
 	userInputs map[string]chan *userInputDecision // reqID(itemId) → 提问回答(nil = 取消)
 
 	threadID   string // codex thread id(续聊凭据)
@@ -70,7 +70,7 @@ type codexDriver struct {
 func newCodexDriver() *codexDriver {
 	return &codexDriver{
 		pending:        map[int]chan json.RawMessage{},
-		approvals:      map[string]chan int{},
+		approvals:      map[string]*codexApproval{},
 		userInputs:     map[string]chan *userInputDecision{},
 		agentToolSeen:  map[string]bool{},
 		agentToolNames: map[string]string{},
@@ -369,19 +369,20 @@ func (d *codexDriver) Interrupt() error {
 	return err
 }
 
-// Resolve 答复审批:结果送进等待中的审批 handler。session=true 时对 codex
-// 答复 acceptForSession(官方语义:本会话同类请求自动放行)。
+// Resolve 答复审批:结果送进等待中的审批 handler。session=true 对
+// commandExecution 答 acceptWithExecpolicyAmendment(带上请求里给的
+// amendment,同类命令本会话自动放行),其余审批类型答 acceptForSession。
 func (d *codexDriver) Resolve(reqID string, allow, session bool) error {
 	d.mu.Lock()
-	ch := d.approvals[reqID]
-	if ch != nil {
+	ap := d.approvals[reqID]
+	if ap != nil {
 		delete(d.approvals, reqID)
 	}
 	d.mu.Unlock()
-	if ch == nil {
+	if ap == nil {
 		return fmt.Errorf("权限请求不存在或已答复: %s", reqID)
 	}
-	ch <- approveCode(allow, session)
+	ap.ch <- approveCode(allow, session)
 	return nil
 }
 
@@ -573,13 +574,13 @@ func (d *codexDriver) waitExit() {
 	d.exitErr = err
 	d.stdin = nil
 	// 进程死了:RPC 全部失败,挂起的审批按拒绝收尾,挂起的提问按取消收尾。
-	for _, ch := range d.approvals {
+	for _, ap := range d.approvals {
 		select {
-		case ch <- 0:
+		case ap.ch <- 0:
 		default:
 		}
 	}
-	d.approvals = map[string]chan int{}
+	d.approvals = map[string]*codexApproval{}
 	for _, ch := range d.userInputs {
 		select {
 		case ch <- nil:
@@ -758,6 +759,17 @@ type codexApprovalParams struct {
 	ToolName   string          `json:"toolName"`    // tool
 	Input      json.RawMessage `json:"input"`       // tool
 	Permission json.RawMessage `json:"permissions"` // permissions
+	// Amendment commandExecution 的 proposedExecpolicyAmendment:按它放行
+	// 后 codex 会在本会话内记住这条规则,同类命令不再询问。
+	Amendment json.RawMessage `json:"proposedExecpolicyAmendment"`
+}
+
+// codexApproval 一个挂起中的审批:答复通道 + 回答时要用的请求上下文。
+type codexApproval struct {
+	ch chan int // 0 拒 / 1 允许 / 2 本会话允许
+	// method + amendment 决定 code=2 时回什么形状(见 handleApproval)。
+	method    string
+	amendment json.RawMessage
 }
 
 func (d *codexDriver) handleServerRequest(msg *jsonrpcLine) {
@@ -821,7 +833,7 @@ func (d *codexDriver) handleApproval(msg *jsonrpcLine) {
 		d.respond(msg.ID, map[string]any{"decision": "decline"})
 		return
 	}
-	d.approvals[reqID] = ch
+	d.approvals[reqID] = &codexApproval{ch: ch, method: msg.Method, amendment: p.Amendment}
 	d.mu.Unlock()
 
 	d.emit(Event{Kind: KindPermissionReq, Payload: &PermissionReqPayload{
@@ -842,6 +854,13 @@ func (d *codexDriver) handleApproval(msg *jsonrpcLine) {
 		}
 	} else if code == 0 {
 		result = map[string]any{"decision": "decline"}
+	} else if code == 2 && msg.Method == "item/commandExecution/requestApproval" && len(p.Amendment) > 0 {
+		// 本会话允许(commandExecution):acceptForSession 在 availableDecisions
+		// 里根本不存在,答了等于没答 —— 正确形状是把请求自带的 amendment
+		// 原样塞回 acceptWithExecpolicyAmendment,codex 会话级记住这条规则。
+		result = map[string]any{"decision": map[string]any{
+			"acceptWithExecpolicyAmendment": map[string]any{"execpolicy_amendment": json.RawMessage(p.Amendment)},
+		}}
 	} else if code == 2 {
 		// acceptForSession:codex 官方语义,同类请求本会话自动放行。
 		result = map[string]any{"decision": "acceptForSession"}

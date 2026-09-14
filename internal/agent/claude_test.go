@@ -439,3 +439,34 @@ func TestClaudeExitDetail(t *testing.T) {
 		t.Fatalf("ExitDetail = %q,应含 stderr 尾部", got)
 	}
 }
+
+// TestClaudeEnvSandbox 放行模式必须注入 IS_SANDBOX=1:root 部署下 claude
+// 拒启 bypassPermissions,不注入的话"全部放行"形同虚设;其它模式不带,
+// 宿主环境里的 IS_SANDBOX 也不该漏进非放行会话。
+func TestClaudeEnvSandbox(t *testing.T) {
+	t.Setenv("IS_SANDBOX", "")
+	os.Unsetenv("IS_SANDBOX")
+
+	for _, tc := range []struct {
+		mode   string
+		want   bool
+		effort string
+	}{
+		{PermAccept, true, ""},
+		{PermAccept, true, EffortHigh},
+		{PermAsk, false, ""},
+		{PermPlan, false, ""},
+		{PermEdits, false, ""},
+	} {
+		env := claudeEnv(nil, tc.effort, tc.mode)
+		got := false
+		for _, kv := range env {
+			if kv == "IS_SANDBOX=1" {
+				got = true
+			}
+		}
+		if got != tc.want {
+			t.Errorf("claudeEnv(perm=%s) IS_SANDBOX=1 = %v,期望 %v", tc.mode, got, tc.want)
+		}
+	}
+}

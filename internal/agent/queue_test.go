@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -97,8 +98,10 @@ func TestQueueStore(t *testing.T) {
 // fakeDriver 只记录 Send 的最小实现:让 releaseQueued 的全链路
 // (出队 → Send → 落库)能在没有真 CLI 的测试里跑通。
 type fakeDriver struct {
-	mu   sync.Mutex
-	sent []string
+	mu       sync.Mutex
+	sent     []string
+	closed   bool // Close 被调过(stale 重启要杀旧进程)
+	applyErr bool // 模拟 claude:ApplySettings 报"运行中改不了"
 }
 
 func (f *fakeDriver) Start(opts StartOpts) error { return nil }
@@ -116,12 +119,22 @@ func (f *fakeDriver) Answer(reqID string, answers map[string][]string) error {
 func (f *fakeDriver) PendingRequests() []PermissionReqPayload { return nil }
 func (f *fakeDriver) ExternalID() string                      { return "" }
 func (f *fakeDriver) CurrentModel() string                    { return "" }
-func (f *fakeDriver) ApplySettings(u SettingsUpdate) error    { return nil }
-func (f *fakeDriver) Events() <-chan Event                    { return nil }
-func (f *fakeDriver) Done() <-chan struct{}                   { return nil }
-func (f *fakeDriver) ExitErr() error                          { return nil }
-func (f *fakeDriver) ExitDetail() string                      { return "" }
-func (f *fakeDriver) Close() error                            { return nil }
+func (f *fakeDriver) ApplySettings(u SettingsUpdate) error {
+	if f.applyErr {
+		return fmt.Errorf("claude 会话运行中不支持调整")
+	}
+	return nil
+}
+func (f *fakeDriver) Events() <-chan Event  { return nil }
+func (f *fakeDriver) Done() <-chan struct{} { return nil }
+func (f *fakeDriver) ExitErr() error        { return nil }
+func (f *fakeDriver) ExitDetail() string    { return "" }
+func (f *fakeDriver) Close() error {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+	return nil
+}
 
 // TestReleaseQueued 回合结束放行:pump 每 idle 放一条,逐条串行;放行后
 // 队列里少一条、时间线上多一条 user 消息。
@@ -228,5 +241,111 @@ func TestEnqueueIdleDirectSend(t *testing.T) {
 	}
 	if left, _ := s.Queued(sess.ID); len(left) != 0 {
 		t.Fatalf("空闲直发不该入队: %v", left)
+	}
+}
+
+// recSub 记录收到的事件,断言订阅转移用。
+type recSub struct{ got []*Event }
+
+func (r *recSub) SendEvent(ev *Event) { r.got = append(r.got, ev) }
+
+// TestSettingsRestartStaleSession claude 式 driver(ApplySettings 报错)改
+// 设置后:标记 stale,下一条消息触发重启 —— 旧进程被杀、订阅者转挂新会话、
+// 新进程收到消息;再发一条不再重启(设置没再改)。
+func TestSettingsRestartStaleSession(t *testing.T) {
+	// 注入假 driver 工厂:记录每个 driver 的生死与发送。
+	var mu sync.Mutex
+	var made []*fakeDriver
+	newDriver = func(app string) (Driver, error) {
+		fd := &fakeDriver{applyErr: true} // 模拟 claude:运行中改不了
+		mu.Lock()
+		made = append(made, fd)
+		mu.Unlock()
+		return fd, nil
+	}
+	t.Cleanup(func() {
+		newDriver = func(app string) (Driver, error) { // 还原
+			switch app {
+			case AppClaude:
+				return newClaudeDriver(), nil
+			case AppCodex:
+				return newCodexDriver(), nil
+			default:
+				return nil, fmt.Errorf("未知 agent: %s", app)
+			}
+		}
+	})
+
+	s := newTestStore(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	sess := &Session{
+		ID: "s-restart", App: AppClaude, Workspace: "/w", PermissionMode: PermAsk,
+		ExternalID: "ext-1", Status: StatusRunning, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateSession(sess); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(s, "/w", false)
+
+	// 会话已在跑:第一条消息走旧进程。
+	if _, err := m.Send(sess.ID, "第一条"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	mu.Lock()
+	first := made[0]
+	mu.Unlock()
+	if got := first.sent; len(got) != 1 {
+		t.Fatalf("第一条应发给旧进程: %v", got)
+	}
+
+	// 订阅旧会话,再改设置(claude 式 driver 会报"改不了")。
+	sub := &recSub{}
+	if err := m.Subscribe(sess.ID, sub); err != nil {
+		t.Fatal(err)
+	}
+	_, _, note := m.Settings(sess.ID, SettingsUpdate{PermissionMode: PermAccept})
+	if note == "" {
+		t.Fatal("claude 式 driver 改设置应有提示")
+	}
+
+	// 第二条消息:stale 触发重启。
+	if _, err := m.Send(sess.ID, "第二条"); err != nil {
+		t.Fatalf("Send after settings: %v", err)
+	}
+	mu.Lock()
+	if len(made) != 2 {
+		mu.Unlock()
+		t.Fatalf("应重启出一个新 driver,得到 %d 个", len(made))
+	}
+	fresh := made[1]
+	mu.Unlock()
+	if !first.closed {
+		t.Fatal("旧进程应被关闭")
+	}
+	if got := fresh.sent; len(got) != 1 || got[0] != "第二条" {
+		t.Fatalf("新进程应收到「第二条」: %v", got)
+	}
+	// 订阅者已转挂新会话:后续广播直接到达,前端无感。
+	cur := m.get(sess.ID)
+	cur.mu.Lock()
+	_, ok := cur.subscribers[sub]
+	nsub := len(cur.subscribers)
+	cur.mu.Unlock()
+	if cur.driver != fresh || !ok || nsub != 1 {
+		t.Fatalf("订阅应转移到新会话(driver/订阅者不对)")
+	}
+
+	// 第三条:设置没再改,不再重启,直接发给新进程。
+	if _, err := m.Send(sess.ID, "第三条"); err != nil {
+		t.Fatalf("Send 3: %v", err)
+	}
+	mu.Lock()
+	nmade := len(made)
+	mu.Unlock()
+	if nmade != 2 {
+		t.Fatalf("设置没改不应再次重启,共 %d 个 driver", nmade)
+	}
+	if got := fresh.sent; len(got) != 2 {
+		t.Fatalf("第三条应发给新进程: %v", got)
 	}
 }

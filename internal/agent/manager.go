@@ -36,6 +36,12 @@ type liveSession struct {
 	// Enqueue 的"空闲直发"与 releaseQueued 的"回合结束放行"都靠它判断,
 	// 抢占式置 running 关闭两边的竞争窗口(见 releaseQueued)。
 	state string
+	// stale 设置已改但进程还没换(claude 的模型/强度/权限都是 spawn 级参数,
+	// 运行中改不了):下一条消息进来时弃旧进程按新设置重启(见 restart)。
+	stale bool
+	// superseded 已被 restart 替换:pump 收尾不再标死、不再广播 exit ——
+	// 订阅者已转挂到新会话,标死会把刚复活的会话在列表/前端打回离线。
+	superseded bool
 }
 
 // Manager 管理存活 agent 会话与 WS 订阅(仿 terminal.Manager 的职责划分,
@@ -259,6 +265,15 @@ func (m *Manager) pump(ls *liveSession) {
 		}
 	}
 
+	// 事件流关闭 = 进程退出。被 restart 替换的会话:订阅者已转挂新会话,
+	// 这里标死/广播 exit 只会把刚复活的会话打回离线,直接静默退场。
+	ls.mu.Lock()
+	superseded := ls.superseded
+	ls.mu.Unlock()
+	if superseded {
+		return
+	}
+
 	// 事件流关闭 = 进程退出。异常退出(resume 失败、CLI 崩溃)在时间线上
 	// 只表现为「又离线了」,原因不给出来远端根本没法排查:把 stderr 尾部
 	// 补成一张 error 卡再标死。正常退出/被杀/已报过错时 ExitDetail 为空。
@@ -298,6 +313,18 @@ func (m *Manager) Send(sessionID, text string) (*Event, error) {
 		ls, err = m.revive(sessionID)
 		if err != nil {
 			return nil, err
+		}
+	} else {
+		// 设置改过还没生效(claude):先按 DB 里的新设置重启进程再发。
+		ls.mu.Lock()
+		stale := ls.stale
+		ls.mu.Unlock()
+		if stale {
+			var err error
+			ls, err = m.restart(ls)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	// 先落库再写 stdin:写 stdin 失败时消息已经在历史里,错误也会以
@@ -419,6 +446,10 @@ func (m *Manager) CancelQueued(sessionID string, id int64) error {
 func (m *Manager) revive(id string) (*liveSession, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.reviveLocked(id)
+}
+
+func (m *Manager) reviveLocked(id string) (*liveSession, error) {
 	if ls, ok := m.sessions[id]; ok { // 双检:等锁的后来者直接复用
 		return ls, nil
 	}
@@ -462,6 +493,43 @@ func (m *Manager) revive(id string) (*liveSession, error) {
 	m.store.SetStatus(id, StatusIdle)
 	go m.pump(ls)
 	return ls, nil
+}
+
+// restart 弃旧换新(stale 会话,见 liveSession.stale):杀掉旧进程,按 DB 里
+// 的新设置重新 spawn。订阅者直接转挂到新会话 —— 前端自始至终不知道换过
+// 进程,连订阅都不用重发。整个操作持有 Manager 锁:并发的两条消息只会
+// 触发一次重启,后到者直接复用新会话。
+func (m *Manager) restart(ls *liveSession) (*liveSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.sessions[ls.id]
+	if cur != ls {
+		if cur != nil { // 别的请求已经重启过了,直接复用
+			return cur, nil
+		}
+		return m.reviveLocked(ls.id)
+	}
+	ls.mu.Lock()
+	ls.superseded = true
+	subs := make([]Subscriber, 0, len(ls.subscribers))
+	for s := range ls.subscribers {
+		subs = append(subs, s)
+	}
+	ls.subscribers = map[Subscriber]struct{}{}
+	ls.mu.Unlock()
+	delete(m.sessions, ls.id)
+	ls.driver.Close() // 异步:旧 pump 会自己收尾(superseded 分支)
+
+	fresh, err := m.reviveLocked(ls.id)
+	if err != nil {
+		return nil, err
+	}
+	fresh.mu.Lock()
+	for _, s := range subs {
+		fresh.subscribers[s] = struct{}{}
+	}
+	fresh.mu.Unlock()
+	return fresh, nil
 }
 
 // applyTitle 首条用户消息即标题(只补一次)。
@@ -513,6 +581,12 @@ func (m *Manager) Settings(sessionID string, u SettingsUpdate) (*Session, error,
 	note := ""
 	if err := ls.driver.ApplySettings(u); err != nil {
 		note = err.Error()
+		// driver 说"运行中改不了"(claude:模型/强度/权限都是 spawn 级参数):
+		// 标记 stale,下一条消息进来时弃旧进程按新设置重启 —— 用户在
+		// codex 上养成的"下一回合生效"预期,claude 也要兑现。
+		ls.mu.Lock()
+		ls.stale = true
+		ls.mu.Unlock()
 	}
 	// 只在 driver 真正接受了新模型时同步 ls.model;claude 没接受(note 非空)时
 	// 保持原值 —— 不然 pump 会拿"仍在跑的旧模型"把用户刚存的选择覆盖回去。

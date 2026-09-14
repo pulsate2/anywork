@@ -133,7 +133,7 @@ func (d *claudeDriver) Start(opts StartOpts) error {
 
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = opts.Cwd
-	cmd.Env = claudeEnv(opts.Env, opts.Effort)
+	cmd.Env = claudeEnv(opts.Env, opts.Effort, opts.PermissionMode)
 	// 独立进程组:kill 时整棵进程树一起收(claude 起的 bash/node 不留孤儿)。
 	setProcessGroup(cmd)
 
@@ -167,16 +167,22 @@ func (d *claudeDriver) Start(opts StartOpts) error {
 // claudeEnv 会话环境:DISABLE_AUTOUPDATER 防自动更新打断回合;
 // CLAUDE_CODE_ENTRYPOINT 归一成 sdk —— 服务进程可能是从某个 claude 会话里启动的,
 // 不归一会把宿主会话的标记带进去。
-func claudeEnv(extra []string, effort string) []string {
-	env := make([]string, 0, len(os.Environ())+4)
+func claudeEnv(extra []string, effort, permMode string) []string {
+	env := make([]string, 0, len(os.Environ())+5)
 	for _, kv := range os.Environ() {
 		switch k, _, _ := strings.Cut(kv, "="); k {
-		case "CLAUDE_CODE_ENTRYPOINT", "MAX_THINKING_TOKENS":
+		case "CLAUDE_CODE_ENTRYPOINT", "MAX_THINKING_TOKENS", "IS_SANDBOX":
 			continue
 		}
 		env = append(env, kv)
 	}
 	env = append(env, "DISABLE_AUTOUPDATER=1", "CLAUDE_CODE_ENTRYPOINT=sdk")
+	// root 下 bypassPermissions 会被 claude 直接拒启("cannot be used with
+	// root/sudo privileges")—— 本工作台常见部署形态就是 root,不放行模式
+	// 会形同虚设。IS_SANDBOX=1 是 claude 官方给容器/沙箱环境的豁免开关。
+	if permMode == PermAccept {
+		env = append(env, "IS_SANDBOX=1")
+	}
 	// 思考强度档位 → 思考 token 预算(claude 官方档位语义,none = 不设,交给默认)。
 	switch effort {
 	case EffortLow:
@@ -281,10 +287,10 @@ func (d *claudeDriver) CurrentModel() string {
 	return d.model
 }
 
-// ApplySettings claude 的模型/思考强度是 spawn 级参数,运行中改不了。
-// Manager 会把设置落库,续聊(resume)时生效 —— 这里只负责说实话。
+// ApplySettings claude 的模型/思考强度/权限都是 spawn 级参数,运行中改不了。
+// Manager 会把设置落库并标记 stale,下一条消息进来时按新设置重启进程。
 func (d *claudeDriver) ApplySettings(u SettingsUpdate) error {
-	return fmt.Errorf("claude 会话运行中不支持调整;设置已保存,结束后续聊时生效")
+	return fmt.Errorf("claude 设置在进程启动时固定;已保存,发送下一条消息时以新设置重启会话")
 }
 
 func (d *claudeDriver) Events() <-chan Event  { return d.events }

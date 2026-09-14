@@ -73,7 +73,9 @@ describe('AgentView 真实会话回放', () => {
       await heads[i].trigger('click')
       await flushPromises()
       const detail = document.body.querySelector('.tool-detail')
-      const toolName = heads[i].find('.tool-name')?.text()
+      // 工具名已换成分类图标(有分类的卡不再有 .tool-name),取不到就标空
+      const nameEl = heads[i].find('.tool-name')
+      const toolName = nameEl.exists() ? nameEl.text() : '(图标卡)'
       expect(detail, `第 ${i} 张卡(${toolName})点开后没有 .tool-detail`).toBeTruthy()
       expect((detail?.textContent?.length ?? 0) > 0, `第 ${i} 张卡(${toolName})弹窗内容为空`).toBeTruthy()
     }

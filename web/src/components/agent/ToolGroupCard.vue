@@ -8,6 +8,7 @@
 // 回来,组卡一卸载弹窗就没了(表现为点开就关)。
 import { computed, ref } from 'vue'
 import type { AgentToolCall } from '@/api/client'
+import { ToolStatusIcon, toolCategoryIcon } from './toolIcons'
 
 const props = defineProps<{
   calls: AgentToolCall[]
@@ -144,9 +145,6 @@ const state = computed(() =>
   props.calls.some((c) => c.state === 'error') ? 'error'
     : props.calls.some((c) => c.state === 'running') ? 'running' : 'ok',
 )
-const stateLabel = computed(() =>
-  state.value === 'running' ? '运行中' : state.value === 'error' ? '出错' : '完成',
-)
 
 // 组内单行标签:意图名(other 用工具名)+ 目标。
 function rowLabel(c: AgentToolCall): string {
@@ -164,20 +162,19 @@ function rowTarget(c: AgentToolCall): string {
 <template>
   <div class="group-card" :class="state">
     <button type="button" class="group-head" @click="open = !open">
-      <!-- 折叠开关用箭头:收起 ›,展开旋转 90° 朝下(圆点换掉,状态已有右侧
-           「完成/运行中/出错」承担,圆点信息重复) -->
+      <!-- 折叠开关用箭头:收起 ›,展开旋转 90° 朝下;状态用图标(勾/叉/spinner) -->
       <span class="group-caret" :class="{ open }" />
       <span class="group-title">{{ title }} · {{ calls.length }} 项</span>
       <span v-if="brief" class="group-brief">{{ brief }}</span>
-      <span class="group-state">{{ stateLabel }}</span>
+      <span class="group-state" :class="state"><ToolStatusIcon :state="state" /></span>
     </button>
     <div v-if="open" class="group-body">
       <button v-for="(c, i) in calls" :key="c.toolUseId || i" type="button" class="group-item" @click="emit('detail', c)">
-        <span class="item-dot" :class="c.state" />
+        <span class="item-state" :class="c.state"><ToolStatusIcon :state="c.state || 'ok'" /></span>
+        <span class="item-icon"><component :is="toolCategoryIcon(c.tool)" /></span>
         <span class="item-name">{{ rowLabel(c) }}</span>
         <span v-if="rowTarget(c)" class="item-target">{{ rowTarget(c) }}</span>
         <span v-if="c.result" class="item-lines">{{ c.result.trim().split('\n').length }} 行</span>
-        <span class="item-state">{{ c.state === 'error' ? '出错' : c.state === 'running' ? '运行中' : '完成' }}</span>
       </button>
     </div>
 
@@ -207,7 +204,11 @@ function rowTarget(c: AgentToolCall): string {
 }
 .group-caret::before { content: '›'; font-weight: 600; }
 .group-caret.open { transform: rotate(90deg); }
-@keyframes group-pulse { 50% { opacity: .35; } }
+/* 状态图标:完成=绿圈勾,出错=红圈叉,运行中=spinner(hapi 同款) */
+.group-state { flex: none; width: 14px; height: 14px; color: var(--lr-fg-muted); }
+.group-state svg, .item-state svg, .item-icon svg { width: 100%; height: 100%; display: block; }
+.group-state.ok { color: var(--lr-ok); }
+.group-state.error { color: var(--lr-danger); }
 .group-title { flex: none; font-weight: 600; font-size: 12px; }
 .group-brief {
   min-width: 0; flex: 1;
@@ -218,8 +219,6 @@ function rowTarget(c: AgentToolCall): string {
   font-family: ui-monospace, monospace;
 }
 .group-brief::-webkit-scrollbar { display: none; }
-.group-state { flex: none; font-size: 11px; color: var(--lr-fg-muted); }
-.group-card.error .group-state { color: var(--lr-danger); }
 .group-body { border-top: 1px solid rgba(127, 127, 127, .14); }
 /* 单条从 div 换成 button(点开详情):补上按钮语义的归零样式 */
 .group-item {
@@ -231,9 +230,11 @@ function rowTarget(c: AgentToolCall): string {
   min-height: 38px;
 }
 .group-item + .group-item { border-top: 1px solid rgba(127, 127, 127, .08); }
-.item-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--lr-ok); }
-.item-dot.error { background: var(--lr-danger); }
-.item-dot.running { background: var(--lr-warn); animation: group-pulse 1.2s ease-in-out infinite; }
+/* 行内:状态图标 + 分类图标 + 标签(图标系两枚 12px,间距收紧) */
+.item-state { flex: none; width: 12px; height: 12px; color: var(--lr-ok); }
+.item-state.error { color: var(--lr-danger); }
+.item-state.running { color: var(--lr-fg-muted); }
+.item-icon { flex: none; width: 12px; height: 12px; color: var(--lr-fg-muted); }
 .item-name { flex: none; color: var(--lr-fg); }
 .item-target {
   min-width: 0; flex: 1;
@@ -242,5 +243,4 @@ function rowTarget(c: AgentToolCall): string {
 }
 .item-target::-webkit-scrollbar { display: none; }
 .item-lines { flex: none; color: var(--lr-fg-muted); }
-.item-state { flex: none; color: var(--lr-fg-muted); font-size: 11px; }
 </style>

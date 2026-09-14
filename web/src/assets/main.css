@@ -185,3 +185,8 @@ body {
     --lr-page-pad-bottom: 20px;
   }
 }
+
+/* 工具卡状态图标的 spinner(toolIcons.ts 的运行中态):函数式组件不带样式,
+   动画全局定义,17/17 前端各处复用 */
+@keyframes tool-icon-spin { to { transform: rotate(360deg); } }
+.tool-icon-spin { animation: tool-icon-spin 1s linear infinite; }

@@ -61,3 +61,66 @@ describe('ToolGroupCard 行点击', () => {
     expect(w.emitted('detail')?.[0]?.[0]).toStrictEqual({ ...bashMerged })
   })
 })
+
+// hapi 同款图标样式:分类图标替代文字工具名(读/写/命令有专属图标,
+// 兜底类保留名字),状态用 勾/叉/锁/spinner 替代文字。
+describe('工具卡图标(hapi 同款)', () => {
+  it('Bash 卡:终端图标 + 状态图标,不再有文字工具名', () => {
+    const w = mount(ToolCallCard, { props: { call: { ...bashMerged } } })
+    expect(w.find('.tool-icon svg').exists()).toBe(true)
+    expect(w.find('.tool-name').exists()).toBe(false)
+    // 完成 = 圈勾(ok 态的 path 在同一 svg 里)
+    const stateSvg = w.find('.tool-state svg')
+    expect(stateSvg.exists()).toBe(true)
+    expect(stateSvg.attributes('viewBox')).toBe('0 0 16 16')
+    expect(w.find('.tool-state').classes()).toContain('ok')
+  })
+
+  it('兜底类(Task):扳手图标旁保留工具名', () => {
+    const w = mount(ToolCallCard, {
+      props: { call: { tool: 'Task', toolUseId: 't1', args: '{"description":"d"}', state: 'ok' as const } },
+    })
+    expect(w.find('.tool-icon svg').exists()).toBe(true)
+    expect(w.find('.tool-name').text()).toBe('Task')
+  })
+
+  it('出错卡:红圈叉(圆圈 + 交叉斜线)', () => {
+    const w = mount(ToolCallCard, {
+      props: { call: { ...bashUse, state: 'error' as const } },
+    })
+    expect(w.find('.tool-state').classes()).toContain('error')
+    const d = w.findAll('.tool-state svg path')
+    expect(d.some((x) => (x.attributes('d') || '').includes('M5.6 5.6l4.8 4.8'))).toBe(true)
+  })
+
+  it('等审批:挂锁;被拒:归并红圈叉', () => {
+    const w = mount(ToolCallCard, {
+      props: {
+        call: { ...bashUse },
+        pendingReq: { reqId: 'r1', tool: 'Bash', args: 'ls' },
+      },
+    })
+    expect(w.find('.tool-state').classes()).toContain('pending')
+    const w2 = mount(ToolCallCard, {
+      props: {
+        call: { ...bashUse },
+        pendingReq: { reqId: 'r1', tool: 'Bash', args: 'ls' },
+        pendingResolved: { allow: false },
+      },
+    })
+    expect(w2.find('.tool-state').classes()).toContain('error')
+  })
+
+  it('组卡:头部状态图标,行内 状态图标+分类图标,无文字状态', async () => {
+    const w = mount(ToolGroupCard, { props: { calls: [
+      { tool: 'Read', toolUseId: 'r', args: '{"file_path":"/w/a"}', state: 'ok' as const, result: 'x' },
+      { ...bashMerged },
+    ] } })
+    await w.find('.group-head').trigger('click')
+    expect(w.find('.group-head .group-state svg').exists()).toBe(true)
+    const items = w.findAll('.group-item')
+    expect(items[0].find('.item-state svg').exists()).toBe(true)
+    expect(items[0].find('.item-icon svg').exists()).toBe(true)
+    expect(w.find('.item-dot').exists()).toBe(false)
+  })
+})

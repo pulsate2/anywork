@@ -384,12 +384,25 @@ const cards = computed<Card[]>(() => {
           else if (card.req && card.req.reqId !== p.reqId) card.extraReqs = [p]
           break
         }
-        // 同工具的 running 工具卡就在跟前(claude 的 Write/Edit/Bash:先 tool_use 卡
-        // 再审批请求):把审批并进那张卡,不再单开一张 —— 免得"同一个工具两张卡"。
-        // 往前看 3 张并包含最后一张(刚推入的 tool_use 卡就是它)。
-        const near = out.slice(-3)
-        const host = [...near].reverse().find((cd) =>
-          cd.kind === 'tool' && cd.call && cd.call.tool === p.tool && cd.call.state === 'running' && !cd.pendingReq)
+        // 宿主卡配对,先精确后启发:
+        // 精确 —— codex 的审批 reqId 就是工具卡的 toolUseId(同一个 itemId),
+        // 并行调用各归各;靠"跟前找"会张冠李戴(并行三条命令时审批全配到
+        // 相邻卡上),甚至配不上单开出一张审批卡。
+        // 启发 —— claude 的审批不带工具调用 id,沿用"跟前 3 张同工具
+        // running 卡"(claude 的 tool_use 与审批紧邻,基本串行)。
+        // 两条路都要校验:同工具、running、未挂过审批,否则继续往下找。
+        let host: (typeof out)[number] | undefined
+        const exact = p.reqId ? toolIndex.get(p.reqId) : undefined
+        if (exact !== undefined) {
+          const c = out[exact]
+          if (c.kind === 'tool' && c.call && c.call.tool === p.tool && c.call.state === 'running' && !c.pendingReq) host = c
+        }
+        if (!host) {
+          // 往前看 3 张并包含最后一张(刚推入的 tool_use 卡就是它)。
+          const near = out.slice(-3)
+          host = [...near].reverse().find((cd) =>
+            cd.kind === 'tool' && cd.call && cd.call.tool === p.tool && cd.call.state === 'running' && !cd.pendingReq)
+        }
         if (host) {
           host.pendingReq = p
           const local = decided.value.get(p.reqId)

@@ -471,3 +471,106 @@ loop:
 		t.Error("没收到 idle 状态")
 	}
 }
+
+// TestCodexApprovalAmendment 本会话允许(commandExecution)必须回
+// acceptWithExecpolicyAmendment:availableDecisions 里没有 acceptForSession,
+// 答了等于没答;amendment 要把请求里的 proposedExecpolicyAmendment 原样
+// 塞回(实测形状,见 handleApproval)。
+func TestCodexApprovalAmendment(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		method   string
+		params   string
+		allow    bool
+		session  bool
+		contains []string
+		absent   []string
+	}{
+		{
+			name:    "commandExecution 本会话允许",
+			method:  "item/commandExecution/requestApproval",
+			params:  `{"itemId":"it1","command":["echo","d1"],"proposedExecpolicyAmendment":["echo","d1"]}`,
+			allow:   true,
+			session: true,
+			contains: []string{
+				`"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["echo","d1"]}}`,
+			},
+			absent: []string{"acceptForSession"},
+		},
+		{
+			name:     "commandExecution 普通允许不带 amendment",
+			method:   "item/commandExecution/requestApproval",
+			params:   `{"itemId":"it2","command":["echo","d2"]}`,
+			allow:    true,
+			session:  false,
+			contains: []string{`"decision":"accept"`},
+			absent:   []string{"acceptWithExecpolicyAmendment"},
+		},
+		{
+			name:     "fileChange 本会话允许退回 acceptForSession",
+			method:   "item/fileChange/requestApproval",
+			params:   `{"itemId":"it3","grantRoot":"/tmp"}`,
+			allow:    true,
+			session:  true,
+			contains: []string{`"decision":"acceptForSession"`},
+			absent:   []string{"acceptWithExecpolicyAmendment"},
+		},
+		{
+			name:     "拒绝",
+			method:   "item/commandExecution/requestApproval",
+			params:   `{"itemId":"it4","command":["echo"],"proposedExecpolicyAmendment":["echo"]}`,
+			allow:    false,
+			session:  true,
+			contains: []string{`"decision":"decline"`},
+			absent:   []string{"acceptWith"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newCodexDriver()
+			in := &fakeStdin{}
+			d.stdin = in
+
+			id := 7
+			line := &jsonrpcLine{ID: &id, Method: tc.method, Params: json.RawMessage(tc.params)}
+			go d.handleServerRequest(line)
+
+			// permission_request 先落,reqID = itemId。
+			select {
+			case ev := <-d.events:
+				pr, ok := ev.Payload.(*PermissionReqPayload)
+				if !ok || ev.Kind != KindPermissionReq {
+					t.Fatalf("先到的应是 permission_request: %+v", ev)
+				} else if pr.ReqID == "" {
+					t.Fatal("permission_request 缺 reqID")
+				}
+				if err := d.Resolve(pr.ReqID, tc.allow, tc.session); err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("没等到 permission_request")
+			}
+
+			deadline := time.After(2 * time.Second)
+			for {
+				if s := in.String(); s != "" {
+					for _, want := range tc.contains {
+						if !strings.Contains(s, want) {
+							t.Fatalf("答复 %s 应含 %s", s, want)
+						}
+					}
+					for _, no := range tc.absent {
+						if strings.Contains(s, no) {
+							t.Fatalf("答复 %s 不应含 %s", s, no)
+						}
+					}
+					return
+				}
+				select {
+				case <-deadline:
+					t.Fatal("没有写出答复")
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		})
+	}
+}

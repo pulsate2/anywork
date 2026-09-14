@@ -81,8 +81,8 @@ type Driver interface {
 	Close() error
 }
 
-// newDriver 按应用构造 driver。
-func newDriver(app string) (Driver, error) {
+// newDriver 按应用构造 driver。包级变量:测试可替换注入假 driver。
+var newDriver = func(app string) (Driver, error) {
 	switch app {
 	case AppClaude:
 		return newClaudeDriver(), nil

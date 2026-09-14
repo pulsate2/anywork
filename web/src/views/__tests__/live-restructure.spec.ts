@@ -84,8 +84,8 @@ describe('live 回合:审批往返时弹窗存活', () => {
     // 组被拆散:Read 与 Bash 都变回单卡,各自有 .tool-head
     expect(w.findAll('.group-head').length).toBe(0)
     expect(heads.length).toBe(2)
-    // 3. 点开 bash 卡详情
-    const bashHead = heads.find((h) => h.text().includes('Bash'))!
+    // 3. 点开 bash 卡详情(工具名已换成图标,靠命令摘要定位)
+    const bashHead = heads.find((h) => h.text().includes('ls -la /w'))!
     await bashHead.trigger('click')
     await flushPromises()
     let detail = document.body.querySelector('.tool-detail')
