@@ -93,6 +93,21 @@ describe('ToolGroupCard 行点击', () => {
     await items[1].trigger('click')
     expect(w.emitted('detail')?.[0]?.[0]).toStrictEqual({ ...bashMerged })
   })
+
+  // 行目标与单卡 brief 同语义(全路径,不截基名):Read 行只显基名时
+  // 认不出目录、同名文件分不清 —— 用户实测反馈过。
+  it('行目标显示完整值:Read 全路径、Grep 模式·目录、Glob 无目录只显模式', async () => {
+    const w = mount(ToolGroupCard, { props: { calls: [
+      { tool: 'Read', toolUseId: 'r1', args: '{"file_path":"/root/gittest2/long_line.txt"}', state: 'ok' as const, result: 'x' },
+      { tool: 'Grep', toolUseId: 'g1', args: '{"pattern":"TODO","path":"/root/anywork/src"}', state: 'ok' as const, result: 'x' },
+      { tool: 'Glob', toolUseId: 'g2', args: '{"pattern":"**/*.spec.ts"}', state: 'ok' as const, result: 'x' },
+    ] } })
+    await w.find('.group-head').trigger('click')
+    const targets = w.findAll('.group-item .item-target')
+    expect(targets[0].text()).toBe('/root/gittest2/long_line.txt')
+    expect(targets[1].text()).toBe('TODO · /root/anywork/src')
+    expect(targets[2].text()).toBe('**/*.spec.ts')
+  })
 })
 
 // hapi 同款图标样式:分类图标替代文字工具名(读/写/命令有专属图标,

@@ -148,10 +148,18 @@ const state = computed(() =>
 
 // 组内单行:分类图标已表意(眼/终端/折角文件),不再重复"查看文件/运行
 // 命令"文字;兜底类(子 agent/MCP)没有专属图标,保留工具名。
+// 行目标与单卡 brief 同语义给完整值(不再截基名):Read/Edit 给全路径,
+// 基名认不出目录、多文件同名时更分不清;Grep/Glob 给「模式 · 目录」——
+// 单卡 brief 的键序里 path 在 pattern 前,只显 path,但组内多条搜索往往
+// 同目录,得靠模式区分,两个都给。
 function rowTarget(c: AgentToolCall): string {
-  const t = callTarget(c)
-  if (!t) return ''
-  return (actionKind(c.tool) === 'read' || actionKind(c.tool) === 'mutation') ? basename(t) : t
+  if (actionKind(c.tool) === 'search') {
+    const args = parseArgs(c)
+    const pattern = safeLabel(argString(args, ['pattern', 'query']))
+    const path = safeLabel(argString(args, ['path', 'file_path']))
+    return [pattern, path].filter(Boolean).join(' · ')
+  }
+  return callTarget(c) || ''
 }
 
 </script>
