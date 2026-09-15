@@ -11,7 +11,7 @@ import (
 // 这里模拟"手机切后台被断网,回来重新连上":A 断开、B 接上同一个会话。
 func TestReattachReplaysBuffer(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
-	sum, err := m.Create("", "/bin/sh", 80, 24, Limits{})
+	sum, err := m.Create("", "/bin/sh", 80, 24, Limits{}, 0)
 	if err != nil {
 		t.Skipf("本机起不了 shell:%v", err)
 	}

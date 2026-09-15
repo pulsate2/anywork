@@ -170,9 +170,15 @@ CREATE TABLE backup_jobs (
 
 **WebSocket 协议(二进制帧)**
 ```
-客户端 → {type:attach|create|input|resize|kill, sessionId, data, cols, rows}
-服务端 → {type:output, data} | {type:sessionList, ...} | {type:exit, code} | {type:resized}
+客户端 → {type:attach|create|input|resize|kill|autoclose, sessionId, data, cols, rows}
+服务端 → {type:output, data} | {type:sessionList, ...} | {type:exit, code, reason} | {type:resized}
 ```
+
+**定时关闭**
+- 新建弹窗开关 + **时长选择器**:n-time-picker 以 `format="HH:mm"` 当时长选择器用(面板上选的就是"过多少时多少分",任意分钟,上限 23:59,换算见 `web/src/utils/duration.ts`);上次的选择(开没开 + 时长)记在 localStorage,新建下一个会话默认还是它。
+- 已打开的会话在会话列表里改:每行「定时」按钮,或直接点行内的倒计时标签(「23 分后关闭」)。
+- 计时在**服务端会话**上(`Session.setAutoClose`,timer 到点 kill),不挂在连接上 —— 人不在、断着线也照样收;换时长从现在重新起算。
+- `Summary.autoCloseAt` 带 RFC3339 截止时刻,前端算剩余时间;到点的 exit 帧带 `reason:"autoclose"`,前端文案说「会话已定时关闭」而不是甩一个退出码。
 
 **移动键盘层**(手机虚拟键盘不送 Ctrl/Alt/Esc/Tab/方向键)
 - 底部固定工具条:⌨️ 唤系统键盘、Esc、Tab、**Ctrl/Alt 粘滞键**、方向四键、退格、回车、符号切换。

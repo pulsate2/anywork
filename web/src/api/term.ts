@@ -15,6 +15,8 @@ export interface TermSummary {
   memoryMB?: number
   cpuPercent?: number
   limitMode?: string
+  // 定时关闭的截止时刻(RFC3339,缺省 = 没设),拿它算"xx 分后关闭"。
+  autoCloseAt?: string
 }
 
 // TermLimits 新建会话时申请的上限,0 = 不限。
@@ -30,7 +32,8 @@ export type TermEvent =
   | { type: 'output'; data: Uint8Array }
   | { type: 'session'; session: TermSummary }
   | { type: 'sessionList'; list: TermSummary[] }
-  | { type: 'exit'; id: string; exitCode: number }
+  // reason='autoclose' 表示定时关闭到点触发的,文案上和手动结束区分开。
+  | { type: 'exit'; id: string; exitCode: number; reason?: string }
 
 export class TermClient {
   private ws: WebSocket | null = null
@@ -149,7 +152,7 @@ export class TermClient {
           this.onEvent({ type: 'error', message: payload.message })
           break
         case 'e':
-          this.onEvent({ type: 'exit', id: payload.id, exitCode: payload.exitCode })
+          this.onEvent({ type: 'exit', id: payload.id, exitCode: payload.exitCode, reason: payload.reason })
           break
         case 's':
           if (payload.type === 'sessionList') {
@@ -166,7 +169,7 @@ export class TermClient {
     }
   }
 
-  createSession(dir: string, shell: string, cols: number, rows: number, limits?: TermLimits) {
+  createSession(dir: string, shell: string, cols: number, rows: number, limits?: TermLimits, autoCloseMin = 0) {
     this.send({
       type: 'create',
       dir,
@@ -175,6 +178,7 @@ export class TermClient {
       rows,
       memoryMB: limits?.memoryMB ?? 0,
       cpuPercent: limits?.cpuPercent ?? 0,
+      autoCloseMin,
     })
   }
   attach(id: string) {
@@ -195,6 +199,10 @@ export class TermClient {
   }
   kill(id: string) {
     this.send({ type: 'kill', sid: id })
+  }
+  // setAutoClose 给已打开的会话设置/取消定时关闭,minutes=0 取消,换档位则从现在重新起算。
+  setAutoClose(id: string, minutes: number) {
+    this.send({ type: 'autoclose', sid: id, autoCloseMin: minutes })
   }
   list() {
     this.send({ type: 'list' })

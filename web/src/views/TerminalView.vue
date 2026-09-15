@@ -6,7 +6,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import {
   NButton, NIcon, NModal, NList, NListItem,
-  NTag, NEmpty, useMessage, NSelect, NForm, NFormItem, NInput, NInputNumber, NSwitch, NSlider,
+  NTag, NEmpty, useMessage, NSelect, NForm, NFormItem, NInput, NInputNumber, NSwitch, NSlider, NTimePicker,
 } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline, StarOutline, ExpandOutline, ContractOutline, KeypadOutline } from '@vicons/ionicons5'
@@ -15,6 +15,7 @@ import { api, type Workspace, type TermLimitSupport } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useCommandStore } from '@/stores/commands'
 import { copyText, selectAllIn } from '@/utils/clipboard'
+import { durToPickerMs, pickerMsToDur } from '@/utils/duration'
 import { useSoftKeyboard } from '@/utils/softKeyboard'
 import { isTouchDevice } from '@/utils/touch'
 import TerminalKeyboard from '@/mobile/TerminalKeyboard.vue'
@@ -98,6 +99,93 @@ function limitTags(s: TermSummary): string[] {
   if (s.memoryMB) out.push(`内存 ${s.memoryMB} MB`)
   if (s.cpuPercent) out.push(`CPU ${s.cpuPercent}%`)
   return out
+}
+
+// ---- 定时关闭 ----
+// 到点由服务端结束进程:计时挂在会话上而不是连接上,人不在、断着线也照样收。
+// 时长用 n-time-picker 当时长选择器(HH:mm 即时长,见 utils/duration.ts),任意
+// 分钟可选;上次的选择(开没开 + 时长)记在本地,新建下一个会话时还是它
+// (和资源限制、bash 开关同一套思路:常用配置不该重填)。
+const AC_KEY = 'lr.term.ac.'
+const acOn = ref(localStorage.getItem(AC_KEY + 'on') === '1')
+const acMin = ref(Number(localStorage.getItem(AC_KEY + 'min')) || 30)
+watch(acOn, v => localStorage.setItem(AC_KEY + 'on', v ? '1' : '0'))
+watch(acMin, v => { if (v > 0) localStorage.setItem(AC_KEY + 'min', String(v)) })
+// 新建弹窗里选择器的值。选到 00:00(= 0 分钟)视为把开关关掉:零时长和不定时
+// 在语义上是同一件事,线上也是同一个 0。
+const acValue = computed<number | null>({
+  get: () => durToPickerMs(acMin.value),
+  set: (v) => {
+    const m = pickerMsToDur(v)
+    acOn.value = m > 0
+    if (m > 0) acMin.value = m
+  },
+})
+
+// 倒计时文本。nowTick 是"渲染用的现在":列表弹窗开着时每 20s 走一次,标签跟着翻新;
+// autoCloseLeft 读它,模板重渲染才会被这个 tick 牵动。
+const nowTick = ref(Date.now())
+let acTicker: number | undefined
+watch(showSessionList, (open) => {
+  if (acTicker !== undefined) window.clearInterval(acTicker)
+  acTicker = undefined
+  if (open) {
+    nowTick.value = Date.now()
+    acTicker = window.setInterval(() => { nowTick.value = Date.now() }, 20000)
+  }
+})
+
+function autoCloseLeft(s: TermSummary): string {
+  if (!s.autoCloseAt) return ''
+  const ms = new Date(s.autoCloseAt).getTime() - nowTick.value
+  if (ms <= 0) return '即将关闭'
+  const min = Math.ceil(ms / 60000)
+  if (min < 60) return `${min} 分后关闭`
+  const h = Math.floor(min / 60)
+  const r = min % 60
+  return r ? `${h} 时 ${r} 分后关闭` : `${h} 小时后关闭`
+}
+
+// 给已打开的会话改定时的小弹窗。服务端只知道截止时刻,不知道当初选的时长,
+// 所以下拉默认停在本地记的上次选择,当前状态用提示文案带出来。
+const showAcModal = ref(false)
+const acTargetId = ref<string | null>(null)
+const acPickOn = ref(false)
+const acPickMin = ref(30)
+const acPickValue = computed<number | null>({
+  get: () => durToPickerMs(acPickMin.value),
+  set: (v) => {
+    const m = pickerMsToDur(v)
+    acPickOn.value = m > 0
+    if (m > 0) acPickMin.value = m
+  },
+})
+const acTarget = computed(() => sessions.value.find((x) => x.id === acTargetId.value) || null)
+const acHint = computed(() => {
+  const s = acTarget.value
+  if (!s) return ''
+  const left = autoCloseLeft(s)
+  return left ? `当前:${left}` : '当前:不自动关闭'
+})
+
+function openAutoClose(s: TermSummary) {
+  acTargetId.value = s.id
+  // 默认带出本地记的上次选择;开关关着就只把时长备好,等用户打开。
+  acPickOn.value = acOn.value
+  acPickMin.value = acMin.value
+  showAcModal.value = true
+}
+
+function applyAutoClose() {
+  const id = acTargetId.value
+  if (!id) return
+  const min = acPickOn.value ? acPickMin.value : 0
+  // 这里选的同样算"上次选择":之后新建会话默认用它。
+  acOn.value = acPickOn.value
+  if (min > 0) acMin.value = min
+  client.setAutoClose(id, min)
+  // 不关列表弹窗:广播回来的新列表会把这行的倒计时标签换掉,设置是否生效当场可见。
+  showAcModal.value = false
 }
 
 // 复制弹窗:手机上没法在 xterm 画布里拖选,只能把缓冲区文本倒进一个普通
@@ -260,7 +348,9 @@ function handleEvent(e: any) {
       }
       break
     case 'exit':
-      message.info(`会话已退出 (退出码 ${e.exitCode})`)
+      // 定时关闭到点的:退出码说不出"这是你自己设的闹钟",文案分开才不会让人
+      // 以为出了什么问题。
+      message.info(e.reason === 'autoclose' ? '会话已定时关闭' : `会话已退出 (退出码 ${e.exitCode})`)
       // 服务端紧跟着会广播新的 sessionList,这里不用再 list()。
       if (e.id === activeId.value) releaseActive()
       break
@@ -634,7 +724,7 @@ function createSession() {
   client.createSession(dir, useBash.value ? 'bash' : execShell.value, term?.cols || 80, term?.rows || 24, {
     memoryMB: use && sup!.memory ? (limitMem.value || 0) : 0,
     cpuPercent: use && sup!.cpu ? (limitCPU.value || 0) : 0,
-  })
+  }, acOn.value ? acMin.value : 0)
   showNewModal.value = false
   // execShell 是一次性的(填了个别路径就用一次),useBash 是记住的偏好,不清。
   execShell.value = ''
@@ -1025,6 +1115,7 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', onResume)
   window.removeEventListener('focus', onResume)
   window.removeEventListener('online', onResume)
+  if (acTicker !== undefined) window.clearInterval(acTicker)
   clearReconnect()
   clearSettle()
   client.close()
@@ -1116,10 +1207,16 @@ watch(fitSignal, () => applyTheme())
         <n-list-item v-for="s in sessions" :key="s.id" class="sess-item">
           <div class="sess-main" @click="attachSession(s)">
             <div class="sess-name">
-              {{ sessionShortName(s) }}
+              <span class="sess-title">{{ sessionShortName(s) }}</span>
               <n-tag v-if="s.id === activeId" size="small" type="info" :bordered="false">当前</n-tag>
               <n-tag v-if="s.dead" size="small" type="error" :bordered="false">结束</n-tag>
               <n-tag v-else size="small" type="success" :bordered="false">运行中</n-tag>
+              <!-- 倒计时标签本身可点:它是最显眼的"这个会话设了定时"的信号,
+                   点它改档位比找旁边的按钮顺手。 -->
+              <n-tag v-if="!s.dead && autoCloseLeft(s)" class="sess-ac-tag" size="small" type="warning"
+                :bordered="false" title="点击修改定时关闭" @click.stop="openAutoClose(s)">
+                {{ autoCloseLeft(s) }}
+              </n-tag>
             </div>
             <div class="sess-dir">{{ s.dir }}</div>
             <div v-if="limitTags(s).length" class="sess-lim">
@@ -1127,11 +1224,42 @@ watch(fitSignal, () => applyTheme())
             </div>
           </div>
           <template #suffix>
-            <n-button class="sess-kill" size="tiny" quaternary type="error" @click.stop="killSession(s.id)">结束</n-button>
+            <div class="sess-ops">
+              <n-button v-if="!s.dead" class="sess-timer" size="tiny" quaternary
+                @click.stop="openAutoClose(s)">定时</n-button>
+              <n-button class="sess-kill" size="tiny" quaternary type="error" @click.stop="killSession(s.id)">结束</n-button>
+            </div>
           </template>
         </n-list-item>
       </n-list>
       <n-empty v-else description="暂无会话" style="padding: 24px 0" />
+    </n-modal>
+
+    <!-- 定时关闭:给某个已打开的会话设/改/取消。列表弹窗不关,生效后的新倒计时
+         会随广播直接出现在列表那一行上。 -->
+    <n-modal v-model:show="showAcModal" preset="card" title="定时关闭" style="width: 92%; max-width: 360px">
+      <n-form label-placement="top">
+        <n-form-item :label="acTarget ? sessionShortName(acTarget) + ' · 定时关闭' : '定时关闭'">
+          <div class="lim-box">
+            <label class="lim-switch">
+              <n-switch v-model:value="acPickOn" size="small" />
+              <span>到时自动结束</span>
+            </label>
+            <div v-if="acPickOn" class="lim-row">
+              <span class="lim-label">时长</span>
+              <n-time-picker v-model:value="acPickValue" format="HH:mm" :actions="['confirm']"
+                size="small" style="flex:1" />
+            </div>
+            <div v-if="acHint" class="lim-hint">{{ acHint }};换时长从现在重新起算,断线不影响计时</div>
+          </div>
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="showAcModal = false">取消</n-button>
+          <n-button type="primary" @click="applyAutoClose">确定</n-button>
+        </div>
+      </template>
     </n-modal>
 
     <!-- 复制弹窗:纯 DOM 文本,手机长按就能选 -->
@@ -1208,6 +1336,24 @@ watch(fitSignal, () => applyTheme())
               <div v-if="limitSupport.cpu && limitCoreHint" class="lim-hint">占整机百分比,{{ limitCoreHint }}</div>
             </template>
             <div v-if="limitNote" class="lim-hint" :title="limitSupport.detail">{{ limitNote }}</div>
+          </div>
+        </n-form-item>
+        <!-- 定时关闭:计时从启动起算、不看忙闲,断线/没人看着也照收。已打开的会话在
+             会话列表里改(那行「定时」按钮),这句提示就是给那条路的指路牌。 -->
+        <n-form-item label="定时关闭">
+          <div class="lim-box">
+            <label class="lim-switch">
+              <n-switch v-model:value="acOn" size="small" />
+              <span>到时自动结束这个会话</span>
+            </label>
+            <!-- HH:mm 当时长用:面板上选的就是"过多少小时多少分钟关"。now 那颗钮
+                 对时长没有意义(现在几点不是时长),只留确认。 -->
+            <div v-if="acOn" class="lim-row">
+              <span class="lim-label">时长</span>
+              <n-time-picker v-model:value="acValue" format="HH:mm" :actions="['confirm']"
+                size="small" style="flex:1" />
+            </div>
+            <div v-if="acOn" class="lim-hint">从启动开始计时,断线不重置;已打开的会话可在「会话」列表里改</div>
           </div>
         </n-form-item>
       </n-form>
@@ -1375,15 +1521,33 @@ watch(fitSignal, () => applyTheme())
    结束按钮挤出可视区。 */
 .sess-item :deep(.n-list-item__main) { min-width: 0; }
 .sess-item :deep(.n-list-item__suffix) { margin-left: 12px; }
-/* 结束按钮统一给一层浅色底色:quaternary 默认是无背景纯文字,第一个会话的按钮
+/* 结束/定时按钮统一给一层浅色底色:quaternary 默认是无背景纯文字,第一个会话的按钮
    因弹窗打开时被自动聚焦而显出 hover/focus 底色,其余行没有——视觉上就参差不齐。
-   显式设相同背景(用 color-mix 让浅/深主题下都跟随 --lr-danger),让每行一致。 */
+   显式设相同背景(用 color-mix 让浅/深主题下都跟随主题色),让每行一致。 */
 .sess-item :deep(.sess-kill),
 .sess-item :deep(.sess-kill.n-button:hover),
 .sess-item :deep(.sess-kill.n-button:focus) {
   background: color-mix(in srgb, var(--lr-danger) 12%, transparent);
 }
-.sess-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.sess-item :deep(.sess-timer),
+.sess-item :deep(.sess-timer.n-button:hover),
+.sess-item :deep(.sess-timer.n-button:focus) {
+  background: color-mix(in srgb, var(--lr-fg-muted) 12%, transparent);
+}
+/* 名字 + 状态标签一行摆不下时必须能折行:标签都不收缩,窄屏(还有 suffix 里
+   两颗按钮占掉的宽度)下唯一能压的就是裸文本,被挤成一字一行的竖条 —— 这行
+   就"扁"了。折行后名字带省略,标签换到下一行完整显示。 */
+.sess-name { display: flex; align-items: center; gap: 4px 6px; flex-wrap: wrap; font-weight: 600; }
+.sess-title {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 倒计时标签点了是改档位,不是选会话 —— 手型 + 收窄一点,免得和「运行中」挤成一坨。 */
+.sess-ac-tag { cursor: pointer; }
+.sess-ops { display: flex; align-items: center; gap: 4px; }
 .sess-dir {
   color: var(--lr-fg-muted); font-size: 12px;
   font-family: ui-monospace, monospace;

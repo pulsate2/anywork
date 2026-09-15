@@ -21,7 +21,7 @@ func TestSessionCgroupLimits(t *testing.T) {
 	}
 
 	m := NewManager(t.TempDir(), false)
-	sum, err := m.Create("", "/bin/sh", 80, 24, Limits{MemoryMB: 64, CPUPercent: 10})
+	sum, err := m.Create("", "/bin/sh", 80, 24, Limits{MemoryMB: 64, CPUPercent: 10}, 0)
 	if err != nil {
 		t.Fatalf("创建会话: %v", err)
 	}
@@ -90,7 +90,7 @@ func waitFor(d time.Duration, ok func() bool) bool {
 // TestSessionWithoutLimits 不填上限时不该有任何限额机制介入。
 func TestSessionWithoutLimits(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
-	sum, err := m.Create("", "/bin/sh", 80, 24, Limits{})
+	sum, err := m.Create("", "/bin/sh", 80, 24, Limits{}, 0)
 	if err != nil {
 		t.Fatalf("创建会话: %v", err)
 	}

@@ -76,6 +76,14 @@ type Session struct {
 	lastInputAt  time.Time
 	idleFuel     bool
 
+	// 定时关闭:到 autoCloseAt 就 kill(零值 = 没设)。timer 只是触发器,真正的
+	// 状态是 autoCloseAt —— Summary 拿它算剩余时间,改档位/取消就是换掉它。
+	autoCloseAt    time.Time
+	autoCloseTimer *time.Timer
+	// killReason 记下这次结束是谁发起的(空 = 用户,autoclose = 定时器),
+	// watchExit 广播 exit 时带上,前端好把"定时关闭"和手动结束分开学舌。
+	killReason string
+
 	exitCh   chan struct{}
 	exitOnce sync.Once
 
@@ -206,6 +214,12 @@ func (s *Session) waitExit(ptmx pty.Pty) {
 	s.dead = true
 	s.exitCode = code
 	s.ptmx = nil
+	// 人已经走了,定时的那声钟再敲也没有意义;不停掉的话长档位会留一个
+	// 几小时后才触发(然后 no-op)的 timer,白白引用着这个会话。
+	if s.autoCloseTimer != nil {
+		s.autoCloseTimer.Stop()
+		s.autoCloseTimer = nil
+	}
 	s.mu.Unlock()
 	// go-pty 的 Close 不可重入(Windows 会二次 ClosePseudoConsole),只在这里调用一次。
 	// 此时 readLoop 仍在读,ClosePseudoConsole 需要输出被排空才能返回,不能提前停读。
@@ -244,11 +258,38 @@ func (s *Session) resize(cols, rows int) error {
 	return s.ptmx.Resize(cols, rows)
 }
 
+// setAutoClose 设置/取消定时关闭:d<=0 取消,否则 now+d 到点自动结束。
+// 返回 false 表示会话已死、什么都没改。重复调用是换档位:旧 timer 停掉换新的,
+// 计时从"现在"重新起算 —— 用户改的是"再过多久关",不是"原定的那个时刻"。
+func (s *Session) setAutoClose(d time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dead {
+		return false
+	}
+	if s.autoCloseTimer != nil {
+		s.autoCloseTimer.Stop()
+		s.autoCloseTimer = nil
+	}
+	if d <= 0 {
+		s.autoCloseAt = time.Time{}
+		return true
+	}
+	s.autoCloseAt = time.Now().Add(d)
+	// 到点走 kill 自己判活:期间会话已退出/正在退出都是 no-op,不会重复收尾。
+	s.autoCloseTimer = time.AfterFunc(d, func() { s.kill("autoclose") })
+	return true
+}
+
 // kill 请求终止会话进程;宽限期内没退出就强杀。
 // 收尾(标记 dead、关 PTY、关 exitCh)一律走 waitExit,这里不碰状态。
-func (s *Session) kill() {
+// reason 见 killReason 字段注释。
+func (s *Session) kill(reason string) {
 	s.mu.Lock()
 	dead := s.dead
+	if !dead && s.killReason == "" {
+		s.killReason = reason
+	}
 	var proc *os.Process
 	if s.cmd != nil {
 		proc = s.cmd.Process
@@ -308,6 +349,13 @@ func (s *Session) ExitCode() int {
 // ExitCh 在进程退出时关闭。
 func (s *Session) ExitCh() <-chan struct{} { return s.exitCh }
 
+// KillReason 返回这次结束的发起方(空 = 用户手动,autoclose = 定时关闭)。
+func (s *Session) KillReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.killReason
+}
+
 // ID 返回会话标识。
 func (s *Session) ID() string { return s.id }
 
@@ -318,7 +366,7 @@ func (s *Session) Dir() string { return s.dir }
 func (s *Session) Summary() Summary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Summary{
+	sum := Summary{
 		ID:         s.id,
 		Dir:        s.dir,
 		Cols:       s.cols,
@@ -330,4 +378,8 @@ func (s *Session) Summary() Summary {
 		CPUPercent: s.limits.CPUPercent,
 		LimitMode:  s.limitMode,
 	}
+	if !s.autoCloseAt.IsZero() {
+		sum.AutoCloseAt = s.autoCloseAt.UTC().Format(time.RFC3339)
+	}
+	return sum
 }

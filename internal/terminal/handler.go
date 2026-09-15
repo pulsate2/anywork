@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -21,6 +22,9 @@ type inMsg struct {
 	// 新建会话时申请的资源上限,0/缺省 = 不限。
 	MemoryMB   int `json:"memoryMB,omitempty"`
 	CPUPercent int `json:"cpuPercent,omitempty"`
+	// 定时关闭,单位分钟,0/缺省 = 不限。create 与 autoclose 帧共用:前者是"建的时候就带",
+	// 后者是"给已打开的会话改"。
+	AutoCloseMin int `json:"autoCloseMin,omitempty"`
 }
 
 // 会话状态帧。Summary 内联展开,所以字段与会话列表里的每一项完全一致 ——
@@ -38,6 +42,8 @@ type exitMsg struct {
 	Type     string `json:"type"`
 	ID       string `json:"id"`
 	ExitCode int    `json:"exitCode"`
+	// Reason = "autoclose" 表示定时关闭到点触发的,前端据此区分文案;空 = 手动/自然退出。
+	Reason string `json:"reason,omitempty"`
 }
 
 // ServeWS 处理单个 /api/term 连接。
@@ -93,7 +99,8 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 		switch in.Type {
 		case "create":
 			sum, err := m.Create(in.Dir, in.Shell, in.Cols, in.Rows,
-				Limits{MemoryMB: in.MemoryMB, CPUPercent: in.CPUPercent})
+				Limits{MemoryMB: in.MemoryMB, CPUPercent: in.CPUPercent},
+				time.Duration(in.AutoCloseMin)*time.Minute)
 			if err != nil {
 				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
 				continue
@@ -172,6 +179,17 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 			if err := m.Kill(in.SID); err != nil {
 				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
 			}
+
+		case "autoclose":
+			if in.SID == "" {
+				continue
+			}
+			if _, err := m.SetAutoClose(in.SID, time.Duration(in.AutoCloseMin)*time.Minute); err != nil {
+				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
+				continue
+			}
+			// 广播给所有连接(含发起方):列表里的倒计时标签全端跟着换。
+			m.broadcastSessionList()
 
 		case "detach":
 			mu.Lock()

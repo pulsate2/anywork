@@ -58,6 +58,8 @@ type Summary struct {
 	MemoryMB   int    `json:"memoryMB,omitempty"`
 	CPUPercent int    `json:"cpuPercent,omitempty"`
 	LimitMode  string `json:"limitMode,omitempty"`
+	// 定时关闭的截止时刻(RFC3339,空 = 没设),前端拿它算"xx 分后关闭"。
+	AutoCloseAt string `json:"autoCloseAt,omitempty"`
 }
 
 // 保活与写超时。

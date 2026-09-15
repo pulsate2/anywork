@@ -55,8 +55,8 @@ func (m *Manager) allClients() []*Client {
 	return out
 }
 
-// Create 新建会话并启动。limits 为零值表示不限制资源。
-func (m *Manager) Create(dir, shell string, cols, rows int, limits Limits) (*Summary, error) {
+// Create 新建会话并启动。limits 为零值表示不限制资源;autoClose>0 表示到点自动结束。
+func (m *Manager) Create(dir, shell string, cols, rows int, limits Limits, autoClose time.Duration) (*Summary, error) {
 	if m.ReadOnly {
 		return nil, fmt.Errorf("只读模式")
 	}
@@ -94,6 +94,22 @@ func (m *Manager) Create(dir, shell string, cols, rows int, limits Limits) (*Sum
 	m.sessions[id] = s
 	m.mu.Unlock()
 	go m.watchExit(s)
+	// 定时器得在服务端会话上而不是连接上:PTY 独立于 WS 活着,没人看着也要能到点收掉。
+	s.setAutoClose(autoClose)
+	sum := s.Summary()
+	return &sum, nil
+}
+
+// SetAutoClose 设置/取消已打开会话的定时关闭(d<=0 = 取消),返回更新后的摘要。
+// 会话已死的返回错误:给一个已经结束的会话定时,到点除了报错什么都做不了。
+func (m *Manager) SetAutoClose(id string, d time.Duration) (*Summary, error) {
+	s := m.get(id)
+	if s == nil {
+		return nil, fmt.Errorf("会话不存在: %s", id)
+	}
+	if !s.setAutoClose(d) {
+		return nil, fmt.Errorf("会话已结束")
+	}
 	sum := s.Summary()
 	return &sum, nil
 }
@@ -117,9 +133,10 @@ func sessionEnv() []string {
 func (m *Manager) watchExit(s *Session) {
 	<-s.ExitCh()
 	code := s.ExitCode()
+	reason := s.KillReason()
 	m.RemoveDead(s.id)
 	for _, c := range m.allClients() {
-		c.sendText(frameTypeExit, exitMsg{Type: "exit", ID: s.id, ExitCode: code})
+		c.sendText(frameTypeExit, exitMsg{Type: "exit", ID: s.id, ExitCode: code, Reason: reason})
 	}
 	m.broadcastSessionList()
 	// 归还限额放在广播之后:删 cgroup 目录要等组里的进程收尾,不能让它拖着
@@ -159,7 +176,7 @@ func (m *Manager) Kill(id string) error {
 	if s == nil {
 		return fmt.Errorf("会话不存在: %s", id)
 	}
-	s.kill()
+	s.kill("")
 	return nil
 }
 
