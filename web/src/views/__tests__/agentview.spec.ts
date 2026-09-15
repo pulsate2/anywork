@@ -85,7 +85,9 @@ describe('AgentView 真实会话回放', () => {
       await groupHeads[g].trigger('click')
       await flushPromises()
       const items = w.findAll('.group-item')
-      console.log('组', g, '行数', items.length, '| 行名:', items.map((x) => x.find('.item-name')?.text()))
+      // 行内分类工具不再有文字名(只有图标),兜底类才有 .item-name
+      const names = items.map((x) => { const n = x.find('.item-name'); return n.exists() ? n.text() : '(图标)' })
+      console.log('组', g, '行数', items.length, '| 行名:', names)
       for (let k = 0; k < items.length; k++) {
         const target = items[k].find('.item-target')?.text() || ''
         await items[k].trigger('click')

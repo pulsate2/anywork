@@ -8,7 +8,7 @@
 // 回来,组卡一卸载弹窗就没了(表现为点开就关)。
 import { computed, ref } from 'vue'
 import type { AgentToolCall } from '@/api/client'
-import { ToolStatusIcon, toolCategoryIcon } from './toolIcons'
+import { ToolStatusIcon, hasToolCategory, toolCategoryIcon } from './toolIcons'
 
 const props = defineProps<{
   calls: AgentToolCall[]
@@ -146,11 +146,8 @@ const state = computed(() =>
     : props.calls.some((c) => c.state === 'running') ? 'running' : 'ok',
 )
 
-// 组内单行标签:意图名(other 用工具名)+ 目标。
-function rowLabel(c: AgentToolCall): string {
-  const k = actionKind(c.tool)
-  return k === 'other' ? c.tool : KIND_LABEL[k]
-}
+// 组内单行:分类图标已表意(眼/终端/折角文件),不再重复"查看文件/运行
+// 命令"文字;兜底类(子 agent/MCP)没有专属图标,保留工具名。
 function rowTarget(c: AgentToolCall): string {
   const t = callTarget(c)
   if (!t) return ''
@@ -172,7 +169,7 @@ function rowTarget(c: AgentToolCall): string {
       <button v-for="(c, i) in calls" :key="c.toolUseId || i" type="button" class="group-item" @click="emit('detail', c)">
         <span class="item-state" :class="c.state"><ToolStatusIcon :state="c.state || 'ok'" /></span>
         <span class="item-icon"><component :is="toolCategoryIcon(c.tool)" /></span>
-        <span class="item-name">{{ rowLabel(c) }}</span>
+        <span v-if="!hasToolCategory(c.tool)" class="item-name">{{ c.tool || '工具' }}</span>
         <span v-if="rowTarget(c)" class="item-target">{{ rowTarget(c) }}</span>
         <span v-if="c.result" class="item-lines">{{ c.result.trim().split('\n').length }} 行</span>
       </button>
