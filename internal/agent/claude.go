@@ -37,6 +37,14 @@ type claudeDriver struct {
 	// toolUseId → 工具名:tool_result 事件回填 Tool 用(stream-json 的
 	// tool_result 块不带工具名,只有 id;没名字前端配对不上就单开卡)。
 	toolNames map[string]string
+	// sideMsg 子 agent 文本消息步的序号:sidechain 的 text 块没有 id,
+	// 合成 toolUseId(parent-msg-N)给前端选中/回填用。
+	sideMsg int
+	// sideUses 待认领的 sidechain tool_use:子 agent 的审批(can_use_tool)
+	// 不带 parent_tool_use_id,只能按 工具名+input 原文 反查宿主。审批
+	// 认领或 tool_result 到达后出队(handleCanUseTool 在独立 goroutine 里
+	// 读写,跟读循环一起走 d.mu)。
+	sideUses []sidechainUse
 	external  string // claude session_id(system/init 里返回)
 	model     string // 当前模型(system/init 里返回)
 	// filesDir 会话附件目录:tool_result 的 image 块落这里(空 = 不落盘)。
@@ -76,6 +84,14 @@ type approveDecision struct {
 type askPending struct {
 	raw       json.RawMessage
 	questions []AskQuestion
+}
+
+// sidechainUse 一条待认领的子 agent tool_use,审批归属反查用。
+type sidechainUse struct {
+	id     string // tool_use id(tool_result 到达时出队)
+	parent string // 宿主 Task 调用的 tool_use id
+	tool   string
+	input  string // 原始 input JSON,与审批请求逐字节比对
 }
 
 func newClaudeDriver() *claudeDriver {
@@ -651,9 +667,9 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 			go d.handleCanUseTool(msg.RequestID, msg.Request)
 		case "assistant", "user":
 			// parent_tool_use_id 非空 = 子 agent(Task 工具)自己的流:
-			// 文本/思考不进主时间线(hapi isSidechain 同款语义),但工具调用
-			// 带 parentToolUseId 透出 —— 前端挂到父 Task 卡下当"过程"展示,
-			// 否则子 agent 跑半天远程端只看到一张静止的 Agent 卡。usage
+			// 不进主时间线(hapi isSidechain 同款语义),但工具调用与叙述
+			// 文本带 parentToolUseId 透出 —— 前端挂到父 Task 卡下当"过程"
+			// 展示,否则子 agent 跑半天远程端只看到一张静止的 Agent 卡。usage
 			// 仍然挡在 StatusBar 外(子 agent 上下文小得多,放进来会让占用
 			// 读数中途塌陷再弹回)。
 			if msg.ParentToolUseID != "" {
@@ -794,10 +810,11 @@ func (d *claudeDriver) handleUserEcho(m *claudeMsg) {
 	}
 }
 
-// handleSubagentTools 子 agent 的工具调用 → 挂到父 Task 卡的过程事件。
-// 只取 tool_use / tool_result 块:文本/思考不透(子 agent 的推理对主时间线
-// 是噪音,前端只要知道它在读哪个文件、跑哪条命令)。与主时间线共用
-// tool_call 形态,差异只在 ParentToolUseID 字段。
+// handleSubagentTools 子 agent 的工具调用与叙述文本 → 挂到父 Task 卡的过程事件。
+// 文本步(sidechain 的 text 块)复用同一个负载:Tool/Args 留空、Text 带正文,
+// 前端在过程列表里渲染成消息行(hapi trace 的 Message 同款)—— 只有工具卡
+// 的过程看不出子 agent 为什么这么干。思考块仍不透(对过程是噪音)。
+// 与主时间线共用 tool_call 形态,差异只在 ParentToolUseID 字段。
 func (d *claudeDriver) handleSubagentTools(m *claudeMsg, parent string) {
 	if m == nil {
 		return
@@ -808,6 +825,16 @@ func (d *claudeDriver) handleSubagentTools(m *claudeMsg, parent string) {
 	}
 	for _, b := range blocks {
 		switch b.Type {
+		case "text":
+			if text := strings.TrimSpace(b.Text); text != "" {
+				d.sideMsg++
+				d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+					ToolUseID:       fmt.Sprintf("%s-msg-%d", parent, d.sideMsg),
+					ParentToolUseID: parent,
+					Text:            truncate(text, 8*1024),
+					State:           "ok",
+				}})
+			}
 		case "tool_use":
 			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
 				Tool:            b.Name,
@@ -816,6 +843,10 @@ func (d *claudeDriver) handleSubagentTools(m *claudeMsg, parent string) {
 				Args:            truncateJSON(string(b.Input), 8*1024),
 				State:           "running",
 			}})
+			// 登记待认领:这条 tool_use 若触发审批,反查归属全靠它。
+			d.mu.Lock()
+			d.sideUses = append(d.sideUses, sidechainUse{id: b.ID, parent: parent, tool: b.Name, input: string(b.Input)})
+			d.mu.Unlock()
 		case "tool_result":
 			result := toolResultText(b.Content)
 			if b.IsError && result != "" {
@@ -827,6 +858,15 @@ func (d *claudeDriver) handleSubagentTools(m *claudeMsg, parent string) {
 				Result:          truncate(result, 4*1024),
 				State:           map[bool]string{true: "error", false: "ok"}[b.IsError],
 			}})
+			// 工具已执行完(或没触发审批):登记出队,别让后续同款请求错认。
+			d.mu.Lock()
+			for i, u := range d.sideUses {
+				if u.id == b.ToolUseID {
+					d.sideUses = append(d.sideUses[:i], d.sideUses[i+1:]...)
+					break
+				}
+			}
+			d.mu.Unlock()
 		}
 	}
 }
@@ -1036,6 +1076,23 @@ func (d *claudeDriver) handleStreamEvent(msg claudeLine) {
 	}
 }
 
+// claimSidechainUse 审批请求归属反查:can_use_tool 只带 tool_name+input,
+// 在 sidechain 待批的 tool_use 里按原文匹配,认出它是哪个子 agent 发起的,
+// 返回宿主 Task 调用的 id 并出队;认不出(主 agent 的审批/没赶上登记)
+// 返回空,走主时间线配对。同 tool+input 并发多条时取最早 —— 审批跟着
+// tool_use 的顺序来(实测两个并行子 agent 的请求会交错)。
+func (d *claudeDriver) claimSidechainUse(tool, input string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i, u := range d.sideUses {
+		if u.tool == tool && u.input == input {
+			d.sideUses = append(d.sideUses[:i], d.sideUses[i+1:]...)
+			return u.parent
+		}
+	}
+	return ""
+}
+
 // handleCanUseTool 一个权限询问:落一条 permission_request 事件,挂起等 Resolve。
 // 会话规则(本会话允许)命中时直接放行,不打扰用户。
 // AskUserQuestion 是特例:它不是权限询问而是 agent 向用户提问,分流到
@@ -1053,6 +1110,9 @@ func (d *claudeDriver) handleCanUseTool(reqID string, rawReq json.RawMessage) {
 		return
 	}
 	args := truncate(string(req.Input), 8*1024)
+	// 先认领归属再走放行规则:命中会话规则直接放行时也要出队,否则这条
+	// 登记会残留到下一条同款请求上张冠李戴。
+	parent := d.claimSidechainUse(req.ToolName, string(req.Input))
 
 	d.mu.Lock()
 	if d.sessionRules[reqRuleKey(req.ToolName, args)] {
@@ -1067,9 +1127,10 @@ func (d *claudeDriver) handleCanUseTool(reqID string, rawReq json.RawMessage) {
 	d.mu.Unlock()
 
 	d.emit(Event{Kind: KindPermissionReq, Payload: &PermissionReqPayload{
-		ReqID: reqID,
-		Tool:  req.ToolName,
-		Args:  args,
+		ReqID:           reqID,
+		Tool:            req.ToolName,
+		Args:            args,
+		ParentToolUseID: parent,
 	}})
 
 	dec := <-ch // Resolve 或进程退出都不会让它永远挂着(退出时 pending 被清,Resolve 返回错)

@@ -51,6 +51,10 @@ func (h *Handlers) Read(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fi, _ := f.Stat()
+	// 不带 Cache-Control 时浏览器会按 Last-Modified 做启发式缓存,文件被
+	// 外部(终端/agent)改过之后预览可能短时间不更新。no-cache 只强制每次
+	// revalidate,配合 Last-Modified 未变时的 304 依然不浪费流量。
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, filepath.Base(p), fi.ModTime(), f)
 }
 
@@ -130,6 +134,8 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fi, _ := f.Stat()
+	// 同 /api/fs/read:内联预览(图片等)也会被启发式缓存卡住旧文件。
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, name, fi.ModTime(), f)
 }
 

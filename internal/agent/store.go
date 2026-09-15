@@ -110,6 +110,10 @@ type ToolCallPayload struct {
 	Result          string   `json:"result,omitempty"` // 文本化并截断后的结果
 	Images          []string `json:"images,omitempty"` // image 块的文件名
 	State           string   `json:"state"`            // running | ok | error
+	// Text 非空 = 子 agent 的叙述文本步(sidechain 的 text 块):复用
+	// KindToolCall 信封走"过程"管线,但不是工具调用 —— Tool/Args 为空,
+	// 前端按 text 渲染成消息行(hapi trace 的 Message 同款)。
+	Text string `json:"text,omitempty"`
 }
 
 // PermissionReqPayload KindPermissionReq 的负载。
@@ -117,6 +121,11 @@ type PermissionReqPayload struct {
 	ReqID string `json:"reqId"`
 	Tool  string `json:"tool"`
 	Args  string `json:"args"`
+	// ParentToolUseID 非空 = 子 agent 的审批:can_use_tool 协议不带
+	// parent_tool_use_id,driver 按 sidechain 待批的 tool_use(工具名+input
+	// 原文)反查出的宿主 Task 调用 id。前端据此把审批嵌进宿主卡 ——
+	// 不再单开一张审批卡占主线,答复完就地隐掉。
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
 }
 
 // PermissionResultPayload KindPermissionResult 的负载。

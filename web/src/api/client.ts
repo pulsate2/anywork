@@ -306,9 +306,14 @@ export interface AgentToolCall {
   // tool_result 里 image 块落盘后的文件名,取 /api/agent/sessions/{id}/files/{name}。
   images?: string[]
   state: 'running' | 'ok' | 'error'
+  // 非空 = 子 agent 的叙述文本步(非工具调用):tool/args 为空,过程列表里
+  // 渲染成消息行,详情按 markdown 渲染正文。
+  text?: string
 }
 
-export interface AgentPermissionReq { reqId: string; tool: string; args: string }
+// parentToolUseId 非空 = 子 agent 的审批:driver 反查出的宿主 Task 调用 id,
+// 前端据此把审批嵌进宿主卡,不再单开一张占主线。
+export interface AgentPermissionReq { reqId: string; tool: string; args: string; parentToolUseId?: string }
 export interface AgentPermissionResult { reqId: string; allow: boolean }
 export interface AgentStatusPayload { state: 'running' | 'idle' }
 export interface AgentErrorPayload { message: string }

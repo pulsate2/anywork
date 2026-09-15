@@ -352,18 +352,20 @@ func TestClaudeSidechainFiltered(t *testing.T) {
 	}
 	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
 
-	// 主时间线两张卡(Task 运行中 → 完成),子 agent 的工具过程挂 parent id
-	// 穿插其间,文本/思考/usage 不露面。
+	// 主时间线两张卡(Task 运行中 → 完成),子 agent 的工具调用与叙述文本
+	// 挂 parent id 穿插其间(文本作为 Text 步进过程),思考/usage 不露面。
 	want := []struct {
 		id     string
 		tool   string
 		state  string
 		parent string
+		text   string
 	}{
-		{"t-main", "Task", "running", ""},
-		{"t-sub", "Read", "running", "t-main"},
-		{"t-sub", "", "ok", "t-main"},
-		{"t-main", "Task", "ok", ""},
+		{"t-main", "Task", "running", "", ""},
+		{"t-main-msg-1", "", "ok", "t-main", "子 agent 的碎碎念"},
+		{"t-sub", "Read", "running", "t-main", ""},
+		{"t-sub", "", "ok", "t-main", ""},
+		{"t-main", "Task", "ok", "", ""},
 	}
 	for i, w := range want {
 		select {
@@ -378,15 +380,95 @@ func TestClaudeSidechainFiltered(t *testing.T) {
 			if call.ParentToolUseID != w.parent {
 				t.Fatalf("事件 %d: parentToolUseId=%q,想要 %q", i, call.ParentToolUseID, w.parent)
 			}
+			if call.Text != w.text {
+				t.Fatalf("事件 %d: text=%q,想要 %q", i, call.Text, w.text)
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("事件 %d:2 秒内没等到", i)
 		}
 	}
 	select {
 	case ev := <-d.events:
-		t.Fatalf("子 agent 的文本/思考/usage 漏进了主时间线: %+v", ev.Payload)
+		t.Fatalf("子 agent 的思考/usage 漏进了主时间线: %+v", ev.Payload)
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+// TestClaudeSubagentApprovalParent 子 agent 触发的审批:can_use_tool 协议
+// 不带 parent_tool_use_id,driver 按 sidechain 待批的 tool_use(工具名+
+// input 原文)反查宿主,ParentToolUseID 随 permission_request 透出 ——
+// 前端据此把审批嵌进宿主 Task 卡,不单开一张占主线。input 对不上(主
+// agent 的审批/没赶上登记)不带 parent,走主时间线配对;tool_result 后
+// 登记出队,后续同款请求不会错认已完成的调用。
+func TestClaudeSubagentApprovalParent(t *testing.T) {
+	d := newClaudeDriver()
+	stdin := &bufCloser{}
+	d.mu.Lock()
+	d.stdin = stdin
+	d.mu.Unlock()
+
+	inputA := `{"command":"go test ./...","description":"跑测试"}`
+	inputB := `{"command":"npm run build"}`
+	// 分两段喂:claude 等到审批答复才执行工具,tool_result 物理上不可能
+	// 先于 REQ —— 一次性全喂会把"result 出队"跑到"REQ 认领"前面,测的
+	// 就不是真实时序了。
+	stage1 := []string{
+		// 主 agent 发起 Task,子 agent 要跑一条需要审批的命令(inputA)。
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-host","name":"Task","input":{"prompt":"跑测试"}}]}}`,
+		`{"type":"assistant","parent_tool_use_id":"t-host","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-sub1","name":"Bash","input":` + inputA + `}]}}`,
+		`{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":` + inputA + `}}`,
+		// 子 agent 又发起一条(inputB),同样待批:同款审批也应认出宿主。
+		`{"type":"assistant","parent_tool_use_id":"t-host","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-sub2","name":"Bash","input":` + inputB + `}]}}`,
+		`{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":` + inputB + `}}`,
+	}
+	go d.readStdout(strings.NewReader(strings.Join(stage1, "\n") + "\n"))
+
+	// 收审批(工具卡事件穿插其间,跳过;各 REQ 的 goroutine 并发,到达
+	// 顺序不保证),收到即放行 —— session=false,免得同款 args 的后续
+	// 请求被会话规则直接放行、少一张卡。
+	collect := func(want map[string]string) {
+		t.Helper()
+		got := map[string]string{}
+		for len(got) < len(want) {
+			select {
+			case ev := <-d.events:
+				if ev.Kind != KindPermissionReq {
+					if ev.Kind != KindToolCall {
+						t.Fatalf("意外事件: %s(%+v)", ev.Kind, ev.Payload)
+					}
+					continue
+				}
+				p, ok := ev.Payload.(*PermissionReqPayload)
+				if !ok {
+					t.Fatalf("审批 payload 类型 %T", ev.Payload)
+				}
+				got[p.ReqID] = p.ParentToolUseID
+				if err := d.Resolve(p.ReqID, true, false); err != nil {
+					t.Fatalf("Resolve(%s): %v", p.ReqID, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("审批没收齐: got=%v,想要 %v", got, want)
+			}
+		}
+		for id, w := range want {
+			if got[id] != w {
+				t.Fatalf("%s: parentToolUseId=%q,想要 %q", id, got[id], w)
+			}
+		}
+	}
+
+	// 第一段:r1/r2 都认出宿主 Task 调用。
+	collect(map[string]string{"r1": "t-host", "r2": "t-host"})
+
+	// 第二段:inputB 执行完(result 出队)后再来同款请求 → 认不出;从未
+	// 登记过的 input(主 agent 的审批形状)→ 同样不带 parent。
+	stage2 := []string{
+		`{"type":"user","parent_tool_use_id":"t-host","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-sub2","content":"build ok"}]}}`,
+		`{"type":"control_request","request_id":"r3","request":{"subtype":"can_use_tool","tool_name":"Bash","input":` + inputB + `}}`,
+		`{"type":"control_request","request_id":"r4","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls /"}}}`,
+	}
+	go d.readStdout(strings.NewReader(strings.Join(stage2, "\n") + "\n"))
+	collect(map[string]string{"r3": "", "r4": ""})
 }
 
 // TestClaudeResumeError resume 失败的真实形状:result 行 is_error=true、

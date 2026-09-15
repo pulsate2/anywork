@@ -43,3 +43,40 @@ func TestReadSizeLimit(t *testing.T) {
 		t.Errorf("big: body = %q, want 含拒绝说明", w.Body.String())
 	}
 }
+
+// read/download 必须带 Cache-Control: no-cache:否则浏览器按 Last-Modified 做
+// 启发式缓存,文件被外部(终端/agent)改动后预览短时间不更新。
+// no-cache 只强制每次 revalidate,未变时仍然 304,不吃流量。
+func TestReadCacheControl(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(file, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlers(NewService(dir, false))
+
+	w := httptest.NewRecorder()
+	h.Read(w, httptest.NewRequest("GET", "/api/fs/read?path=a.txt", nil))
+	if cc := w.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("read: Cache-Control = %q, want no-cache", cc)
+	}
+
+	w = httptest.NewRecorder()
+	h.Download(w, httptest.NewRequest("GET", "/api/fs/download?path=a.txt", nil))
+	if cc := w.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("download: Cache-Control = %q, want no-cache", cc)
+	}
+
+	// revalidate 的廉价路径没被破坏:If-Modified-Since 命中时仍回 304。
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/fs/read?path=a.txt", nil)
+	req.Header.Set("If-Modified-Since", fi.ModTime().UTC().Format(http.TimeFormat))
+	w = httptest.NewRecorder()
+	h.Read(w, req)
+	if w.Code != http.StatusNotModified {
+		t.Errorf("ims: code = %d, want 304", w.Code)
+	}
+}

@@ -53,6 +53,10 @@ export const GlobeIcon = svg24([
 export const WrenchIcon = svg24([
   p('M21 7a5 5 0 0 1-7 4L7 18a2 2 0 0 1-3-3l7-7a5 5 0 0 1 6-6l-3 3 4 4 3-3z'),
 ])
+// 消息:气泡(子 agent 过程里的叙述文本步)
+export const MessageIcon = svg24([
+  p('M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'),
+])
 
 // 16×16 状态图标(hapi ToolStatusIcon 同款):完成=圈勾,出错=圈叉
 // (圆圈 + 交叉斜线),等审批=挂锁,运行中=spinner。

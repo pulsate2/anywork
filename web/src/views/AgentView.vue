@@ -384,6 +384,22 @@ const cards = computed<Card[]>(() => {
           else if (card.req && card.req.reqId !== p.reqId) card.extraReqs = [p]
           break
         }
+        // 子 agent 的审批:driver 按 sidechain 待批的 tool_use(工具名+input)
+        // 认出了宿主(parentToolUseId = Task 调用的 id),直接嵌进宿主卡 ——
+        // 审批在 Task 卡内问答,答复即隐,不再单开一张卡占主线。宿主挂着
+        // 未答复的审批(同卡并发两问)时嵌不进,落回下面的老路单开一张;
+        // 已答复的会被下一条替换着顶上(一个宿主一生会有多次审批)。
+        if (p.parentToolUseId) {
+          const i = toolIndex.get(p.parentToolUseId)
+          const c = i !== undefined ? out[i] : undefined
+          if (c && c.kind === 'tool' && c.call && !(c.pendingReq && !c.resolved)) {
+            c.pendingReq = p
+            const local = decided.value.get(p.reqId)
+            c.resolved = local ? { ...local } : undefined
+            if (p.reqId && i !== undefined) apprIndex.set(p.reqId, i)
+            break
+          }
+        }
         // 宿主卡配对,先精确后启发:
         // 精确 —— codex 的审批 reqId 就是工具卡的 toolUseId(同一个 itemId),
         // 并行调用各归各;靠"跟前找"会张冠李戴(并行三条命令时审批全配到
@@ -425,7 +441,9 @@ const cards = computed<Card[]>(() => {
       // status 不渲染:回合状态走下面的 turnState。
     }
   }
-  return groupToolCards(out)
+  // 子 agent 的审批单开卡(嵌入失败时的兜底):答复完就撤出主线。
+  const kept = out.filter((c) => !(c.kind === 'approval' && c.resolved && c.req?.parentToolUseId))
+  return groupToolCards(kept)
 })
 
 // ---- 工具详情弹窗(全局唯一,视图层) ----
@@ -657,6 +675,31 @@ const pendingAsk = computed(() =>
 // "正在生成"的那一段,历史回放完全靠落库消息,不依赖它。
 const streamText = ref('')
 const streamThink = ref('')
+// 思考秒表(直播卡"思考中 · N 秒"用):首个思考增量到达起表、每秒跳一下,
+// 流式缓冲区清空(完整消息落库,思考段收尾)停表。正式卡上的 thinkMs 走
+// 事件时间差,秒表只管"正在思考"的实时读数 —— 一次回合里多段思考各计各的。
+const thinkStartAt = ref(0)
+const thinkNow = ref(0)
+let thinkTimer: ReturnType<typeof setInterval> | undefined
+const thinkElapsedMs = computed(() => Math.max(0, thinkNow.value - thinkStartAt.value))
+watch(streamThink, (v, old) => {
+  if (v && !old) {
+    // 起点 = 最近一条持久化事件的 createdAt,不是 Date.now():思考 burst
+    // 紧随其后开始,与正式卡的 thinkMs(上一条事件→本条的时间差)同一
+    // 算法,直播读数收尾时无缝衔接。退出重进时 burst 早已开始 —— 增量是
+    // 瞬态的,回放里没有,从 0 重计会假装思考刚起步;现场看时它与
+    // Date.now() 只差首字延迟,那也是 agent 在干活的时间,算进去更诚实。
+    const last = messages.value[messages.value.length - 1]
+    const t0 = last?.createdAt ? Date.parse(last.createdAt) : NaN
+    thinkStartAt.value = Number.isFinite(t0) ? t0 : Date.now()
+    thinkNow.value = Date.now()
+    thinkTimer = setInterval(() => { thinkNow.value = Date.now() }, 1000)
+  } else if (!v && thinkTimer) {
+    clearInterval(thinkTimer)
+    thinkTimer = undefined
+  }
+})
+onBeforeUnmount(() => { if (thinkTimer) clearInterval(thinkTimer) })
 watch([streamText, streamThink], () => scrollBottom())
 
 // ---- WS 推送 ----
@@ -1542,10 +1585,11 @@ onBeforeUnmount(() => {
           </div>
           <div v-else-if="c.kind === 'system' && c.sysinfo" class="sysline" :class="{ 'sysline-failed': c.sysinfo.type === 'api_error' && c.sysinfo.maxRetry && !c.sysinfo.retry }">{{ sysinfoIcon(c.sysinfo) }} {{ sysinfoText(c.sysinfo) }}</div>
         </div>
-        <!-- 流式直播区:正在生成的思考与正文(瞬态,完整消息落库后清空换正式卡) -->
+        <!-- 流式直播区:正在生成的思考与正文(瞬态,完整消息落库后清空换正式卡)。
+             思考计时是本地秒表:首个增量起每秒跳,收尾即停(thinkMs 落在正式卡上) -->
         <div v-if="streamThink" class="chat-row reasoning">
           <details class="reasoning" open>
-            <summary>思考过程中…</summary>
+            <summary>思考中 · {{ fmtThink(thinkElapsedMs) }}</summary>
             <div class="reasoning-body">{{ streamThink }}</div>
           </details>
         </div>

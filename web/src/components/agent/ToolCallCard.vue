@@ -3,12 +3,13 @@
 // (AgentView 层的 ToolDetailModal,卡片只 emit —— 卡片会随回合实时重组,
 // 弹窗挂卡片内部会跟着被卸载)。编辑类 diff / 参数原文 / 结果都在弹窗里;
 // codex 改动卡(ApplyPatch/CodexDiff)的 diff 例外,直接铺在卡内。
-// 审批请求内嵌在行下方,子 agent 过程(steps)嵌在卡内。
-import { computed, ref, watch } from 'vue'
+// 审批请求内嵌在行下方,子 agent 过程(steps)一行触发、点开 StepsModal。
+import { computed, ref } from 'vue'
 import { NModal } from 'naive-ui'
 import { api, type AgentPermissionReq, type AgentToolCall } from '@/api/client'
 import DiffView from './DiffView.vue'
 import ApprovalCard from './ApprovalCard.vue'
+import StepsModal from './StepsModal.vue'
 import { ToolStatusIcon, hasToolCategory, toolCategoryIcon } from './toolIcons'
 
 const props = defineProps<{
@@ -31,16 +32,25 @@ const emit = defineEmits<{
   (e: 'detail', call: AgentToolCall): void
 }>()
 
-// ---- 子 agent 步骤(嵌在本卡里,不另起卡) ----
-// 列表展开态:父卡在跑默认展开(实时看子 agent 在做什么),完成默认收起;
-// 用户手动点过就不再跟父卡状态走。
-const stepsOpen = ref(props.call.state === 'running')
-watch(() => props.call.state, (s) => {
-  if (s === 'running') stepsOpen.value = true
+// ---- 子 agent 过程(弹窗) ----
+// 过程不再嵌在卡里上下堆叠(每条两行,太占位置):卡内只留一行「过程 N」
+// 触发按钮 + 实时进展摘要,点开左右两栏的 StepsModal(左列表右详情)。
+// 弹窗挂卡内是安全的:Task/Agent 是 UNGROUPABLE,宿主卡不会被聚合拆装
+// (组卡才会出现的"点开就关"轮不到它),v-for key 稳定、实例不重建。
+const stepsOpen = ref(false)
+
+// 触发行上的实时进展:正在跑的步骤 → 最后一条 —— 不开弹窗也能看见子 agent
+// 此刻在干嘛(替代原先"父卡跑着就自动展开列表"的诉求)。
+const liveStep = computed(() => {
+  const s = props.steps
+  if (!s?.length) return null
+  return s.find((c) => c.state === 'running') ?? s[s.length - 1]
 })
 
-// 子 agent 单条的目标摘要(Read 的 file_path、Bash 的 command…)。
+// 子 agent 单条的目标摘要:文本步取首行,工具步取关键参数(Read 的
+// file_path、Bash 的 command…)。
 function stepBrief(c: AgentToolCall): string {
+  if (c.text) return c.text.trim().split('\n')[0] ?? ''
   try {
     const args = c.args ? JSON.parse(c.args) : null
     if (args && typeof args === 'object') {
@@ -286,24 +296,14 @@ const inlineDiff = computed(() =>
       <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
       <span class="tool-state" :class="statusState"><ToolStatusIcon :state="statusState" /></span>
     </button>
-    <!-- 子 agent 过程:嵌在父卡内的一体区块(不另起卡)。头部一行开关,
-         单条可点看详情;每条上下两行(工具名一行、摘要换行下一行) -->
+    <!-- 子 agent 过程:一行触发(数量 + 实时进展),点开左右两栏弹窗 -->
     <div v-if="steps?.length" class="steps">
-      <button type="button" class="steps-toggle" @click="stepsOpen = !stepsOpen">
-        <span class="steps-caret" :class="{ open: stepsOpen }" />过程({{ steps.length }})
+      <button type="button" class="steps-open" @click="stepsOpen = true">
+        <span class="steps-label">过程</span>
+        <span class="steps-count">{{ steps.length }}</span>
+        <span v-if="liveStep && stepBrief(liveStep)" class="steps-live">{{ stepBrief(liveStep) }}</span>
       </button>
-      <div v-if="stepsOpen" class="steps-body">
-        <button
-          v-for="(c, i) in steps" :key="c.toolUseId || i" type="button"
-          class="steps-item" :class="c.state" @click="emit('detail', c)"
-        >
-          <div class="steps-line">
-            <span class="steps-state" :class="c.state"><ToolStatusIcon :state="c.state || 'ok'" /></span>
-            <span class="steps-name">{{ c.tool || '工具' }}</span>
-          </div>
-          <div v-if="stepBrief(c)" class="steps-brief">{{ stepBrief(c) }}</div>
-        </button>
-      </div>
+      <StepsModal v-model:show="stepsOpen" :steps="steps || []" :session-id="sessionId" :title="brief || undefined" />
     </div>
     <!-- codex 改动卡:diff 直接铺在卡片里,不用点开就能看见改了什么 -->
     <div v-if="inlineDiff" class="tool-inline-diff">
@@ -318,11 +318,14 @@ const inlineDiff = computed(() =>
         <img :src="u" :alt="`图片 ${i + 1}`" loading="lazy" />
       </button>
     </div>
-    <!-- 内嵌审批:compact 省掉命令摘要行(头部本来就显示着);留在时间线上,弹窗打开也能答复。
-         已答复的不再渲染 —— 结论并进卡头的状态词(允许→完成,拒绝→出错),一卡一行一个结论 -->
+    <!-- 内嵌审批:留在时间线上,弹窗打开也能答复。已答复的不再渲染 ——
+         结论并进卡头的状态词(允许→完成,拒绝→出错),一卡一行一个结论。
+         compact 省掉命令摘要行,只用在"卡头本来就显示着这条命令"的配对;
+         子 agent 的审批(parentToolUseId,挂在宿主 Task 卡上)命令在卡头
+         看不到,必须带着摘要,否则用户对着一个盲目的 Bash 按允许。 -->
     <ApprovalCard
       v-if="pendingReq && !pendingResolved"
-      :req="pendingReq" :busy="approveBusy" compact
+      :req="pendingReq" :busy="approveBusy" :compact="!pendingReq.parentToolUseId"
       class="tool-approval"
       @decide="(allow, session) => emit('decide', allow, session)"
     />
@@ -348,7 +351,7 @@ const inlineDiff = computed(() =>
   flex: none; width: 14px; height: 14px;
   color: var(--lr-fg-muted);
 }
-.tool-icon svg, .tool-state svg, .steps-state svg {
+.tool-icon svg, .tool-state svg {
   width: 100%; height: 100%; display: block;
 }
 /* 状态图标配色:完成=绿圈勾,出错/被拒=红圈叉,等审批=挂锁,运行中=spinner */
@@ -377,9 +380,9 @@ const inlineDiff = computed(() =>
 }
 .tool-brief::-webkit-scrollbar { display: none; }
 
-/* ---- 子 agent 过程(嵌在父卡内的区块) ---- */
+/* ---- 子 agent 过程(一行触发,点开 StepsModal) ---- */
 .steps { border-top: 1px solid rgba(127, 127, 127, .14); }
-.steps-toggle {
+.steps-open {
   display: flex; align-items: center; gap: 6px;
   width: 100%; min-height: 32px; padding: 4px 10px;
   appearance: none; border: 0; background: transparent;
@@ -387,33 +390,18 @@ const inlineDiff = computed(() =>
   cursor: pointer; text-align: left;
   -webkit-tap-highlight-color: transparent;
 }
-.steps-caret {
-  flex: none; width: 1em; text-align: center;
-  opacity: .7; transition: transform .15s ease;
-  /* 收起 ">";展开旋转 90° 朝下 */
+.steps-open:hover { color: var(--lr-fg); }
+.steps-label { flex: none; }
+.steps-count {
+  flex: none; min-width: 16px; padding: 0 4px;
+  border-radius: 8px; text-align: center;
+  background: rgba(127, 127, 127, .14); font-size: 11px; line-height: 16px;
 }
-.steps-toggle .steps-caret::before { content: '›'; font-weight: 600; }
-.steps-caret.open { transform: rotate(90deg); }
-.steps-body { padding: 0 0 4px; }
-/* 每条可点(弹窗看该次参数与结果);上下两行,不左右挤 */
-.steps-item {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
-  width: 100%; padding: 5px 10px 5px 22px;
-  appearance: none; border: 0; background: transparent;
-  font: inherit; color: inherit; text-align: left; cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-  min-height: 38px;
-}
-.steps-item:hover { background: rgba(127, 127, 127, .06); }
-.steps-line { display: flex; align-items: center; gap: 6px; align-self: stretch; }
-.steps-state { flex: none; width: 12px; height: 12px; color: var(--lr-ok); }
-.steps-state.error { color: var(--lr-danger); }
-.steps-state.running { color: var(--lr-fg-muted); }
-.steps-name { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg); }
-.steps-brief {
-  align-self: stretch;
-  white-space: normal; overflow-wrap: anywhere;
-  font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
+/* 实时进展:正在跑/最近一条的摘要,单行省略;点开弹窗看全量 */
+.steps-live {
+  min-width: 0; flex: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: ui-monospace, monospace; font-size: 11px;
 }
 /* 内铺 diff:多块之间只留 1px 分隔;正文高度收紧(时间线上只是扫一眼,
    完整内容仍在详情弹窗),超出内部滚动,不把手机时间线滚穿 */
@@ -436,28 +424,9 @@ const inlineDiff = computed(() =>
 }
 </style>
 
-<!-- 弹窗里的详情由 teleport 渲染到 body,scoped 样式作用不到,放非 scoped 块 -->
+<!-- 卡内点亮的原图弹窗由 teleport 渲染到 body,scoped 样式作用不到;详情块
+     (.tool-block 等)的规则已归 ToolDetailBody(经 StepsModal 引入),这里只
+     留自己的 lightbox。 -->
 <style>
-.tool-detail { display: flex; flex-direction: column; gap: 12px; }
-.tool-modal .tool-block {
-  margin: 0; padding: 8px 10px;
-  border: 1px solid rgba(127, 127, 127, .14); border-radius: var(--lr-radius);
-  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
-  white-space: pre-wrap; overflow-wrap: anywhere;
-  max-height: 55vh; overflow: auto;
-  color: var(--lr-fg);
-}
-.tool-modal .tool-block.result { background: rgba(127, 127, 127, .06); }
-.tool-modal .tool-wait { padding: 8px 10px; font-size: 12px; color: var(--lr-fg-muted); }
-.tool-modal .patch-files { display: flex; flex-direction: column; gap: 4px; }
-.tool-modal .patch-file {
-  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
-  color: var(--lr-fg); overflow-wrap: anywhere;
-}
-.tool-modal .tool-imgs { display: flex; gap: 8px; flex-wrap: wrap; }
-.tool-modal .tool-imgs img {
-  width: 96px; height: 96px; border-radius: 6px; cursor: zoom-in;
-  border: 1px solid rgba(127, 127, 127, .2); object-fit: cover;
-}
 .tool-modal .tool-lightbox { max-width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
 </style>

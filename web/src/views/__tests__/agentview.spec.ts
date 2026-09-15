@@ -104,23 +104,29 @@ describe('AgentView 真实会话回放', () => {
       await groupHeads[g].trigger('click') // 收起
     }
 
-    // 子 agent 过程(Task/Agent 卡内嵌 steps):展开过程,逐条点详情
-    const stepsToggles = w.findAll('.steps-toggle')
-    console.log('过程卡:', stepsToggles.length)
-    for (let t = 0; t < stepsToggles.length; t++) {
-      await stepsToggles[t].trigger('click')
+    // 子 agent 过程(Task/Agent 卡):点「过程」开左右两栏弹窗,点左栏条目
+    // 右栏出该步骤的详情。多张过程卡依次开,弹窗 teleport 到 body,取最新
+    // 一个 .steps-modal(前一张没关也不影响)。
+    const stepsOpens = w.findAll('.steps-open')
+    console.log('过程卡:', stepsOpens.length)
+    for (let t = 0; t < stepsOpens.length; t++) {
+      await stepsOpens[t].trigger('click')
       await flushPromises()
-      const items = w.findAll('.steps-item')
-      console.log(' 过程', t, '条目', items.length, items.map((x) => x.find('.steps-name')?.text()))
-      for (let k = 0; k < items.length; k++) {
-        await items[k].trigger('click')
+      const modals = document.body.querySelectorAll('.steps-modal')
+      const modal = modals[modals.length - 1]
+      if (!modal) console.log('FAIL steps modal missing:', t)
+      expect(modal, `过程卡 ${t} 点开后没有弹窗`).toBeTruthy()
+      const items = Array.from(modal!.querySelectorAll('.steps-md-item'))
+      console.log(' 过程', t, '条目', items.length)
+      for (const it of items) {
+        (it as HTMLElement).click()
         await flushPromises()
-        const details = document.body.querySelectorAll('.tool-detail')
-        const last = details[details.length - 1]
-        if (!last || !last.textContent) {
-          console.log('FAIL step:', t, k, items[k].text())
-        }
-        expect(!!last?.textContent, `过程卡 ${t} 第 ${k} 条点开后没有详情内容`).toBeTruthy()
+        const detail = modal!.querySelector('.steps-md-detail')
+        if (!detail || !detail.textContent) console.log('FAIL step:', t, it.textContent)
+        expect(
+          (detail?.textContent?.length ?? 0) > 0,
+          `过程卡 ${t} 点条目(${it.textContent?.slice(0, 24)})后右栏没有详情内容`,
+        ).toBeTruthy()
       }
     }
   })
