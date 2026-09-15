@@ -471,6 +471,87 @@ func TestClaudeSubagentApprovalParent(t *testing.T) {
 	collect(map[string]string{"r3": "", "r4": ""})
 }
 
+// TestClaudeAutoAllowMidSession 运行中把权限模式切到全部放行:进程还是旧
+// 模式在弹询问,重启又要等下一条消息 —— 这段空窗由 driver 内存开关代答:
+// 后续询问直接放行(不落 permission_request,前端不弹卡);AskUserQuestion
+// 不受影响(那是 agent 向用户提问,不是权限);切回询问模式后恢复弹卡。
+// 切换时刻已经挂着的询问由 Manager.Settings 代答(见 queue_test 的
+// TestSettingsAcceptAutoApprovePending),不经这条路径。
+func TestClaudeAutoAllowMidSession(t *testing.T) {
+	d := newClaudeDriver()
+	stdin := &bufCloser{}
+	d.mu.Lock()
+	d.stdin = stdin
+	d.mu.Unlock()
+
+	feed := func(line string) { go d.readStdout(strings.NewReader(line + "\n")) }
+	// 切换前:询问正常落 permission_request(前端弹卡)。
+	feed(`{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls /"}}}`)
+	select {
+	case ev := <-d.events:
+		if ev.Kind != KindPermissionReq {
+			t.Fatalf("切换前应弹审批,得到 %s(%+v)", ev.Kind, ev.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("切换前 2 秒内没等到审批事件")
+	}
+
+	// 切到全部放行:开关置位,设置提示仍是"重启才生效"(spawn 参数换不了)。
+	if err := d.ApplySettings(SettingsUpdate{PermissionMode: PermAccept}); err == nil {
+		t.Fatal("claude 运行中改设置仍应有提示")
+	}
+
+	// 后续询问:不弹卡,stdin 直接回 allow。
+	feed(`{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm /tmp/x"}}}`)
+	select {
+	case ev := <-d.events:
+		t.Fatalf("r2 不应再弹审批: %+v", ev.Payload)
+	case <-time.After(300 * time.Millisecond):
+	}
+	out := stdin.String()
+	if !strings.Contains(out, `"request_id":"r2"`) || !strings.Contains(out, `"behavior":"allow"`) {
+		t.Fatalf("r2 应被直接放行,stdin = %s", out)
+	}
+
+	// AskUserQuestion 照旧分流到提问:autoAllow 不替用户答题。
+	feed(`{"type":"control_request","request_id":"r3","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"header":"方向","question":"继续吗?","options":[{"label":"继续"},{"label":"停"}]}]}}}`)
+	select {
+	case ev := <-d.events:
+		if ev.Kind != KindAskUser {
+			t.Fatalf("提问应分流到 ask_user,得到 %s(%+v)", ev.Kind, ev.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("提问 2 秒内没到达")
+	}
+	if strings.Contains(stdin.String(), `"request_id":"r3"`) {
+		t.Fatal("autoAllow 不应代答提问")
+	}
+	if err := d.Answer("r3", nil); err != nil {
+		t.Fatalf("Answer(r3): %v", err)
+	}
+
+	// 切回询问模式:恢复弹卡。
+	if err := d.ApplySettings(SettingsUpdate{PermissionMode: PermAsk}); err == nil {
+		t.Fatal("切回询问模式仍应有提示")
+	}
+	feed(`{"type":"control_request","request_id":"r4","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls /tmp"}}}`)
+	select {
+	case ev := <-d.events:
+		if ev.Kind != KindPermissionReq {
+			t.Fatalf("切回后应恢复弹卡,得到 %s(%+v)", ev.Kind, ev.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("切回后 2 秒内没等到审批事件")
+	}
+	// 收尾:挂着的 r1/r4 都答复掉,别留泄漏的 goroutine。
+	if err := d.Resolve("r1", true, false); err != nil {
+		t.Fatalf("Resolve(r1): %v", err)
+	}
+	if err := d.Resolve("r4", true, false); err != nil {
+		t.Fatalf("Resolve(r4): %v", err)
+	}
+}
+
 // TestClaudeResumeError resume 失败的真实形状:result 行 is_error=true、
 // result 文本为空、原因在 errors 数组里。此前只有 result 文本非空才报错,
 // 失败被静默吞掉 —— 远端只看到会话「又离线了」,无从排查。

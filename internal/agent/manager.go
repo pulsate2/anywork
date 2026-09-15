@@ -588,6 +588,16 @@ func (m *Manager) Settings(sessionID string, u SettingsUpdate) (*Session, error,
 		ls.stale = true
 		ls.mu.Unlock()
 	}
+	// 切到全部放行:当前回合立即兑现,不等重启 —— 挂着的询问直接代答
+	// (Approve 落 permission_result,屏上的审批卡正常收掉);后续询问由
+	// driver 内存开关代答(claude,见 claudeDriver.ApplySettings)。重启
+	// 仍等下一条消息:bypassPermissions 参数与 IS_SANDBOX 环境变量只有
+	// 重启换得上。
+	if u.PermissionMode == PermAccept {
+		for _, p := range ls.driver.PendingRequests() {
+			_ = m.Approve(sessionID, p.ReqID, true, false) // 已答复/已失效:跳过
+		}
+	}
 	// 只在 driver 真正接受了新模型时同步 ls.model;claude 没接受(note 非空)时
 	// 保持原值 —— 不然 pump 会拿"仍在跑的旧模型"把用户刚存的选择覆盖回去。
 	if u.Model != "" && note == "" {

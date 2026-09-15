@@ -102,6 +102,10 @@ type fakeDriver struct {
 	sent     []string
 	closed   bool // Close 被调过(stale 重启要杀旧进程)
 	applyErr bool // 模拟 claude:ApplySettings 报"运行中改不了"
+	// resolves Resolve 收到的 reqID(切全部放行时的代答应长这样);
+	// pending 是 PendingRequests 的固定快照(模拟挂着的询问)。
+	resolves []string
+	pending  []PermissionReqPayload
 }
 
 func (f *fakeDriver) Start(opts StartOpts) error { return nil }
@@ -111,12 +115,21 @@ func (f *fakeDriver) Send(text string) error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeDriver) Interrupt() error                                { return nil }
-func (f *fakeDriver) Resolve(reqID string, allow, session bool) error { return nil }
+func (f *fakeDriver) Interrupt() error { return nil }
+func (f *fakeDriver) Resolve(reqID string, allow, session bool) error {
+	f.mu.Lock()
+	f.resolves = append(f.resolves, reqID)
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeDriver) Answer(reqID string, answers map[string][]string) error {
 	return nil
 }
-func (f *fakeDriver) PendingRequests() []PermissionReqPayload { return nil }
+func (f *fakeDriver) PendingRequests() []PermissionReqPayload {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]PermissionReqPayload(nil), f.pending...)
+}
 func (f *fakeDriver) ExternalID() string                      { return "" }
 func (f *fakeDriver) CurrentModel() string                    { return "" }
 func (f *fakeDriver) ApplySettings(u SettingsUpdate) error {
@@ -347,5 +360,71 @@ func TestSettingsRestartStaleSession(t *testing.T) {
 	}
 	if got := fresh.sent; len(got) != 2 {
 		t.Fatalf("第三条应发给新进程: %v", got)
+	}
+}
+
+// TestSettingsAcceptAutoApprovePending 运行中切到全部放行立即兑现:落库、
+// 标 stale(下一条消息重启)之外,挂着的询问当场代答 —— Resolve 放行 +
+// permission_result 落库广播,屏上的审批卡随事件收掉,不用等下一轮重启。
+func TestSettingsAcceptAutoApprovePending(t *testing.T) {
+	fd := &fakeDriver{
+		applyErr: true, // claude 式:spawn 级参数,重启才生效
+		pending:  []PermissionReqPayload{{ReqID: "r1"}, {ReqID: "r2"}},
+	}
+	s := newTestStore(t)
+	sess := createTestSession(t, s)
+	m := NewManager(s, "/w", false)
+	ls := &liveSession{
+		id: sess.ID, driver: fd,
+		subscribers: map[Subscriber]struct{}{},
+		state:       StatusRunning,
+	}
+	m.mu.Lock()
+	m.sessions[sess.ID] = ls
+	m.mu.Unlock()
+
+	sub := &recSub{}
+	if err := m.Subscribe(sess.ID, sub); err != nil {
+		t.Fatal(err)
+	}
+	updated, err, note := m.Settings(sess.ID, SettingsUpdate{PermissionMode: PermAccept})
+	if err != nil {
+		t.Fatalf("Settings: %v", err)
+	}
+	if note == "" {
+		t.Fatal("claude 式 driver 改设置应有提示")
+	}
+	if updated.PermissionMode != PermAccept {
+		t.Fatalf("设置应已落库: %s", updated.PermissionMode)
+	}
+	// 挂着的两个询问都被代答放行。
+	fd.mu.Lock()
+	resolves := append([]string(nil), fd.resolves...)
+	fd.mu.Unlock()
+	if len(resolves) != 2 || resolves[0] != "r1" || resolves[1] != "r2" {
+		t.Fatalf("挂着的询问应都被代答: %v", resolves)
+	}
+	// 代答走 Approve:permission_result 落库并广播,前端卡靠它收掉。
+	var results []*Event
+	for _, ev := range sub.got {
+		if ev.Kind == KindPermissionResult {
+			results = append(results, ev)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("应广播 2 条 permission_result,得到 %d 条", len(results))
+	}
+	msgs, err := s.Messages(sess.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored int
+	for _, ev := range msgs {
+		if ev.Kind == KindPermissionResult {
+			stored++
+		}
+	}
+	if stored != 2 {
+		t.Fatalf("permission_result 应落库 2 条,得到 %d 条", stored)
 	}
 }

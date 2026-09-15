@@ -31,6 +31,10 @@ type claudeDriver struct {
 	// 会话级放行规则(本会话允许):Bash 存完整命令串(和 Bash(cmd) 语义对齐),
 	// 其它工具存工具名。同类请求来时直接放行,不再推审批卡。
 	sessionRules map[string]bool
+	// autoAllow 全部放行的中途接管(ApplySettings 置位):权限模式运行中切
+	// 到 accept 时进程还是旧模式在弹询问,重启又要等下一条消息 —— 这段
+	// 空窗里 driver 替用户答应。重启后由 bypassPermissions 接棒,不再询问。
+	autoAllow bool
 	// 审批挂起时记下工具与参数,Resolve 时生成会话规则用。
 	lastReqTool map[string]string
 	lastReqArgs map[string]string
@@ -303,9 +307,19 @@ func (d *claudeDriver) CurrentModel() string {
 	return d.model
 }
 
-// ApplySettings claude 的模型/思考强度/权限都是 spawn 级参数,运行中改不了。
-// Manager 会把设置落库并标记 stale,下一条消息进来时按新设置重启进程。
+// ApplySettings claude 的模型/思考强度/权限都是 spawn 级参数,进程内换不了;
+// Manager 落库并标记 stale,下一条消息进来时按新设置重启。唯一例外:权限
+// 切到全部放行时当前回合立即生效 —— 旧进程还会按老模式弹询问,由 driver
+// 内存开关代答(见 handleCanUseTool);切回其它模式则把开关关掉。
 func (d *claudeDriver) ApplySettings(u SettingsUpdate) error {
+	if u.PermissionMode != "" {
+		d.mu.Lock()
+		d.autoAllow = u.PermissionMode == PermAccept
+		d.mu.Unlock()
+	}
+	if u.PermissionMode == PermAccept {
+		return fmt.Errorf("已保存:当前回合的询问由服务端自动放行;下一条消息起以新设置重启会话")
+	}
 	return fmt.Errorf("claude 设置在进程启动时固定;已保存,发送下一条消息时以新设置重启会话")
 }
 
@@ -1115,7 +1129,10 @@ func (d *claudeDriver) handleCanUseTool(reqID string, rawReq json.RawMessage) {
 	parent := d.claimSidechainUse(req.ToolName, string(req.Input))
 
 	d.mu.Lock()
-	if d.sessionRules[reqRuleKey(req.ToolName, args)] {
+	// 全部放行的中途接管(ApplySettings 置位)或会话规则命中:直接放行,
+	// 不落事件、不打扰用户。autoAllow 不拦 AskUserQuestion —— 那是 agent
+	// 向用户提问,不是权限,早已在上面分流走了。
+	if d.autoAllow || d.sessionRules[reqRuleKey(req.ToolName, args)] {
 		d.mu.Unlock()
 		d.writeControlResponse(reqID, true)
 		return
