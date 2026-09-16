@@ -3,12 +3,19 @@ package backup
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+)
+
+// 备份/恢复共用的闸门争用,以及任务不存在。handler 靠 errors.Is 映射成 409/404。
+var (
+	ErrBusy  = errors.New("任务正忙")
+	ErrNoJob = errors.New("任务不存在")
 )
 
 // JobConfig 备份任务配置(与 backup_jobs 表对应)。
@@ -39,6 +46,9 @@ type Job struct {
 	LastSkipped bool      `json:"lastSkipped"` // 上次备份因内容未变化被跳过
 	Running     bool      `json:"running"`
 	Progress    string    `json:"progress,omitempty"`
+	// Restoring 正在异步恢复。和 Running 共用一把闸门:两者都在读改写 sourceDir。
+	Restoring  bool   `json:"restoring"`
+	RestoreErr string `json:"restoreErr,omitempty"`
 
 	mu     sync.Mutex
 	spec   *cronSpec
@@ -201,14 +211,13 @@ func (m *Manager) Delete(id string) error {
 func (m *Manager) Start() {
 	m.wg.Add(1)
 	go m.scheduleLoop()
-	// 启动自动恢复任务。失败必须留痕,否则用户以为数据在而实际不在。
+	// 启动自动恢复。和手动恢复走同一条异步路径(抢闸门 + 进 wg),
+	// 这样它不会被 Stop() 甩下留下一半目录,也不会和随后的定时备份撞在一起。
 	for _, j := range m.List() {
 		if j.AutoRestore && j.Enabled {
-			go func(j *Job) {
-				if err := m.RestoreLatest(j.ID); err != nil {
-					log.Printf("备份: 任务 %s(%s) 启动自动恢复失败: %v", j.Name, j.ID, err)
-				}
-			}(j)
+			if err := m.StartRestore(j.ID, ""); err != nil {
+				log.Printf("备份: 任务 %s(%s) 启动自动恢复未开始: %v", j.Name, j.ID, err)
+			}
 		}
 	}
 }
@@ -233,34 +242,95 @@ func (m *Manager) scheduleLoop() {
 				}
 				j.mu.Lock()
 				due := !j.NextRun.IsZero() && !now.Before(j.NextRun)
-				notRunning := !j.Running
 				j.mu.Unlock()
-				if due && notRunning {
+				if due {
 					j.mu.Lock()
 					j.NextRun = j.spec.next(now)
 					j.mu.Unlock()
-					go m.RunBackup(j.ID, false)
+					if err := m.RunBackup(j.ID, false); err != nil {
+						// 撞上正在跑的备份/恢复就跳过这一轮,不补跑:下一轮到点按定时来。
+						log.Printf("备份: 任务 %s(%s) 本次定时未执行: %v", j.Name, j.ID, err)
+					}
 				}
 			}
 		}
 	}
 }
 
-// RunBackup 立即执行一次备份。force=false 时内容指纹与上次相同则跳过。
-func (m *Manager) RunBackup(id string, force bool) {
+// RunBackup 立即执行一次备份,抢到闸门就返回 nil 并在后台跑完。
+// force=false 时内容指纹与上次相同则跳过。
+// 闸门同步地抢:抢不到当场返回错误,调用方(HTTP)才能说清为什么没跑,
+// 而不是回一句"已触发"然后什么都没发生。
+func (m *Manager) RunBackup(id string, force bool) error {
 	j := m.Get(id)
 	if j == nil {
-		return
+		return fmt.Errorf("%w: %s", ErrNoJob, id)
 	}
 	j.mu.Lock()
-	if j.Running {
+	switch {
+	case j.Restoring:
 		j.mu.Unlock()
-		return
+		return fmt.Errorf("%w: 正在恢复,等恢复结束再备份", ErrBusy)
+	case j.Running:
+		j.mu.Unlock()
+		return fmt.Errorf("%w: 已在备份中", ErrBusy)
 	}
 	j.Running = true
 	j.Progress = "" // 清掉上一轮的文案,本轮由 doBackup 在收尾时写
 	j.mu.Unlock()
 
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.runBackupLocked(j, force)
+	}()
+	return nil
+}
+
+// StartRestore 异步恢复指定快照(snap 为空 = 最近一次)。立刻返回,进度靠 Job.Restoring。
+// 与备份共用闸门:恢复中途被备份读到的是半棵新半棵旧的树,两边都得挡。
+func (m *Manager) StartRestore(id, snap string) error {
+	j := m.Get(id)
+	if j == nil {
+		return fmt.Errorf("%w: %s", ErrNoJob, id)
+	}
+	j.mu.Lock()
+	switch {
+	case j.Restoring:
+		j.mu.Unlock()
+		return fmt.Errorf("%w: 已在恢复中", ErrBusy)
+	case j.Running:
+		j.mu.Unlock()
+		return fmt.Errorf("%w: 正在备份,等备份结束再恢复", ErrBusy)
+	}
+	j.Restoring = true
+	j.RestoreErr = ""
+	j.mu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		var err error
+		if snap != "" {
+			err = m.RestoreSnapshot(id, snap)
+		} else {
+			err = m.RestoreLatest(id)
+		}
+		j.mu.Lock()
+		j.Restoring = false
+		if err != nil {
+			j.RestoreErr = err.Error()
+		}
+		j.mu.Unlock()
+		if err != nil {
+			log.Printf("备份: 任务 %s(%s) 恢复失败: %v", j.Name, j.ID, err)
+		}
+	}()
+	return nil
+}
+
+// runBackupLocked 真正跑一次备份。调用前 Running 必须已置位。
+func (m *Manager) runBackupLocked(j *Job, force bool) {
 	skipped, err := m.doBackup(j, force)
 	j.mu.Lock()
 	j.Running = false
@@ -278,7 +348,7 @@ func (m *Manager) RunBackup(id string, force bool) {
 
 	// 成功且非跳过后轮转(跳过时没有新快照,轮转无意义)。
 	if err == nil && !skipped {
-		_ = m.Rotate(id)
+		_ = m.Rotate(j.ID)
 	}
 }
 

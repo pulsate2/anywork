@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -37,7 +38,7 @@ func (h *Handlers) Save(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeMgrErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, j)
@@ -52,12 +53,27 @@ func (h *Handlers) Delete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// Run 立即执行备份。force=1 时内容未变化也强制出快照。
+// Run 立即执行备份(异步)。force=1 时内容未变化也强制出快照。
 func (h *Handlers) Run(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	force := r.URL.Query().Get("force") == "1"
-	go h.mgr.RunBackup(id, force)
+	if err := h.mgr.RunBackup(id, force); err != nil {
+		writeMgrErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
+}
+
+// writeMgrErr 把管理器里的哨兵错误映射成状态码:争用 409、任务不存在 404、其余 500。
+func writeMgrErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrBusy):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, ErrNoJob):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 // Snapshots 列远程快照历史(PROPFIND 实时)。
@@ -90,27 +106,26 @@ func (h *Handlers) Snapshots(w http.ResponseWriter, r *http.Request) {
 		}
 		snaps = append(snaps, snap{Name: name, Size: e.Size})
 	}
+	// 倒序:新的在前。PROPFIND 的返回顺序由服务器定(有的按名字升序,有的就乱着来),
+	// 不能指望。名字里嵌的是定宽的 YYYYMMDD-HHMMSS,字典序倒排即时间倒排。
+	sort.Slice(snaps, func(a, b int) bool { return snaps[a].Name > snaps[b].Name })
 	writeJSON(w, http.StatusOK, snaps)
 }
 
-// Restore 从指定快照(或最新)恢复。
+// Restore 从指定快照(或最新)恢复。只负责起头:下载解压要跑很久,
+// 占着这个请求不放既没有进度可看,也会被反代的读超时掐断,于是就地转成异步,
+// 进度读任务上的 restoring / restoreErr。
 func (h *Handlers) Restore(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	var body struct {
 		Snapshot string `json:"snapshot"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	var err error
-	if body.Snapshot != "" {
-		err = h.mgr.RestoreSnapshot(id, body.Snapshot)
-	} else {
-		err = h.mgr.RestoreLatest(id)
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+	if err := h.mgr.StartRestore(id, body.Snapshot); err != nil {
+		writeMgrErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
 }
 
 // Download 代理流式下载远程快照。

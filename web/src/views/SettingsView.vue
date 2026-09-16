@@ -6,6 +6,7 @@ import { NButton, NInput, NInputNumber, NList, NListItem, NEmpty, NSpin, NModal,
   NTooltip } from 'naive-ui'
 import { api, type SysInfo, type ProcInfo, type BackupJob, type BackupSnapshot, type PushStatus } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
+import { snapTime, snapRel } from '@/utils/snapshot'
 import DirTreePicker from '@/components/DirTreePicker.vue'
 
 const message = useMessage()
@@ -463,6 +464,27 @@ async function removeJob(id: string) {
   }
 }
 
+// 恢复改异步后,POST 回来只代表"开跑了"。进度只能轮询任务状态:
+// 跑到 restoring 落下为止,再报结果(失败的详情在 restoreErr 里)。
+const restoreTimers: number[] = []
+
+function pollRestore(id: string) {
+  const tick = async () => {
+    await loadJobs()
+    const j = jobs.value.find(x => x.id === id)
+    if (!j) return
+    if (j.restoring) {
+      restoreTimers.push(window.setTimeout(tick, 2000))
+      return
+    }
+    // 快照列表开着就顺手刷一次,关着就别替用户展开(undefined 才是"没展开")。
+    if (snapshots.value[id]) loadSnaps(id)
+    if (j.restoreErr) message.error('恢复失败:' + j.restoreErr)
+    else message.success('恢复完成')
+  }
+  restoreTimers.push(window.setTimeout(tick, 1500))
+}
+
 async function restoreSnap(j: BackupJob, snap?: string) {
   dialog.warning({
     title: '确认恢复',
@@ -474,7 +496,8 @@ async function restoreSnap(j: BackupJob, snap?: string) {
     onPositiveClick: async () => {
       try {
         await api.backupRestore(j.id, snap)
-        message.success('恢复完成')
+        message.info('已开始恢复,完成后会提示')
+        pollRestore(j.id)
       } catch (e: any) {
         message.error(e?.message || '恢复失败')
       }
@@ -493,6 +516,9 @@ function fmtTime(t?: string): string {
   return isNaN(d.getTime()) ? t : d.toLocaleString()
 }
 
+// 快照名是 backup-YYYYMMDD-HHMMSS.tar.gz,整串文件名对用户没意义,
+// 拆时刻/相对时间的规则在 utils/snapshot.ts(带单测,时区那条坑钉在那里)。
+
 onMounted(() => {
   load()
   // 目录树和来源提示都以 root 为界。直接刷新在设置页时 store 还是空的(root 由首页
@@ -503,6 +529,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopSys()
+  restoreTimers.forEach(t => clearTimeout(t))
   document.removeEventListener('visibilitychange', onVisibility)
 })
 </script>
@@ -529,7 +556,8 @@ onUnmounted(() => {
                   <n-tag size="tiny" :type="j.enabled ? 'success' : 'default'" :bordered="false">
                     {{ j.enabled ? '启用' : '停用' }}
                   </n-tag>
-                  <n-tag v-if="j.running" size="tiny" type="warning" :bordered="false">备份中</n-tag>
+                  <n-tag v-if="j.restoring" size="tiny" type="warning" :bordered="false">恢复中</n-tag>
+                  <n-tag v-else-if="j.running" size="tiny" type="warning" :bordered="false">备份中</n-tag>
                   <n-tag v-else-if="j.lastRun && j.lastOk && j.lastSkipped" size="tiny" type="info" :bordered="false">已跳过</n-tag>
                   <n-tag v-else-if="j.lastRun" size="tiny" :type="j.lastOk ? 'success' : 'error'" :bordered="false">
                     {{ j.lastOk ? '成功' : '失败' }}
@@ -540,15 +568,16 @@ onUnmounted(() => {
                   <div v-if="j.schedule" class="job-meta">定时: {{ j.schedule }} · 保留: {{ j.retention }} 份</div>
                   <div v-else class="job-meta">手动 · 保留 {{ j.retention }} 份</div>
                   <div v-if="j.lastRun" class="job-meta">上次: {{ fmtTime(j.lastRun) }}<template v-if="j.progress"> · {{ j.progress }}</template></div>
+                  <div v-if="j.restoreErr" class="job-err">恢复失败:{{ j.restoreErr }}</div>
                   <div v-if="j.lastErr" class="job-err">{{ j.lastErr }}</div>
                 </div>
                 <div v-if="j.excludes?.length" class="job-ex">
                   <n-tag v-for="e in j.excludes" :key="e" size="tiny" :bordered="false">{{ e }}</n-tag>
                 </div>
                 <div class="job-ops">
-                  <n-button size="tiny" @click="confirmRun(j)" :disabled="j.running">立即备份</n-button>
+                  <n-button size="tiny" @click="confirmRun(j)" :disabled="j.running || j.restoring">立即备份</n-button>
                   <n-button size="tiny" quaternary @click="toggleSnaps(j)">快照</n-button>
-                  <n-button size="tiny" quaternary @click="restoreSnap(j)">恢复最近</n-button>
+                  <n-button size="tiny" quaternary @click="restoreSnap(j)" :disabled="j.running || j.restoring">恢复最近</n-button>
                   <n-button size="tiny" quaternary @click="openEdit(j)">编辑</n-button>
                   <n-popconfirm @positive-click="removeJob(j.id)">
                     <template #trigger><n-button size="tiny" quaternary type="error">删除</n-button></template>
@@ -560,12 +589,23 @@ onUnmounted(() => {
                 <div v-if="snapshots[j.id]" class="snap-list">
                   <div v-if="snapErr[j.id]" class="job-err">{{ snapErr[j.id] }}</div>
                   <n-empty v-else-if="!snapshots[j.id].length" description="暂无快照" />
-                  <div v-for="s in snapshots[j.id]" :key="s.name" class="snap-row">
-                    <span class="snap-name">{{ s.name }}</span>
-                    <span class="snap-size">{{ fmtBytes(s.size) }}</span>
-                    <n-button size="tiny" quaternary @click="restoreSnap(j, s.name)">恢复</n-button>
-                    <a :href="api.backupDownloadUrl(j.id, s.name)" download class="snap-dl">下载</a>
-                  </div>
+                  <template v-else>
+                    <div class="snap-head">
+                      快照 {{ snapshots[j.id].length }} 份
+                      <span class="snap-head-hint">最新在前</span>
+                    </div>
+                    <div v-for="(s, i) in snapshots[j.id]" :key="s.name" class="snap-row" :title="s.name">
+                      <span class="snap-time">{{ snapTime(s.name) }}</span>
+                      <n-tag v-if="i === 0" size="tiny" type="success" :bordered="false">最新</n-tag>
+                      <span class="snap-meta">{{ fmtBytes(s.size) }}</span>
+                      <span class="snap-rel">{{ snapRel(s.name) }}</span>
+                      <span class="snap-acts">
+                        <n-button size="tiny" secondary @click="restoreSnap(j, s.name)"
+                          :disabled="j.running || j.restoring">恢复</n-button>
+                        <a :href="api.backupDownloadUrl(j.id, s.name)" download class="snap-dl">下载</a>
+                      </span>
+                    </div>
+                  </template>
                 </div>
               </div>
             </n-list-item>
@@ -763,11 +803,40 @@ h2 { font-size: 20px; margin: 0 0 8px; }
 .job-err { color: #d03050; font-size: 12px; }
 .job-ex { display: flex; gap: 6px; flex-wrap: wrap; }
 .job-ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.snap-list { margin-top: 6px; border-top: 1px solid var(--lr-border, #eee); padding-top: 6px; display: flex; flex-direction: column; gap: 4px; }
-.snap-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-.snap-name { font-family: monospace; }
-.snap-size { color: var(--lr-fg-muted); font-size: 12px; }
-.snap-dl { font-size: 13px; color: var(--lr-primary, #2563eb); }
+.snap-list { margin-top: 6px; border-top: 1px solid var(--lr-border, #eee); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.snap-head { color: var(--lr-fg-muted); font-size: 12px; display: flex; align-items: baseline; gap: 6px; }
+.snap-head-hint { opacity: .7; }
+/* 一行一份快照:时刻 + 大小/相对时间 + 操作。行本身给底色和圆角,几行摞起来才成"列表";
+   此前只是一条条挨着的文字,看不出边界。 */
+.snap-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(127,127,127,.08);
+}
+/* 时刻是这一行的主信息,吃掉剩余宽度;窄屏上也不许把右边的操作挤走。 */
+.snap-time {
+  flex: 1 1 auto; min-width: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.snap-meta { color: var(--lr-fg-muted); font-size: 12px; white-space: nowrap; flex: none; }
+.snap-rel { color: var(--lr-fg-muted); font-size: 12px; white-space: nowrap; flex: none; opacity: .8; }
+.snap-acts { display: flex; align-items: center; gap: 6px; flex: none; }
+/* 下载是个 <a>(要带 download 属性走原生下载),但外观不该露馅成两种控件:
+   高度跟着全局 44px 触控下限走,和旁边那颗"恢复"按钮一样高。 */
+.snap-dl {
+  font-size: 12px; color: var(--lr-accent); text-decoration: none;
+  padding: 0 10px; min-height: var(--lr-touch);
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 3px;
+}
+.snap-dl:hover { background: rgba(127,127,127,.15); }
+@media (max-width: 767px) {
+  /* 窄屏:相对时间先让位(上面的时刻已经说清了),保住时刻、大小和操作。 */
+  .snap-rel { display: none; }
+}
 /* 加上 Swap 是四张卡了。min 从 200 收到 150:手机上排成 2×2,不然四张竖着堆
    要划半屏才看到进程表。 */
 .sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }

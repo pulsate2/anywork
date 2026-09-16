@@ -185,8 +185,9 @@ export const api = {
   backupRun: (id: string, force?: boolean) => request<{ started: boolean }>('POST',
     `/api/backup/run?id=${encodeURIComponent(id)}${force ? '&force=1' : ''}`),
   backupSnapshots: (id: string) => request<BackupSnapshot[]>('GET', `/api/backup/snapshots?id=${encodeURIComponent(id)}`),
+  // 恢复是异步的:POST 只负责起头,进度看任务的 restoring / restoreErr。
   backupRestore: (id: string, snapshot?: string) =>
-    request<{ ok: boolean }>('POST', `/api/backup/restore?id=${encodeURIComponent(id)}`, { snapshot }),
+    request<{ started: boolean }>('POST', `/api/backup/restore?id=${encodeURIComponent(id)}`, { snapshot }),
   backupDownloadUrl: (id: string, snapshot: string) => `/api/backup/download?id=${encodeURIComponent(id)}&snapshot=${encodeURIComponent(snapshot)}`,
 
   pushStatus: () => request<PushStatus>('GET', '/api/push/status'),
@@ -685,6 +686,8 @@ export interface BackupJob {
   lastErr?: string
   running?: boolean
   progress?: string
+  restoring?: boolean
+  restoreErr?: string
 }
 
 export interface BackupSnapshot {
