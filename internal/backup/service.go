@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -97,7 +98,11 @@ func (m *Manager) load() {
 func (m *Manager) jobFromConfig(c JobConfig) *Job {
 	j := &Job{JobConfig: c, cancel: make(chan struct{})}
 	if c.Schedule != "" {
-		if spec, err := parseCron(c.Schedule); err == nil {
+		spec, err := parseCron(c.Schedule)
+		if err != nil {
+			// 不能只当没配:任务会从此再不自动触发,而界面上看不出异样。
+			log.Printf("备份: 任务 %s(%s) 的定时 %q 无法解析,该任务不会自动触发: %v", c.Name, c.ID, c.Schedule, err)
+		} else {
 			j.spec = spec
 			j.NextRun = spec.next(time.Now())
 		}
@@ -131,6 +136,13 @@ func (m *Manager) Get(id string) *Job {
 // Save 新建或更新任务并落库。last_fp 是服务端指纹,更新时不动它:
 // 指纹输入包含 excludes 与文件清单,任一变化算出的指纹必然不同,不会误跳过。
 func (m *Manager) Save(c JobConfig) (*Job, error) {
+	c.Schedule = strings.TrimSpace(c.Schedule)
+	// 存进来就得是能跑的:否则任务被静默存下却永不触发,只有日志里能找到线索。
+	if c.Schedule != "" {
+		if _, err := parseCron(c.Schedule); err != nil {
+			return nil, err
+		}
+	}
 	if c.ID == "" {
 		c.ID = fmt.Sprintf("b-%d", time.Now().UnixNano())
 		c.CreatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -246,6 +258,7 @@ func (m *Manager) RunBackup(id string, force bool) {
 		return
 	}
 	j.Running = true
+	j.Progress = "" // 清掉上一轮的文案,本轮由 doBackup 在收尾时写
 	j.mu.Unlock()
 
 	skipped, err := m.doBackup(j, force)
@@ -256,14 +269,11 @@ func (m *Manager) RunBackup(id string, force bool) {
 	if err != nil {
 		j.LastOK = false
 		j.LastErr = err.Error()
-		j.Progress = ""
+		j.Progress = "" // 中途失败,进度文案可能停在半路
 	} else {
 		j.LastOK = true
 		j.LastErr = ""
-		if !skipped {
-			j.Progress = ""
-		} // 跳过时保留 doBackup 写的「内容未变化,已跳过」
-	}
+	} // 成功/跳过都保留 doBackup 写的文案(已备份 N 个文件 / 内容未变化,已跳过)
 	j.mu.Unlock()
 
 	// 成功且非跳过后轮转(跳过时没有新快照,轮转无意义)。

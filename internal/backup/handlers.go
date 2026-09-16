@@ -2,6 +2,7 @@ package backup
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -31,6 +32,11 @@ func (h *Handlers) Save(w http.ResponseWriter, r *http.Request) {
 	}
 	j, err := h.mgr.Save(c)
 	if err != nil {
+		// 定时表达式不合法是用户输入问题,不该报 500。
+		if errors.Is(err, ErrBadCron) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -77,6 +83,11 @@ func (h *Handlers) Snapshots(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := filepath.Base(e.Href)
+		// 只列快照本身:.json 是元数据,列出来点"恢复"必然报错;
+		// 扁平布局下同目录还可能躺着别人的文件,同样不列。
+		if !isSnapshotName(name) {
+			continue
+		}
 		snaps = append(snaps, snap{Name: name, Size: e.Size})
 	}
 	writeJSON(w, http.StatusOK, snaps)
@@ -112,7 +123,7 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	snap := r.URL.Query().Get("snapshot")
 	href := snap
 	if !strings.Contains(snap, "/") {
-		href = remoteDirFor(j) + "/" + snap
+		href = remotePath(remoteDirFor(j), snap)
 	}
 	c := newWebdav(j.WebDAVURL, j.WebDAVUser, j.WebDAVPass)
 	rc, err := c.get(href)

@@ -15,9 +15,25 @@ import (
 	"time"
 )
 
-// remoteDirFor 计算远程目录:基名/jobID。
+// remoteDirFor 快照在 WebDAV 上的存放目录。空 = 直接放在任务配置的那个地址下,
+// 不再套 <源目录名>/<任务ID>/ 两层。
+// 代价:多个任务指向同一目录时快照会混在一起(文件名带时间戳,同一秒才会互撞);
+// 反过来轮转/列表都只认自己命名的 backup-*.tar.gz,不会碰到别人的文件。
 func remoteDirFor(j *Job) string {
-	return filepath.Join(filepath.Base(j.SourceDir), j.ID)
+	return ""
+}
+
+// remotePath 拼远端路径,兼容空的目录前缀。
+func remotePath(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
+}
+
+// isSnapshotName 是否是本系统生成的快照名。
+func isSnapshotName(name string) bool {
+	return strings.HasPrefix(name, "backup-") && strings.HasSuffix(name, ".tar.gz")
 }
 
 // fileStamp 指纹输入:路径 + 大小 + 纳秒级 mtime。
@@ -99,7 +115,7 @@ func (m *Manager) doBackup(j *Job, force bool) (bool, error) {
 		return false, err
 	}
 	base := "backup-" + ts
-	gzPath := remoteDir + "/" + base + ".tar.gz"
+	gzPath := remotePath(remoteDir, base+".tar.gz")
 
 	// 流式打包并 PUT(用 io.Pipe 边打边上传)。
 	pr, pw := io.Pipe()
@@ -129,7 +145,7 @@ func (m *Manager) doBackup(j *Job, force bool) (bool, error) {
 		"fp":       fp,
 	}
 	mb, _ := json.Marshal(meta)
-	if err := c.put(remoteDir+"/"+base+".json", strings.NewReader(string(mb))); err != nil {
+	if err := c.put(remotePath(remoteDir, base+".json"), strings.NewReader(string(mb))); err != nil {
 		return false, err
 	}
 	m.updateFingerprint(j.ID, fp)
@@ -197,7 +213,7 @@ func (m *Manager) RestoreLatest(id string) error {
 	var latest string
 	var latestTS time.Time
 	for _, e := range entries {
-		if strings.HasSuffix(e.Href, ".tar.gz") {
+		if isSnapshotName(filepath.Base(e.Href)) {
 			if ts, ok := parseSnapshotTS(e.Href); ok && ts.After(latestTS) {
 				latestTS = ts
 				latest = e.Href
@@ -287,7 +303,8 @@ func (m *Manager) Rotate(id string) error {
 	}
 	var snaps []string
 	for _, e := range entries {
-		if strings.HasSuffix(e.Href, ".tar.gz") {
+		// 扁平布局下这个目录里可能有别的东西,只轮转我们自己命名的快照。
+		if isSnapshotName(filepath.Base(e.Href)) {
 			snaps = append(snaps, e.Href)
 		}
 	}
@@ -309,10 +326,10 @@ func (m *Manager) RestoreSnapshot(id, snap string) error {
 		return fmt.Errorf("任务不存在")
 	}
 	c := newWebdav(j.WebDAVURL, j.WebDAVUser, j.WebDAVPass)
-	// 规范化:补上远程目录前缀。
+	// 规范化:只有文件名时补上远程目录前缀。
 	href := snap
 	if !strings.Contains(snap, "/") {
-		href = remoteDirFor(j) + "/" + snap
+		href = remotePath(remoteDirFor(j), snap)
 	}
 	return m.restoreSnapshot(j, c, href)
 }

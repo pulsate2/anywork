@@ -166,6 +166,7 @@ const permission = ref<NotificationPermission>('default')
 // ---- 备份 ----
 const jobs = ref<BackupJob[]>([])
 const snapshots = ref<Record<string, BackupSnapshot[]>>({})
+const snapErr = ref<Record<string, string>>({})
 const loadingJobs = ref(false)
 const loadingSnaps = ref('')
 const editModal = ref(false)
@@ -209,7 +210,12 @@ async function loadJobs() {
 async function loadSnaps(id: string) {
   try {
     snapshots.value[id] = await api.backupSnapshots(id)
-  } catch { snapshots.value[id] = [] }
+    snapErr.value[id] = ''
+  } catch (e: any) {
+    // 拉不到不能当成"没有":这两件事对用户的意义完全相反。
+    snapshots.value[id] = []
+    snapErr.value[id] = e?.message || '读取快照失败'
+  }
 }
 
 async function load() {
@@ -303,7 +309,7 @@ function openCreate() {
   editUrl.value = ''
   editUser.value = ''
   editPass.value = ''
-  editSchedule.value = ''
+  editSchedule.value = '0 2 * * *' // 预填每天 2 点,不想定时就清空
   editExcludes.value = ''
   editRetention.value = 3
   editAutoRestore.value = false
@@ -331,9 +337,74 @@ function parseExcludes(text: string): string[] {
   return text.split('\n').map(s => s.trim()).filter(Boolean)
 }
 
+// 5 段 cron 的校验照搬 internal/backup/cron.go:这里只为把错当场告诉用户,
+// 真正的裁决还在后端(Save 会再解析一次,不合法直接 400)。
+const CRON_MAX = [59, 23, 31, 12, 6]
+const CRON_NAMES = ['分', '时', '日', '月', '周']
+
+function cronFieldError(f: string, max: number): string {
+  if (f === '*') return ''
+  if (f.startsWith('*/')) {
+    const n = Number(f.slice(2))
+    if (!Number.isInteger(n) || n <= 0) return `步长得是正整数: ${f}`
+    return ''
+  }
+  for (const part of f.split(',')) {
+    if (!part) return `有空的取值: ${f}`
+    if (part.includes('-')) {
+      const m = /^(\d+)-(\d+)$/.exec(part)
+      if (!m) return `范围得写成 数-数: ${part}`
+      const lo = Number(m[1]), hi = Number(m[2])
+      // 倒序范围在后端曾静默变成"每分钟都跑",这里也不能放过。
+      if (lo > hi) return `范围左端大于右端: ${part}`
+      if (hi > max) return `超出 0-${max}: ${part}`
+      continue
+    }
+    if (!/^\d+$/.test(part)) return `无法解析: ${part}`
+    if (Number(part) > max) return `超出 0-${max}: ${part}`
+  }
+  return ''
+}
+
+function cronError(expr: string): string {
+  const f = expr.trim()
+  if (!f) return ''
+  const parts = f.split(/\s+/)
+  if (parts.length !== 5) return `需要 5 段(分 时 日 月 周),当前 ${parts.length} 段`
+  for (let i = 0; i < 5; i++) {
+    const e = cronFieldError(parts[i], CRON_MAX[i])
+    if (e) return `${CRON_NAMES[i]} ${e}`
+  }
+  return ''
+}
+
+// 挑最常见的三种写法翻成人话,其余只报"合法"——不做完整 cron 语义解释。
+function describeCron(expr: string): string {
+  const [mi, h, dom, mon, dow] = expr.trim().split(/\s+/)
+  const hm = (a: string, b: string) => `${b.padStart(2, '0')}:${a.padStart(2, '0')}`
+  if (/^\d+$/.test(mi) && /^\d+$/.test(h) && dom === '*' && mon === '*' && dow === '*')
+    return `每天 ${hm(mi, h)} 触发`
+  if (mi.startsWith('*/') && h === '*' && dom === '*' && mon === '*' && dow === '*')
+    return `每 ${mi.slice(2)} 分钟触发一次`
+  if (/^\d+$/.test(mi) && /^\d+$/.test(h) && dom === '*' && mon === '*' && dow === '1-5')
+    return `工作日 ${hm(mi, h)} 触发`
+  return '表达式合法'
+}
+
+const cronTip = computed(() => {
+  const f = editSchedule.value.trim()
+  const e = cronError(f)
+  if (e) return { text: `表达式无效:${e}`, bad: true }
+  if (!f) return { text: '留空 = 只手动触发,不自动跑。', bad: false }
+  return { text: `合法,${describeCron(f)}`, bad: false }
+})
+
 async function save() {
   if (!editName.value.trim() || !editSource.value.trim() || !editUrl.value.trim()) {
     message.warning('名称、源目录、WebDAV 地址必填'); return
+  }
+  if (cronError(editSchedule.value)) {
+    message.warning('定时表达式无效,请按提示修改'); return
   }
   try {
     await api.backupSave({
@@ -487,7 +558,8 @@ onUnmounted(() => {
 
                 <!-- 快照列表 -->
                 <div v-if="snapshots[j.id]" class="snap-list">
-                  <n-empty v-if="!snapshots[j.id].length" description="暂无快照" />
+                  <div v-if="snapErr[j.id]" class="job-err">{{ snapErr[j.id] }}</div>
+                  <n-empty v-else-if="!snapshots[j.id].length" description="暂无快照" />
                   <div v-for="s in snapshots[j.id]" :key="s.name" class="snap-row">
                     <span class="snap-name">{{ s.name }}</span>
                     <span class="snap-size">{{ fmtBytes(s.size) }}</span>
@@ -647,8 +719,9 @@ onUnmounted(() => {
           <n-input v-model:value="editUser" placeholder="用户名" />
           <n-input v-model:value="editPass" type="password" placeholder="密码" />
         </div>
-        <label>Cron 定时(留空=仅手动,如 0 3 * * * 每天3点)</label>
+        <label>Cron 定时(5 段:分 时 日 月 周;留空=仅手动,默认 0 2 * * * 每天 2 点)</label>
         <n-input v-model:value="editSchedule" placeholder="分 时 日 月 周" />
+        <div class="hint" :class="{ 'hint-bad': cronTip.bad }">{{ cronTip.text }}</div>
         <label>保留份数</label>
         <n-input-number v-model:value="editRetention" :min="1" :max="100" style="width:100%" />
         <label>排除(每行一个,如 node_modules、.next、*.log;裸目录名匹配任意层级)</label>
@@ -670,14 +743,26 @@ onUnmounted(() => {
 h2 { font-size: 20px; margin: 0 0 8px; }
 .set-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .hint { color: var(--lr-fg-muted); font-size: 12px; }
-.job-card { display: flex; flex-direction: column; gap: 6px; }
+/* cron 校验失败:同一行位置上换成错误色,不再另起一行,免得弹窗高度跳 */
+.hint-bad { color: var(--lr-danger); }
+/* 每个任务一张卡。此前 n-list-item 自带的是 padding: 12px 0(naive 只在
+   bordered/hoverable 时才给左右内边距),内容直接贴到页面留白上,和"系统"页
+   的 sys-card 不是一个观感。左右各留 12px,和 sys-card 对齐。 */
+:deep(.n-list-item) { padding: 0; }
+.job-card {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--lr-border, #eee);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
 .job-top { display: flex; align-items: center; gap: 8px; }
 .job-name { font-weight: 600; font-size: 15px; }
 .job-info { font-size: 13px; display: flex; flex-direction: column; gap: 2px; }
 .job-meta { color: var(--lr-fg-muted); font-size: 12px; }
 .job-err { color: #d03050; font-size: 12px; }
 .job-ex { display: flex; gap: 6px; flex-wrap: wrap; }
-.job-ops { display: flex; gap: 8px; align-items: center; }
+.job-ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .snap-list { margin-top: 6px; border-top: 1px solid var(--lr-border, #eee); padding-top: 6px; display: flex; flex-direction: column; gap: 4px; }
 .snap-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .snap-name { font-family: monospace; }

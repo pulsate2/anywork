@@ -42,6 +42,10 @@
   --lr-page-pad-left: 12px;
   --lr-page-pad-bottom: calc(72px + env(safe-area-inset-bottom));
 
+  /* 卡片/表格的描边。此前只在各处写了 var(--lr-border, #eee),变量本身没定义,
+     于是永远走 #eee 回退 —— 深色主题下是压在近黑页底上的一条惨白线。 */
+  --lr-border: #e5e7eb;
+
   /* 断点 */
   --lr-breakpoint-mobile: 768px;
 }
@@ -56,6 +60,7 @@
     --lr-danger: #ef4444;
     --lr-ok: #22c55e;
     --lr-warn: #f59e0b;
+    --lr-border: #2a2f37;
     /* 差异卡自身的红绿严格照参考稿,不随主题翻转(见上面的说明),所以这里不覆盖。
        只有卡外压在深页底上的那两个小字要换亮档:#b71c1c 压在 #0f1115 上只有 2.88:1。 */
     --lr-diff-add: #4ade80;

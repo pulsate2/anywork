@@ -9,16 +9,21 @@ import (
 	"time"
 )
 
+// ErrBadCron 定时表达式不合法。带哨兵是为了让 handler 能映射成 400 而不是 500。
+var ErrBadCron = errors.New("cron 表达式无效")
+
 // cronSpec 解析后的 5 段 cron:分 时 日 月 周。
 type cronSpec struct {
 	minute, hour, dom, month, dow []int
 }
 
+var cronFieldNames = []string{"分", "时", "日", "月", "周"}
+
 // parseCron 解析 5 段 cron 表达式(标准 crontab 语法)。
 func parseCron(expr string) (*cronSpec, error) {
 	fields := strings.Fields(expr)
 	if len(fields) != 5 {
-		return nil, errors.New("cron 需 5 段:分 时 日 月 周")
+		return nil, fmt.Errorf("%w:需要 5 段(分 时 日 月 周),当前 %d 段", ErrBadCron, len(fields))
 	}
 	s := &cronSpec{}
 	maxes := []int{59, 23, 31, 12, 6}
@@ -26,12 +31,7 @@ func parseCron(expr string) (*cronSpec, error) {
 	for i := 0; i < 5; i++ {
 		v, e := parseField(fields[i], maxes[i])
 		if e != nil {
-			return nil, e
-		}
-		for _, x := range v {
-			if x < 0 || x > maxes[i] {
-				return nil, fmt.Errorf("字段越界: %d 超出 0-%d", x, maxes[i])
-			}
+			return nil, fmt.Errorf("%w:%s %v", ErrBadCron, cronFieldNames[i], e)
 		}
 		switch i {
 		case 0:
@@ -50,6 +50,7 @@ func parseCron(expr string) (*cronSpec, error) {
 }
 
 // parseField 解析单个字段:* | */n | a-b | a,b,c | 数值(可组合)。max 为字段上限。
+// 越界在这里就判掉:否则越界值会一路溜到 match() 里静默不命中。
 func parseField(f string, max int) ([]int, error) {
 	f = strings.TrimSpace(f)
 	if f == "*" {
@@ -59,7 +60,7 @@ func parseField(f string, max int) ([]int, error) {
 	if strings.HasPrefix(f, "*/") {
 		n, err := strconv.Atoi(strings.TrimPrefix(f, "*/"))
 		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("非法步长: %s", f)
+			return nil, fmt.Errorf("步长得是正整数: %q", f)
 		}
 		out := []int{}
 		for i := 0; i <= max; i += n {
@@ -70,23 +71,39 @@ func parseField(f string, max int) ([]int, error) {
 	var out []int
 	for _, part := range strings.Split(f, ",") {
 		part = strings.TrimSpace(part)
-		if strings.Contains(part, "-") {
-			bounds := strings.SplitN(part, "-", 2)
-			lo, e1 := strconv.Atoi(bounds[0])
-			hi, e2 := strconv.Atoi(bounds[1])
+		if part == "" {
+			return nil, fmt.Errorf("有空的取值: %q", f)
+		}
+		if i := strings.Index(part, "-"); i >= 0 {
+			lo, e1 := strconv.Atoi(part[:i])
+			hi, e2 := strconv.Atoi(part[i+1:])
 			if e1 != nil || e2 != nil {
-				return nil, fmt.Errorf("非法范围: %s", part)
+				return nil, fmt.Errorf("范围得写成 数-数: %q", part)
+			}
+			// 倒序范围必须报错:展开循环一次都不走,out 保持 nil,
+			// 而 nil 的语义是"全部" —— 5-1 会静默变成每分钟都跑。
+			if lo > hi {
+				return nil, fmt.Errorf("范围左端大于右端: %q", part)
+			}
+			if lo < 0 || hi > max {
+				return nil, fmt.Errorf("超出 0-%d: %q", max, part)
 			}
 			for i := lo; i <= hi; i++ {
 				out = append(out, i)
 			}
-		} else {
-			n, err := strconv.Atoi(part)
-			if err != nil {
-				return nil, fmt.Errorf("非法数值: %s", part)
-			}
-			out = append(out, n)
+			continue
 		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("无法解析: %q", part)
+		}
+		if n < 0 || n > max {
+			return nil, fmt.Errorf("超出 0-%d: %q", max, part)
+		}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("没有可用取值: %q", f)
 	}
 	return out, nil
 }
