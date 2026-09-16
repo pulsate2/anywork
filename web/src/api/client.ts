@@ -181,7 +181,9 @@ export const api = {
   backupJobs: () => request<BackupJob[]>('GET', '/api/backup/jobs'),
   backupSave: (j: Partial<BackupJob>) => request<BackupJob>('POST', '/api/backup/job', j),
   backupDelete: (id: string) => request<{ ok: boolean }>('DELETE', `/api/backup/job?id=${encodeURIComponent(id)}`),
-  backupRun: (id: string) => request<{ started: boolean }>('POST', `/api/backup/run?id=${encodeURIComponent(id)}`),
+  // force=true:内容未变化也强制出一份快照(默认跳过相同内容)。
+  backupRun: (id: string, force?: boolean) => request<{ started: boolean }>('POST',
+    `/api/backup/run?id=${encodeURIComponent(id)}${force ? '&force=1' : ''}`),
   backupSnapshots: (id: string) => request<BackupSnapshot[]>('GET', `/api/backup/snapshots?id=${encodeURIComponent(id)}`),
   backupRestore: (id: string, snapshot?: string) =>
     request<{ ok: boolean }>('POST', `/api/backup/restore?id=${encodeURIComponent(id)}`, { snapshot }),
@@ -679,8 +681,10 @@ export interface BackupJob {
   nextRun?: string
   lastRun?: string
   lastOk?: boolean
+  lastSkipped?: boolean
   lastErr?: string
   running?: boolean
+  progress?: string
 }
 
 export interface BackupSnapshot {

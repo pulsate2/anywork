@@ -20,39 +20,83 @@ func remoteDirFor(j *Job) string {
 	return filepath.Join(filepath.Base(j.SourceDir), j.ID)
 }
 
+// fileStamp 指纹输入:路径 + 大小 + 纳秒级 mtime。
+type fileStamp struct {
+	rel   string
+	size  int64
+	mtime int64
+}
+
+// computeFingerprint 内容指纹:源目录 + 排除规则 + 每文件(路径|大小|mtime)。
+// walk 顺序天然稳定;excludes 或文件清单任一变化,指纹必变。
+func computeFingerprint(sourceDir string, excludes []string, files []fileStamp) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "dir:%s\n", sourceDir)
+	fmt.Fprintf(h, "excl:%s\n", strings.Join(excludes, "\x00"))
+	for _, f := range files {
+		fmt.Fprintf(h, "%s|%d|%d\n", f.rel, f.size, f.mtime)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // doBackup 流式打包 sourceDir 到 WebDAV(O(1) 内存),并写元数据。
-func (m *Manager) doBackup(j *Job) error {
+// force=false 且指纹与上次相同 → 跳过(skipped=true),零网络开销。
+func (m *Manager) doBackup(j *Job, force bool) (bool, error) {
 	if j.SourceDir == "" || j.WebDAVURL == "" {
-		return fmt.Errorf("来源目录或 WebDAV 地址为空")
+		return false, fmt.Errorf("来源目录或 WebDAV 地址为空")
 	}
 	if !m.dirAllowed(j.SourceDir) {
-		return fmt.Errorf("来源目录超出根边界")
+		return false, fmt.Errorf("来源目录超出根边界")
 	}
 	matcher := newIgnoreMatcher(j.Excludes)
-	// 预扫描:收集文件 + 总量(用于进度)。
+	// 反选(!)可能救回被排除目录里的文件,此时不能剪枝,只能逐文件判断。
+	prunable := !matcher.hasNegate()
+	// 预扫描:收集文件 + 总量 + 指纹输入(用于跳过未变化备份)。
 	files := []string{}
+	fping := []fileStamp{}
 	var total int64
 	filepath.Walk(j.SourceDir, func(p string, fi os.FileInfo, err error) error {
-		if err != nil || fi.IsDir() {
+		if err != nil {
 			return nil
 		}
 		rel, rerr := filepath.Rel(j.SourceDir, p)
-		if rerr != nil {
+		if rerr != nil || rel == "." {
 			return nil
 		}
-		if matcher.shouldIgnore(filepath.ToSlash(rel)) {
+		relSlash := filepath.ToSlash(rel)
+		if fi.IsDir() {
+			// 目录命中即整棵剪枝,不再深入(node_modules 里不用逐个判断)。
+			if prunable && matcher.shouldIgnore(relSlash, true) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if matcher.shouldIgnore(relSlash, false) {
 			return nil
 		}
 		files = append(files, p)
+		fping = append(fping, fileStamp{rel: relSlash, size: fi.Size(), mtime: fi.ModTime().UnixNano()})
 		total += fi.Size()
 		return nil
 	})
+
+	// 内容未变化则跳过(手动 force 除外)。
+	j.mu.Lock()
+	lastFP := j.LastFP
+	j.mu.Unlock()
+	fp := computeFingerprint(j.SourceDir, j.Excludes, fping)
+	if !force && fp == lastFP {
+		j.mu.Lock()
+		j.Progress = "内容未变化,已跳过"
+		j.mu.Unlock()
+		return true, nil
+	}
 
 	ts := time.Now().Format("20060102-150405")
 	remoteDir := remoteDirFor(j)
 	c := newWebdav(j.WebDAVURL, j.WebDAVUser, j.WebDAVPass)
 	if err := c.ensureDir(remoteDir); err != nil {
-		return err
+		return false, err
 	}
 	base := "backup-" + ts
 	gzPath := remoteDir + "/" + base + ".tar.gz"
@@ -68,11 +112,11 @@ func (m *Manager) doBackup(j *Job) error {
 	hash, size, terr := tarStream(j.SourceDir, files, matcher, pw)
 	if terr != nil {
 		pw.CloseWithError(terr)
-		return terr
+		return false, terr
 	}
 	pw.Close()
 	if err := <-done; err != nil {
-		return err
+		return false, err
 	}
 
 	// 写元数据。
@@ -82,15 +126,17 @@ func (m *Manager) doBackup(j *Job) error {
 		"mtime":    time.Now().UTC().Format(time.RFC3339),
 		"bytes":    size,
 		"sha256":   hash,
+		"fp":       fp,
 	}
 	mb, _ := json.Marshal(meta)
 	if err := c.put(remoteDir+"/"+base+".json", strings.NewReader(string(mb))); err != nil {
-		return err
+		return false, err
 	}
+	m.updateFingerprint(j.ID, fp)
 	j.mu.Lock()
 	j.Progress = fmt.Sprintf("已备份 %d 个文件 %s", len(files), humanSize(size))
 	j.mu.Unlock()
-	return nil
+	return false, nil
 }
 
 // tarStream 把 files 打包成 tar.gz 写入 w,返回 sha256 与总字节。
@@ -111,6 +157,8 @@ func tarStream(root string, files []string, matcher *ignoreMatcher, w io.Writer)
 			continue
 		}
 		hdr.Name = filepath.ToSlash(rel)
+		// PAX 才存得下纳秒级 mtime;恢复保留 mtime 后指纹才能与备份时一致。
+		hdr.Format = tar.FormatPAX
 		if err := tw.WriteHeader(hdr); err != nil {
 			return "", 0, err
 		}

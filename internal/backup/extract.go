@@ -31,7 +31,7 @@ func extractTarGz(src, dir string, matcher *ignoreMatcher) error {
 			return err
 		}
 		name := filepath.ToSlash(hdr.Name)
-		if matcher != nil && matcher.shouldIgnore(name) {
+		if matcher != nil && matcher.shouldIgnore(name, hdr.Typeflag == tar.TypeDir) {
 			continue
 		}
 		dest := filepath.Join(dir, name)
@@ -49,6 +49,8 @@ func extractTarGz(src, dir string, matcher *ignoreMatcher) error {
 			}
 			io.Copy(out, tr)
 			out.Close()
+			// 保留快照时的修改时间:恢复后首次备份指纹不变,不多出冗余快照。
+			_ = os.Chtimes(dest, hdr.ModTime, hdr.ModTime)
 		}
 	}
 	return nil
@@ -62,7 +64,7 @@ func mergeDir(staged, dst string, matcher *ignoreMatcher) error {
 		}
 		rel, _ := filepath.Rel(staged, p)
 		relSlash := filepath.ToSlash(rel)
-		if matcher != nil && matcher.shouldIgnore(relSlash) {
+		if matcher != nil && matcher.shouldIgnore(relSlash, fi.IsDir()) {
 			if fi.IsDir() {
 				return filepath.SkipDir
 			}
@@ -82,6 +84,7 @@ func mergeDir(staged, dst string, matcher *ignoreMatcher) error {
 	})
 }
 
+// copyFileAtomic 复制并原子替换,保留源文件 mtime(理由同 extractTarGz)。
 func copyFileAtomic(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -99,7 +102,13 @@ func copyFileAtomic(src, dst string) error {
 		return err
 	}
 	out.Close()
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(src); err == nil {
+		_ = os.Chtimes(dst, fi.ModTime(), fi.ModTime())
+	}
+	return nil
 }
 
 // within 校验 dest 在 base 边界内。

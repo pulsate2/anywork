@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 设置:系统信息(含任务管理器式进程列表)+ 备份(WebDAV)任务管理。
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch, h } from 'vue'
 import { NButton, NInput, NInputNumber, NList, NListItem, NEmpty, NSpin, NModal,
   NTag, NPopconfirm, useMessage, useDialog, NTabs, NTabPane, NSwitch, NSlider, NSelect,
   NTooltip } from 'naive-ui'
@@ -357,14 +357,28 @@ async function save() {
   }
 }
 
-async function runJob(id: string) {
+async function runJob(id: string, force = false) {
   try {
-    await api.backupRun(id)
-    message.success('已触发备份')
+    await api.backupRun(id, force)
+    message.success(force ? '已触发强制备份' : '已触发备份')
     setTimeout(() => { loadJobs(); loadSnaps(id) }, 500)
   } catch (e: any) {
     message.error(e?.message || '触发失败')
   }
+}
+
+// 备份前的二次确认:顺便把「跳过」语义说清,强制备份收进同一个弹窗。
+// 自定义 action 区放三颗按钮,点完自己关弹窗(onPositiveClick 只对默认按钮生效)。
+function confirmRun(j: BackupJob) {
+  const d = dialog.create({
+    title: '立即备份',
+    content: `备份 ${j.sourceDir} 到 ${j.webdavUrl}。内容与上次相同会跳过上传;需要无论如何生成新快照,请用强制备份。`,
+    action: () => [
+      h(NButton, { size: 'small', quaternary: true, onClick: () => d.destroy() }, { default: () => '取消' }),
+      h(NButton, { size: 'small', type: 'primary', onClick: () => { d.destroy(); runJob(j.id) } }, { default: () => '备份' }),
+      h(NButton, { size: 'small', type: 'warning', onClick: () => { d.destroy(); runJob(j.id, true) } }, { default: () => '强制备份' }),
+    ],
+  })
 }
 
 async function removeJob(id: string) {
@@ -445,6 +459,7 @@ onUnmounted(() => {
                     {{ j.enabled ? '启用' : '停用' }}
                   </n-tag>
                   <n-tag v-if="j.running" size="tiny" type="warning" :bordered="false">备份中</n-tag>
+                  <n-tag v-else-if="j.lastRun && j.lastOk && j.lastSkipped" size="tiny" type="info" :bordered="false">已跳过</n-tag>
                   <n-tag v-else-if="j.lastRun" size="tiny" :type="j.lastOk ? 'success' : 'error'" :bordered="false">
                     {{ j.lastOk ? '成功' : '失败' }}
                   </n-tag>
@@ -453,14 +468,14 @@ onUnmounted(() => {
                   <div>{{ j.sourceDir }} → {{ j.webdavUrl }}</div>
                   <div v-if="j.schedule" class="job-meta">定时: {{ j.schedule }} · 保留: {{ j.retention }} 份</div>
                   <div v-else class="job-meta">手动 · 保留 {{ j.retention }} 份</div>
-                  <div v-if="j.lastRun" class="job-meta">上次: {{ fmtTime(j.lastRun) }}</div>
+                  <div v-if="j.lastRun" class="job-meta">上次: {{ fmtTime(j.lastRun) }}<template v-if="j.progress"> · {{ j.progress }}</template></div>
                   <div v-if="j.lastErr" class="job-err">{{ j.lastErr }}</div>
                 </div>
                 <div v-if="j.excludes?.length" class="job-ex">
                   <n-tag v-for="e in j.excludes" :key="e" size="tiny" :bordered="false">{{ e }}</n-tag>
                 </div>
                 <div class="job-ops">
-                  <n-button size="tiny" @click="runJob(j.id)" :disabled="j.running">立即备份</n-button>
+                  <n-button size="tiny" @click="confirmRun(j)" :disabled="j.running">立即备份</n-button>
                   <n-button size="tiny" quaternary @click="toggleSnaps(j)">快照</n-button>
                   <n-button size="tiny" quaternary @click="restoreSnap(j)">恢复最近</n-button>
                   <n-button size="tiny" quaternary @click="openEdit(j)">编辑</n-button>
@@ -636,7 +651,7 @@ onUnmounted(() => {
         <n-input v-model:value="editSchedule" placeholder="分 时 日 月 周" />
         <label>保留份数</label>
         <n-input-number v-model:value="editRetention" :min="1" :max="100" style="width:100%" />
-        <label>排除(每行一个 gitignore 模式,如 *.log)</label>
+        <label>排除(每行一个,如 node_modules、.next、*.log;裸目录名匹配任意层级)</label>
         <n-input v-model:value="editExcludes" type="textarea" :autosize="{minRows:2,maxRows:5}" />
         <div class="row2">
           <label class="switch-row"><n-switch v-model:value="editEnabled" /> 启用</label>

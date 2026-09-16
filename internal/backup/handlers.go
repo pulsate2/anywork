@@ -46,10 +46,11 @@ func (h *Handlers) Delete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// Run 立即执行备份。
+// Run 立即执行备份。force=1 时内容未变化也强制出快照。
 func (h *Handlers) Run(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-	go h.mgr.RunBackup(id)
+	force := r.URL.Query().Get("force") == "1"
+	go h.mgr.RunBackup(id, force)
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
 }
 
