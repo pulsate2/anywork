@@ -285,6 +285,53 @@ async function doInit() {
   }
 }
 
+// ---- 克隆远程仓库(git clone)----
+// 和"初始化"并列的另一个入口:不是所有人都从零开始,更多时候是想把一个已有的远端仓库拉下来。
+// 克隆进当前工作区(原地),和 init 一样作用在 repoPath 上 —— 落地后这个目录本身就是仓库,
+// 重跑 load() 空状态就换成正常界面。代价是这个目录必须为空(git clone 到 . 的硬性要求),
+// 弹窗里把这一点说清楚。
+const cloneModal = ref(false)
+const cloneUrl = ref('')
+const cloning = ref(false)
+const cloneValid = computed(() => cloneUrl.value.trim().length > 0)
+
+function askClone() {
+  cloneUrl.value = ''
+  cloneModal.value = true
+}
+
+function cancelClone() {
+  cloneModal.value = false
+}
+
+async function doClone() {
+  if (!cloneValid.value) return
+  cloning.value = true
+  try {
+    const r = await api.gitClone(repoPath.value, cloneUrl.value.trim())
+    cloneModal.value = false
+    message.success(`已克隆,当前分支 ${r.branch || '未知'}`)
+    // 同 doInit:重新走一遍 load,克隆出来的仓库立刻按正常界面显示。
+    await load()
+  } catch (e: any) {
+    // 409:这个目录(或它的某个上级)已经是仓库了 —— 屏幕上这个空状态是过期的,
+    // 报错没意义,重新加载一次就能看到仓库。
+    if (e instanceof ApiError && e.status === GIT_ALREADY_REPO) {
+      cloneModal.value = false
+      message.info('这个目录已经在一个 Git 仓库里了')
+      await load()
+      return
+    }
+    if (e instanceof ApiError && e.status === 403) {
+      message.error('服务以只读模式启动,不能克隆仓库')
+      return
+    }
+    message.error(e?.message || '克隆失败')
+  } finally {
+    cloning.value = false
+  }
+}
+
 async function loadMoreLog() {
   logLoading.value = true
   try {
@@ -804,15 +851,21 @@ watch(() => store.currentPath, (p) => {
     </div>
 
     <n-spin :show="loading">
-      <!-- 不是仓库:把"初始化"放在这句提示下面,省掉"先去终端敲 git init"这一步。
-           按钮只在确实拿到了 repo=false 时给:repo 为 null 说明连仓库信息都没问出来
-           (路径不存在、越界),那种情况 init 同样做不成,给了只是让人白点一次。 -->
+      <!-- 不是仓库:把"初始化"和"克隆"放在这句提示下面,省掉"先去终端敲 git init/clone"这一步。
+           两个按钮都只在确实拿到了 repo=false 时给:repo 为 null 说明连仓库信息都没问出来
+           (路径不存在、越界),那种情况这两个动作同样做不成,给了只是让人白点一次。 -->
       <n-empty v-if="!repo?.repo" description="当前工作区不是 Git 仓库" class="git-empty">
         <template #extra>
-          <n-button v-if="repo && !loading" size="small" type="primary" :loading="initing" @click="askInit">
-            <template #icon><n-icon :component="GitBranchOutline" /></template>
-            初始化 Git 仓库
-          </n-button>
+          <div class="git-empty-actions">
+            <n-button v-if="repo && !loading" size="small" type="primary" :loading="initing" @click="askInit">
+              <template #icon><n-icon :component="GitBranchOutline" /></template>
+              初始化 Git 仓库
+            </n-button>
+            <n-button v-if="repo && !loading" size="small" :loading="cloning" @click="askClone">
+              <template #icon><n-icon :component="CloudDownloadOutline" /></template>
+              克隆远程仓库
+            </n-button>
+          </div>
         </template>
       </n-empty>
       <template v-else>
@@ -1051,6 +1104,30 @@ watch(() => store.currentPath, (p) => {
       </template>
     </n-modal>
 
+    <!-- 克隆远程仓库:克隆进当前工作区(原地),所以文案要把"落到哪个目录、什么条件"
+         说清楚。私有仓库要账号密码时走既有 askClient,克隆途中会自动弹认证框。 -->
+    <n-modal v-model:show="cloneModal" preset="card" title="克隆远程仓库" :mask-closable="false"
+      style="width: 92%; max-width: 460px">
+      <div class="git-hint">
+        将克隆进当前工作区「{{ repo?.short || repoPath }}」。该目录必须为空。
+      </div>
+      <n-form label-placement="top" :show-feedback="false">
+        <n-form-item label="仓库地址">
+          <n-input v-model:value="cloneUrl" placeholder="https://github.com/user/repo.git"
+            :input-props="{ inputmode: 'url', autocapitalize: 'off', spellcheck: false }"
+            @keydown.enter="doClone" />
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div class="modal-footer">
+          <n-button :disabled="cloning" @click="cancelClone">取消</n-button>
+          <n-button type="primary" :loading="cloning" :disabled="!cloneValid" @click="doClone">
+            {{ cloning ? '克隆中…' : '克隆' }}
+          </n-button>
+        </div>
+      </template>
+    </n-modal>
+
     <!-- 提交身份:git 拼不出 user.name/user.email 时挡在提交/回滚前面。
          只写当前仓库,所以文案要把"作用范围"说清楚,别让人以为动了全局。 -->
     <n-modal v-model:show="idModal" preset="card" title="设置提交身份" :mask-closable="false"
@@ -1165,6 +1242,8 @@ watch(() => store.currentPath, (p) => {
 /* 7 个图标钮在窄屏(360px)上放不下一行,让它换行并靠右收边。 */
 .git-toolbar { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px; }
 .git-empty { padding: 40px 0; }
+/* 初始化 / 克隆两个按钮:窄屏放不下就换行居中,别挤成一行。 */
+.git-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
 .git-meta { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
 .git-sub {
   color: var(--lr-fg-muted); font-size: 12px;

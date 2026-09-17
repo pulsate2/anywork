@@ -84,11 +84,14 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
 
     // 第一个思考增量:直播卡出现,标签是"思考中"(不再是"思考过程中…"),
     // 秒表从 1 秒起跳(fmtThink 对 0 取 max(1,…))
-    await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning_delta', payload: '先理一下思路' } })
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning_delta', payload: '先理一下思路 **重点是并发**' } })
     const summary = () => w.find('.chat-row.reasoning summary').text()
     expect(w.find('.chat-row.reasoning').exists()).toBe(true)
     expect(summary()).toBe('思考中 · 1 秒')
     expect(w.find('.reasoning-body').text()).toContain('先理一下思路')
+    // 思考正文也要走 markdown 渲染(此前是纯文本插值,星号照字面显示)
+    expect(w.find('.reasoning-body').html()).toContain('<strong>')
+    expect(w.find('.reasoning-body').text()).not.toContain('**')
 
     // 5 秒后:读数跟着跳(假时间驱动 setInterval 与 Date.now)
     await vi.advanceTimersByTimeAsync(5000)

@@ -117,21 +117,36 @@ func (m *Manager) doBackup(j *Job, force bool) (bool, error) {
 	base := "backup-" + ts
 	gzPath := remotePath(remoteDir, base+".tar.gz")
 
-	// 流式打包并 PUT(用 io.Pipe 边打边上传)。
-	pr, pw := io.Pipe()
-	done := make(chan error, 1)
-	go func() {
-		werr := c.put(gzPath, pr)
-		pr.CloseWithError(werr)
-		done <- werr
-	}()
-	hash, size, terr := tarStream(j.SourceDir, files, matcher, pw)
+	// 先落成临时文件再上传。此前是流式打包(PUT 一个 io.Pipe)省一次落盘,
+	// 但 body 长度未知会退化成 chunked,而且上传耗时完全不受控:
+	// 服务端对 chunked 处理不好、或按体积上限提前应答关连接时,客户端还在往
+	// 管道里写,报出来的是 io.ErrClosedPipe("io: read/write on closed pipe"),
+	// 真正的原因(413/507/超时)全被吃掉 —— 文件越多包越大越容易撞上。
+	// 落盘后长度已知:PUT 带准确 Content-Length,超时也能按体量给。
+	tmp, err := os.CreateTemp("", "lr-backup-*.tar.gz")
+	if err != nil {
+		return false, err
+	}
+	defer os.Remove(tmp.Name())
+	hash, size, terr := tarStream(j.SourceDir, files, matcher, tmp)
 	if terr != nil {
-		pw.CloseWithError(terr)
+		tmp.Close()
 		return false, terr
 	}
-	pw.Close()
-	if err := <-done; err != nil {
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	// size 是原始内容字节数(给元数据看),上传要用压缩包自己的大小。
+	fi, err := os.Stat(tmp.Name())
+	if err != nil {
+		return false, err
+	}
+	f, err := os.Open(tmp.Name())
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if err := c.put(gzPath, f, fi.Size()); err != nil {
 		return false, err
 	}
 
@@ -145,7 +160,7 @@ func (m *Manager) doBackup(j *Job, force bool) (bool, error) {
 		"fp":       fp,
 	}
 	mb, _ := json.Marshal(meta)
-	if err := c.put(remotePath(remoteDir, base+".json"), strings.NewReader(string(mb))); err != nil {
+	if err := c.put(remotePath(remoteDir, base+".json"), strings.NewReader(string(mb)), int64(len(mb))); err != nil {
 		return false, err
 	}
 	m.updateFingerprint(j.ID, fp)
@@ -246,17 +261,21 @@ func humanSize(n int64) string {
 
 // restoreSnapshot 下载并解压覆盖到 sourceDir(校验 sha256)。
 func (m *Manager) restoreSnapshot(j *Job, c *webdavClient, href string) error {
-	// 取元数据校验。
+	// 取元数据校验。顺带拿到原始体积:下载时限按它估,
+	// 否则大快照只能走 5 分钟底,慢线路上的恢复会被时限掐断。
 	metaPath := strings.TrimSuffix(href, ".tar.gz") + ".json"
 	wantHash := ""
-	if rc, err := c.get(metaPath); err == nil {
+	var estSize int64
+	if rc, err := c.get(metaPath, 0); err == nil {
 		b, _ := io.ReadAll(rc)
 		rc.Close()
 		var meta struct {
 			Sha256 string `json:"sha256"`
+			Bytes  int64  `json:"bytes"`
 		}
 		json.Unmarshal(b, &meta)
 		wantHash = meta.Sha256
+		estSize = meta.Bytes
 	}
 	// 下载到临时文件。
 	tmp, err := os.CreateTemp("", "lr-restore-*.tar.gz")
@@ -264,7 +283,7 @@ func (m *Manager) restoreSnapshot(j *Job, c *webdavClient, href string) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	rc, err := c.get(href)
+	rc, err := c.get(href, estSize)
 	if err != nil {
 		return err
 	}

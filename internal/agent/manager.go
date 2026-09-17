@@ -440,6 +440,7 @@ func (m *Manager) CancelQueued(sessionID string, id int64) error {
 }
 
 // revive 复活死会话:用 DB 里存的 external_id + 设置重新 spawn,挂回 sessions。
+// external_id 为空(CLI 侧还没建过会话)时按新会话起,不报错,见 reviveLocked。
 // 运行中保存的模型/强度/权限(claude 约定"续聊时生效")正是在这里落地。
 // spawn 拿着 Manager 锁:并发复活同一会话只会有一个真跑,其它会话的操作
 // 最多阻塞一个进程启动的功夫(百毫秒级)。
@@ -460,9 +461,12 @@ func (m *Manager) reviveLocked(id string) (*liveSession, error) {
 	if sess == nil {
 		return nil, fmt.Errorf("会话不存在: %s", id)
 	}
-	if sess.ExternalID == "" {
-		return nil, fmt.Errorf("该会话没有可恢复的凭据(进程未成功启动过)")
-	}
+	// external_id 为空 = CLI 侧还没有会话,没有可续的东西,直接新起一个。
+	// claude 的 session_id 要等第一条消息(init)才吐出来,新建会话在发出
+	// 首条消息前 external_id 一直是空 —— 此时改模型/权限会标 stale,下一条
+	// 消息走 restart → 这里。早先这里无条件报"没有可恢复的凭据",正好把
+	// 新建会话改设置的路径整个堵死(用户:进入后改放行,报该会话没有可恢复
+	// 的凭据)。真出错(CLI 起不来)会在时间线上落 error 卡,不怕被吞。
 	cwd, err := m.resolve(sess.Workspace)
 	if err != nil {
 		return nil, err

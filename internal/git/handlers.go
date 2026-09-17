@@ -43,6 +43,25 @@ func (h *Handlers) Init(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
+// Clone 在当前目录上克隆远端仓库(git clone <url> .),返回克隆后的仓库信息。
+// 只读模式下被 allowWrite 拒掉(403),目录已经在仓库里回 409,目录非空回 400。
+func (h *Handlers) Clone(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+		URL  string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	info, err := h.svc.Clone(body.Path, body.URL)
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 	st, err := h.svc.Status(r.URL.Query().Get("path"))
 	if err != nil {

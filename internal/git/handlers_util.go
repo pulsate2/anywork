@@ -24,7 +24,7 @@ func (h *Handlers) httpErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, errEmptyMessage), errors.Is(err, errBadIdentity),
 		errors.Is(err, errInitNotDir), errors.Is(err, errBranchExists):
 		code = http.StatusBadRequest
-	// 409:目录已经是仓库(或在某个仓库里),init 这个动作本身没有意义了。
+	// 409:目录已经是仓库(或在某个仓库里),init/clone 这两个动作本身没有意义了。
 	// 不归 400 是想让前端能分辨"你不必再点了,刷新就能看到仓库"这一种。
 	case errors.Is(err, errAlreadyRepo):
 		code = http.StatusConflict
@@ -32,7 +32,8 @@ func (h *Handlers) httpErr(w http.ResponseWriter, err error) {
 		errors.Is(err, errUnknownStashOp), errors.Is(err, errUnknownWorktreeOp),
 		errors.Is(err, errUnknownRestoreMode), errors.Is(err, errUnknownRevertOp),
 		errors.Is(err, errNoPaths), errors.Is(err, errBadCommitArg),
-		errors.Is(err, errBinaryFile):
+		errors.Is(err, errBinaryFile), errors.Is(err, errBadCloneURL),
+		errors.Is(err, errCloneNotEmpty):
 		code = http.StatusBadRequest
 	}
 	http.Error(w, err.Error(), code)

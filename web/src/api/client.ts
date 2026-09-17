@@ -118,6 +118,8 @@ export const api = {
   gitRepo: (path: string) => request<GitRepo>('GET', `/api/git/repo?path=${encodeURIComponent(path)}`),
   // 在这个目录上 git init。返回初始化之后的仓库信息(分支名由 git 定),可直接顶替 gitRepo 的结果。
   gitInit: (path: string) => request<GitRepo>('POST', '/api/git/init', { path }),
+  // 把远端仓库原地克隆进这个目录(git clone <url> .),同上返回克隆后的仓库信息。
+  gitClone: (path: string, url: string) => request<GitRepo>('POST', '/api/git/clone', { path, url }),
   gitStatus: (path: string) => request<GitStatus>('GET', `/api/git/status?path=${encodeURIComponent(path)}`),
   gitDiff: (path: string, scope: string, file?: string, ref?: string) =>
     requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}`),

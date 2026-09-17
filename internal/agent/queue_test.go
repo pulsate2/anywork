@@ -363,6 +363,96 @@ func TestSettingsRestartStaleSession(t *testing.T) {
 	}
 }
 
+// TestRestartSessionWithoutExternalID 新建的 claude 会话在发出首条消息前
+// external_id 是空的(claude 的 session_id 要等第一条消息的 init 才吐),
+// 此时改模型/权限会标 stale,下一条消息触发 restart → reviveLocked。
+// 回归:早先 reviveLocked 无条件要 external_id,这条路径报"该会话没有可恢复
+// 的凭据(进程未成功启动过)",新建会话从改设置起就废了 —— 用户报的正是
+// 「新建 claude → 进入改放行 → 该会话没有可恢复的凭据」。没有可续的东西
+// 就该新起一个进程,消息照发。
+func TestRestartSessionWithoutExternalID(t *testing.T) {
+	var mu sync.Mutex
+	var made []*fakeDriver
+	newDriver = func(app string) (Driver, error) {
+		fd := &fakeDriver{applyErr: true} // claude 式:运行中改不了
+		mu.Lock()
+		made = append(made, fd)
+		mu.Unlock()
+		return fd, nil
+	}
+	t.Cleanup(func() {
+		newDriver = func(app string) (Driver, error) {
+			switch app {
+			case AppClaude:
+				return newClaudeDriver(), nil
+			case AppCodex:
+				return newCodexDriver(), nil
+			default:
+				return nil, fmt.Errorf("未知 agent: %s", app)
+			}
+		}
+	})
+
+	s := newTestStore(t)
+	sess := createTestSession(t, s) // ExternalID 留空:还没发过消息的新会话
+	m := NewManager(s, "/w", false)
+	// 进程已经在跑(Create 时就 spawn),但 CLI 侧还没建会话。
+	running := &fakeDriver{applyErr: true}
+	ls := &liveSession{
+		id: sess.ID, driver: running,
+		subscribers: map[Subscriber]struct{}{},
+		state:       StatusIdle,
+	}
+	m.mu.Lock()
+	m.sessions[sess.ID] = ls
+	m.mu.Unlock()
+
+	// 改权限为全部放行:落库 + 标 stale。
+	if _, _, note := m.Settings(sess.ID, SettingsUpdate{PermissionMode: PermAccept}); note == "" {
+		t.Fatal("claude 式 driver 改设置应有提示(下一条消息重启)")
+	}
+
+	// 首条消息:stale 触发重启,不能因没有续聊凭据失败。
+	if _, err := m.Send(sess.ID, "第一条"); err != nil {
+		t.Fatalf("新建会话改设置后首条消息不该失败: %v", err)
+	}
+	mu.Lock()
+	n := len(made)
+	var fresh *fakeDriver
+	if n > 0 {
+		fresh = made[n-1]
+	}
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("应新起一个进程,得到 %d 个", n)
+	}
+	if !running.closed {
+		t.Fatal("旧进程应被关闭")
+	}
+	if got := fresh.sent; len(got) != 1 || got[0] != "第一条" {
+		t.Fatalf("新进程应收到「第一条」: %v", got)
+	}
+
+	// 进程又死了(重进页面/服务重启后标死):再发消息走 revive,同样不能
+	// 因为没有 external_id 报错 —— 会话记录在,用户不该被迫删了重建。
+	m.mu.Lock()
+	delete(m.sessions, sess.ID)
+	m.mu.Unlock()
+	if _, err := m.Send(sess.ID, "第二条"); err != nil {
+		t.Fatalf("无凭据的死会话复活不该失败: %v", err)
+	}
+	mu.Lock()
+	n = len(made)
+	fresh = made[n-1]
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("应再起一个进程,共 %d 个", n)
+	}
+	if got := fresh.sent; len(got) != 1 || got[0] != "第二条" {
+		t.Fatalf("复活的新进程应收到「第二条」: %v", got)
+	}
+}
+
 // TestSettingsAcceptAutoApprovePending 运行中切到全部放行立即兑现:落库、
 // 标 stale(下一条消息重启)之外,挂着的询问当场代答 —— Resolve 放行 +
 // permission_result 落库广播,屏上的审批卡随事件收掉,不用等下一轮重启。

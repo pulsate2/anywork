@@ -41,6 +41,70 @@ func (s *Service) Init(p string) (RepoInfo, error) {
 	return s.ResolveToRepo(p)
 }
 
+// Clone 把远端仓库原地克隆进这个目录(git clone <url> .),返回克隆后的仓库信息。
+//
+// 和 Init 一样只用在"当前工作区不是仓库"时:已经是仓库(或在其后代里)就拒绝,
+// 理由同 Init —— 那会留下一个嵌套仓库。
+//
+// 之所以克隆进"." 而不是新建子目录:仓库落地后这个目录本身就是仓库,前端换掉 repoPath
+// 之外不用再切路径;而且和 init 的语义对称(都作用在当前工作区上)。代价是目录必须为空,
+// git clone 对 "." 本来就有这条硬性要求 —— 这里提前判一次,好过让 git 报那句
+// "destination path '.' already exists and is not an empty directory"。
+//
+// 私有仓库要账号密码时走 remoteOpRun:和 push/pull 同一套,broker 非 nil 时会经
+// GIT_ASKPASS 找浏览器弹窗,期间命令阻塞等用户输入。
+func (s *Service) Clone(p, url string) (RepoInfo, error) {
+	if err := s.allowWrite(); err != nil {
+		return RepoInfo{}, err
+	}
+	info, err := s.ResolveToRepo(p)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	if info.Repo {
+		return RepoInfo{}, errAlreadyRepo
+	}
+	// 同 Init:ResolveToRepo 对文件路径会退到它所在的目录,那样克隆出来的位置和用户
+	// 点的东西不是一个,所以明确要求是目录。
+	fi, err := os.Stat(info.Dir)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	if !fi.IsDir() {
+		return RepoInfo{}, errInitNotDir
+	}
+	url, err = checkCloneURL(url)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	entries, err := os.ReadDir(info.Dir)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	if len(entries) > 0 {
+		return RepoInfo{}, errCloneNotEmpty
+	}
+	// "--" 终止选项解析:否则一个 "-" 开头的 url 会被 git 当选项(--upload-pack=… 之类
+	// 能直接执行命令)。checkCloneURL 已经挡了一道,这里是最后一道。
+	if _, err := s.remoteOpRun(info.Dir, "clone", "--", url, "."); err != nil {
+		return RepoInfo{}, err
+	}
+	// 同 Init:分支名和仓库根由 git 定,照抄它的结果。
+	return s.ResolveToRepo(p)
+}
+
+// checkCloneURL 校验并规整 url:空串、以 - 开头的伪选项、ext:: transport 都拒掉,
+// 返回去掉首尾空白的地址(校验用的是它,交给 git 的也得是它,免得两边看到的不一样)。
+// ext:: 那个远程 helper 会执行任意命令;本应用另有终端模块、并非新增暴露面,
+// 但和 checkRefArgs 防选项注入一样,顺手拦掉更稳妥。
+func checkCloneURL(url string) (string, error) {
+	u := strings.TrimSpace(url)
+	if u == "" || strings.HasPrefix(u, "-") || strings.HasPrefix(u, "ext::") {
+		return "", errBadCloneURL
+	}
+	return u, nil
+}
+
 // StageAdd 把 paths 加入暂存(index)。
 func (s *Service) StageAdd(p string, paths []string) error {
 	if err := s.allowWrite(); err != nil {

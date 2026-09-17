@@ -70,6 +70,8 @@ var (
 	errBadRemoteArg       = errors.New("remote name and url required")
 	errBadRefArg          = errors.New("invalid branch or remote name")
 	errBadCommitArg       = errors.New("invalid commit hash")
+	errBadCloneURL        = errors.New("invalid clone url")
+	errCloneNotEmpty      = errors.New("directory not empty")
 	errBinaryFile         = errors.New("binary cannot be read")
 	errNoPaths            = errors.New("no files specified")
 )

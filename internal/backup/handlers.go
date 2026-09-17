@@ -141,7 +141,8 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 		href = remotePath(remoteDirFor(j), snap)
 	}
 	c := newWebdav(j.WebDAVURL, j.WebDAVUser, j.WebDAVPass)
-	rc, err := c.get(href)
+	// 这是给浏览器直接下载的,长度这里没有(要问 PROPFIND),走兜底时限。
+	rc, err := c.get(href, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

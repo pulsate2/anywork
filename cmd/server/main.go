@@ -260,6 +260,7 @@ func (a *App) routes() http.Handler {
 		// Git(里程碑 4)。
 		pr.Get("/api/git/repo", a.git.RepoInfo)
 		pr.Post("/api/git/init", a.git.Init)
+		pr.Post("/api/git/clone", a.git.Clone)
 		pr.Get("/api/git/status", a.git.Status)
 		pr.Get("/api/git/diff", a.git.Diff)
 		pr.Get("/api/git/show", a.git.Show)

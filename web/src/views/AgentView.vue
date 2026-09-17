@@ -1554,7 +1554,7 @@ onBeforeUnmount(() => {
           <div v-else-if="c.kind === 'assistant'" class="agent-plain agent-md-body" v-html="renderMarkdown(c.text || '')" />
           <details v-else-if="c.kind === 'reasoning'" class="reasoning">
             <summary>思考过程{{ c.thinkMs ? ` · ${fmtThink(c.thinkMs)}` : '' }}</summary>
-            <div class="reasoning-body">{{ c.text }}</div>
+            <div class="reasoning-body agent-md-body" v-html="renderMarkdown(c.text || '')" />
           </details>
           <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" @detail="detailCall = $event" />
           <ToolCallCard
@@ -1590,7 +1590,7 @@ onBeforeUnmount(() => {
         <div v-if="streamThink" class="chat-row reasoning">
           <details class="reasoning" open>
             <summary>思考中 · {{ fmtThink(thinkElapsedMs) }}</summary>
-            <div class="reasoning-body">{{ streamThink }}</div>
+            <div class="reasoning-body agent-md-body" v-html="renderMarkdown(streamThink)" />
           </details>
         </div>
         <div v-if="streamText" class="chat-row assistant">
@@ -1642,7 +1642,6 @@ onBeforeUnmount(() => {
       <Composer
         :running="turnState === 'running'"
         :stopping="stopping"
-        :disabled="turnState === 'dead' && !selected.externalId"
         :ask-pending="pendingAsk"
         :sending="sending"
         :session-id="selected.id"
@@ -2163,8 +2162,14 @@ onBeforeUnmount(() => {
 }
 .reasoning[open] summary::before { transform: rotate(90deg); }
 .reasoning-body {
-  white-space: pre-wrap; overflow-wrap: anywhere;
-  max-height: 220px; overflow-y: auto;
+  /* 正文走 markdown(agent-md-body,非 scoped):容器不能留 pre-wrap ——
+     markdown-it 输出的块标签之间带换行,pre-wrap 会把它们渲染成空行。
+     字号/线高在这里压回 12px:scoped 的 .reasoning-body[data-v-x] 特异性
+     高于 .agent-md-body,否则会被它拽到 14px,思考比正文还大。
+     不设 max-height:思考框自己不滚,由时间线统一跟底 —— 内层一旦有
+     独立滚动条,新增内容都落在框的下沿外,外层高度不再变化,
+     scrollBottom 的跟底逻辑就失灵了。 */
+  white-space: normal; font-size: 12px;
   padding: 2px 0 6px; font-style: italic; opacity: .85;
 }
 
