@@ -62,12 +62,14 @@ const deletions = computed(() => rows.value.filter((r) => r.kind === 'del').leng
   overflow: hidden;
 }
 .diff-head {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
   padding: 6px 10px;
   background: rgba(127, 127, 127, .07);
-  font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
+  font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5; color: var(--lr-fg-muted);
 }
-.diff-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 文件名换行显示,不省略:这是弹窗里唯一能认出"改的是哪个文件"的地方,
+   目录长一点(实测 /tmp/claude-0/<uuid>/… )文件名就被省略号吃掉,等于没显示。 */
+.diff-path { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 /* flex: none + nowrap:路径很长时统计徽章不许被压缩成"挤压扁"的一团 */
 .diff-stats { display: flex; gap: 6px; flex: none; }
 .diff-badge { padding: 0 6px; border-radius: 999px; font-size: 10px; line-height: 16px; white-space: nowrap; }

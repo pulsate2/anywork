@@ -56,32 +56,71 @@ function argString(args: Record<string, unknown> | null, keys: string[]): string
   return null
 }
 
-// 敏感内容不进标签(hapi safeGroupedLabelValue:token/密钥形状的值直接弃用)。
-const SENSITIVE_TEXT_RE = /(?:bearer\s+\S+|(?:api[_-]?key|token|password|secret)(?:\s*[:=]\s*\S+|\s+\S{12,})|(?:gh[pousr]_|github_pat_|sk-[a-z0-9_-]*|xox[baprs]-)[a-z0-9_-]{12,}|[a-f0-9]{32,}|[a-z0-9_+/=-]{40,})/i
-const MAX_LABEL = 72
+// 标签只做空白归一 —— 不过滤、不截断、不省略。自用工具,折叠卡里的目标是认出
+// 「这一步干了什么」的唯一线索,藏了等于没有;值长就靠行横向滚动看全。
+function label(v: string | null): string | null {
+  if (!v) return null
+  return v.replace(/\s+/g, ' ').trim() || null
+}
 
-function safeLabel(v: string | null): string | null {
-  if (!v || SENSITIVE_TEXT_RE.test(v)) return null
-  const normalized = v.replace(/\s+/g, ' ').trim()
-  return normalized.length > MAX_LABEL ? `${normalized.slice(0, MAX_LABEL - 1)}…` : normalized
+// 能当一行摘要的字符串:第一个非空字符串值。不做长度/换行过滤 —— 值就是值,
+// 行本身是横向可滚的单行,长就滚着看,不藏。
+function summarizing(v: unknown): string | null {
+  return typeof v === 'string' && v.trim() ? v : null
+}
+
+// 参数键形形色色(每个工具、每个 MCP 各不同),硬编码的键列表必然漏 —— 漏了整行
+// 就没有目标,只剩图标 +「N 行」,点开也认不出是什么(实测 PushNotification、
+// CronCreate 就是这样)。取不到已知键就退到第一个像摘要的字符串值。
+function argLabel(args: Record<string, unknown> | null, keys: string[]): string | null {
+  const hit = label(argString(args, keys))
+  if (hit) return hit
+  if (!args) return null
+  for (const v of Object.values(args)) {
+    const s = summarizing(v)
+    if (s) return s
+  }
+  return null
+}
+
+// ApplyPatch/CodexPatch 的路径在 changes[].path 里(没有 file_path 这种平键)。
+function patchPaths(args: Record<string, unknown> | null): string | null {
+  if (!args || !Array.isArray(args.changes)) return null
+  const out: string[] = []
+  for (const e of args.changes as unknown[]) {
+    if (!e || typeof e !== 'object') continue
+    const o = e as Record<string, unknown>
+    const v = o.path ?? o.file ?? o.filePath ?? o.file_path
+    if (typeof v === 'string' && v) out.push(v)
+  }
+  return out.length ? out.join('、') : null
+}
+
+// CodexDiff 的路径藏在 unified_diff 的 "+++ b/xxx" 头里。
+function diffPath(args: Record<string, unknown> | null): string | null {
+  const t = args?.unified_diff
+  if (typeof t !== 'string') return null
+  const m = t.match(/^\+\+\+ (?:b\/)?([^\t\n]+)/m)
+  return m ? m[1].trim() : null
 }
 
 function basename(v: string): string {
   return v.replace(/\\/g, '/').split('/').filter(Boolean).pop() || v
 }
 
-// 一条工具的目标摘要:按意图取对应字段,取不到给空。
+// 一条工具的目标摘要:按意图取对应字段,取不到退到兜底。
 function callTarget(c: AgentToolCall): string | null {
   const args = parseArgs(c)
   const kind = actionKind(c.tool)
   if (kind === 'read' || kind === 'mutation') {
-    return safeLabel(argString(args, ['file_path', 'path', 'file', 'filePath', 'notebook_path']))
+    return label(argString(args, ['file_path', 'path', 'file', 'filePath', 'notebook_path']))
+      ?? patchPaths(args) ?? diffPath(args) ?? argLabel(args, [])
   }
-  if (kind === 'search') return safeLabel(argString(args, ['pattern', 'query']))
-  if (kind === 'command') return safeLabel(argString(args, ['command', 'cmd']))
-  if (kind === 'web') return safeLabel(argString(args, ['url', 'query']))
-  // other 覆盖子 agent(Agent/Task 的 description)与 TaskOutput(task_id)。
-  return safeLabel(argString(args, ['description', 'file_path', 'path', 'pattern', 'query', 'command', 'url', 'task_id', 'name']))
+  if (kind === 'search') return argLabel(args, ['pattern', 'query'])
+  if (kind === 'command') return argLabel(args, ['command', 'cmd'])
+  if (kind === 'web') return argLabel(args, ['url', 'query'])
+  // other 覆盖子 agent(description/prompt)、MCP 工具、定时任务等。
+  return argLabel(args, ['description', 'prompt', 'message', 'file_path', 'path', 'pattern', 'query', 'command', 'url', 'task_id', 'name', 'target'])
 }
 
 // 主导意图:组内出现最多的类型(平票先到先得,hapi getPrimaryIntent 同款)。
@@ -103,7 +142,7 @@ const primaryKind = computed<Kind>(() => {
 // 的具体目标(查看/编辑 xxx、搜索 pattern)→ 主导意图标签。
 const title = computed(() => {
   for (const c of props.calls) {
-    const d = safeLabel(argString(parseArgs(c), ['description']))
+    const d = label(argString(parseArgs(c), ['description']))
     if (d) return d
   }
   const matching = props.calls.filter((c) => actionKind(c.tool) === primaryKind.value)
@@ -120,7 +159,8 @@ const title = computed(() => {
   return KIND_LABEL[primaryKind.value]
 })
 
-// 摘要行:单一类型时列目标(基名去重),混排时列各类型计数(hapi 副标题同款)。
+// 摘要行:单一类型时列全部目标(不去基名、不"等 N 项"—— 折叠状态下这行是
+// 唯一能看出组里干了什么的地方,排不下就横向滚),混排时列各类型计数。
 const brief = computed(() => {
   const kinds = new Set(props.calls.map((c) => actionKind(c.tool)))
   if (kinds.size > 1) {
@@ -133,12 +173,7 @@ const brief = computed(() => {
     return parts.join(' · ')
   }
   const uniq = [...new Set(props.calls.map((c) => callTarget(c)).filter((v): v is string => !!v))]
-  if (!uniq.length) return ''
-  const named = primaryKind.value === 'read' || primaryKind.value === 'mutation'
-    ? uniq.map((v) => basename(v)) : uniq
-  const u = [...new Set(named)]
-  if (u.length <= 3) return u.join('、')
-  return `${u.slice(0, 2).join('、')} 等 ${u.length} 项`
+  return uniq.join('、')
 })
 
 const state = computed(() =>
@@ -155,8 +190,8 @@ const state = computed(() =>
 function rowTarget(c: AgentToolCall): string {
   if (actionKind(c.tool) === 'search') {
     const args = parseArgs(c)
-    const pattern = safeLabel(argString(args, ['pattern', 'query']))
-    const path = safeLabel(argString(args, ['path', 'file_path']))
+    const pattern = argLabel(args, ['pattern', 'query'])
+    const path = label(argString(args, ['path', 'file_path']))
     return [pattern, path].filter(Boolean).join(' · ')
   }
   return callTarget(c) || ''
@@ -177,7 +212,9 @@ function rowTarget(c: AgentToolCall): string {
       <button v-for="(c, i) in calls" :key="c.toolUseId || i" type="button" class="group-item" @click="emit('detail', c)">
         <span class="item-state" :class="c.state"><ToolStatusIcon :state="c.state || 'ok'" /></span>
         <span class="item-icon"><component :is="toolCategoryIcon(c.tool)" /></span>
-        <span v-if="!hasToolCategory(c.tool)" class="item-name">{{ c.tool || '工具' }}</span>
+        <!-- 拿不到目标(参数缺失/事件被分页截断)时把工具名补上:不能只留一枚
+             图标 +「N 行」——那行就认不出来了 -->
+        <span v-if="!hasToolCategory(c.tool) || !rowTarget(c)" class="item-name">{{ c.tool || '工具' }}</span>
         <span v-if="rowTarget(c)" class="item-target">{{ rowTarget(c) }}</span>
         <span v-if="c.result" class="item-lines">{{ c.result.trim().split('\n').length }} 行</span>
       </button>
@@ -214,7 +251,8 @@ function rowTarget(c: AgentToolCall): string {
 .group-state svg, .item-state svg, .item-icon svg { width: 100%; height: 100%; display: block; }
 .group-state.ok { color: var(--lr-ok); }
 .group-state.error { color: var(--lr-danger); }
-.group-title { flex: none; font-weight: 600; font-size: 12px; }
+/* 标题是组里第一条工具的 description 原文,不截断:长了就换行,别撑破卡头 */
+.group-title { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; font-weight: 600; font-size: 12px; }
 .group-brief {
   min-width: 0; flex: 1;
   white-space: nowrap;

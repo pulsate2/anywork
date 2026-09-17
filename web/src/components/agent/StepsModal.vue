@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 子 agent 过程弹窗:左右两栏 —— 左栏步骤列表(单行紧凑:工具步 = 状态图标
-// + 分类图标 + 摘要省略号;文本步 = 气泡图标 + 首行预览),右栏选中步骤的
+// 子 agent 过程弹窗:左右两栏 —— 左栏步骤列表(紧凑:工具步 = 状态图标
+// + 分类图标 + 摘要;文本步 = 气泡图标 + 首行预览),右栏选中步骤的
 // 详情(工具步走 ToolDetailBody:diff/参数/结果;文本步按 markdown 渲染正文,
 // hapi trace 的 Message 同款)。替代原先嵌在 Task 卡里上下堆叠的过程列表
 // (每条两行,太占位置)。
@@ -111,9 +111,11 @@ function stepBrief(c: AgentToolCall): string {
   padding: 16px 8px; text-align: center;
   font-size: 12px; color: var(--lr-fg-muted);
 }
-/* 单条:状态图标 + 分类图标 + 摘要(超长省略号,详情点开看) */
+/* 单条:状态图标 + 分类图标 + 摘要。摘要【不省略】:文件路径/命令换行铺开 ——
+   省略号一吃,左栏就认不出这步看的是哪个文件(详情虽在右栏,但左栏是选哪一条
+   的依据)。行高随内容长,所以图标改跟首行对齐。 */
 .steps-md-item {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: flex-start; gap: 6px;
   width: 100%; min-height: 34px; padding: 5px 8px;
   appearance: none; border: 0; background: transparent;
   font: inherit; font-size: 12px; color: var(--lr-fg);
@@ -123,15 +125,16 @@ function stepBrief(c: AgentToolCall): string {
 .steps-md-item + .steps-md-item { border-top: 1px solid rgba(127, 127, 127, .08); }
 .steps-md-item:hover { background: rgba(127, 127, 127, .06); }
 .steps-md-item.active { background: rgba(37, 99, 235, .1); }
-.steps-md-state { flex: none; width: 12px; height: 12px; color: var(--lr-ok); }
+/* 图标槽跟摘要首行对齐(摘要可能换行成多行,居中的话图标会飘到中间) */
+.steps-md-state { flex: none; width: 12px; height: 12px; margin-top: 2px; color: var(--lr-ok); }
 .steps-md-state.error { color: var(--lr-danger); }
 .steps-md-state.running { color: var(--lr-fg-muted); }
-.steps-md-icon { flex: none; width: 12px; height: 12px; color: var(--lr-fg-muted); }
+.steps-md-icon { flex: none; width: 12px; height: 12px; margin-top: 2px; color: var(--lr-fg-muted); }
 .steps-md-state svg, .steps-md-icon svg { width: 100%; height: 100%; display: block; }
 .steps-md-name { flex: none; font-family: ui-monospace, monospace; font-size: 11px; }
 .steps-md-brief {
   min-width: 0; flex: 1;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  overflow-wrap: anywhere; line-height: 1.45;
   font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
 }
 .steps-md-item.active .steps-md-brief { color: var(--lr-fg); }

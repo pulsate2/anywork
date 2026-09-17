@@ -16,6 +16,22 @@ type bufCloser struct{ bytes.Buffer }
 
 func (b *bufCloser) Close() error { return nil }
 
+// drainRunning 吃掉主 agent 输出触发的那条 running 状态事件。回合状态与
+// 下面各用例断言的事件序列无关,但每个回合的第一条事件就是它(见
+// claudeDriver.markRunning)—— 不先吃掉,序列断言会整体错位一格。
+func drainRunning(t *testing.T, d *claudeDriver) {
+	t.Helper()
+	select {
+	case ev := <-d.events:
+		sp, ok := ev.Payload.(*StatusPayload)
+		if ev.Kind != KindStatus || !ok || sp.State != StatusRunning {
+			t.Fatalf("首条应是 running 状态,得到 %s(%+v)", ev.Kind, ev.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("2 秒内没等到 running 状态")
+	}
+}
+
 // TestClaudeCompactionBoundary 喂合成 stream-json 的 compact_boundary /
 // microcompact_boundary 行,验证归一成 KindCompaction 且 token 字段不丢。
 func TestClaudeCompactionBoundary(t *testing.T) {
@@ -217,6 +233,7 @@ func TestClaudeStreamEvent(t *testing.T) {
 		`{"type":"stream_event","event":{"type":"message_stop"}}`,
 	}
 	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	drainRunning(t, d)
 
 	type want struct {
 		kind    string
@@ -239,6 +256,57 @@ func TestClaudeStreamEvent(t *testing.T) {
 	select {
 	case ev := <-d.events:
 		t.Fatalf("不该再透出事件: %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestClaudeRunningOnSelfInitiatedTurn 没经过 Send 的自起回合也要标"进行中"。
+// 后台任务完成时 CLI 会注入通知并自己接着跑一个回合(Monitor 唤醒、队列消息
+// 被 absorbed_mid_turn 吸收同理),这条路径上没有 Send,早先只有 Send 会发
+// running —— 于是主回合结束后界面永远停在"在线",后续消息再多也不动。回归:
+// 主 agent 一冒输出就补发 running(幂等,一回合一条),result 收尾后重新计。
+func TestClaudeRunningOnSelfInitiatedTurn(t *testing.T) {
+	d := newClaudeDriver()
+	lines := []string{
+		// 第一回合:走正常路径(Send 已发过 running,这里由 assistant 补发,
+		// 幂等去重后仍只有一条)。
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"第一回合"}]}}`,
+		`{"type":"result","duration_ms":1000,"usage":{"input_tokens":10,"output_tokens":2}}`,
+		// 后台任务完成:CLI 注入通知并接着跑第二回合 —— 全程没有 Send。
+		`{"type":"user","message":{"role":"user","content":"<task-notification>\n<summary>后台任务完成</summary>\n<status>completed</status>\n</task-notification>"}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"接上"}}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"第二回合"}]}}`,
+		`{"type":"result","duration_ms":500,"usage":{"input_tokens":20,"output_tokens":2}}`,
+	}
+	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+
+	// 只挑 status 事件(正文/用量/时长行不参与断言)。
+	var got []string
+	for len(got) < 4 {
+		select {
+		case ev := <-d.events:
+			if ev.Kind != KindStatus {
+				continue
+			}
+			sp, ok := ev.Payload.(*StatusPayload)
+			if !ok {
+				t.Fatalf("status 负载类型 %T", ev.Payload)
+			}
+			got = append(got, sp.State)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("状态序列没收齐: %v", got)
+		}
+	}
+	want := []string{StatusRunning, StatusIdle, StatusRunning, StatusIdle}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("状态序列 = %v,想要 %v", got, want)
+		}
+	}
+	// 不能有多余的状态:一个回合一条 running(两次 assistant 输出不重复发)。
+	select {
+	case ev := <-d.events:
+		t.Fatalf("不该再有事件: %s(%+v)", ev.Kind, ev.Payload)
 	case <-time.After(150 * time.Millisecond):
 	}
 }
@@ -351,6 +419,7 @@ func TestClaudeSidechainFiltered(t *testing.T) {
 		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t-main","content":"调研结论:可以"}]}}`,
 	}
 	go d.readStdout(strings.NewReader(strings.Join(lines, "\n") + "\n"))
+	drainRunning(t, d)
 
 	// 主时间线两张卡(Task 运行中 → 完成),子 agent 的工具调用与叙述文本
 	// 挂 parent id 穿插其间(文本作为 Text 步进过程),思考/usage 不露面。
@@ -433,7 +502,7 @@ func TestClaudeSubagentApprovalParent(t *testing.T) {
 			select {
 			case ev := <-d.events:
 				if ev.Kind != KindPermissionReq {
-					if ev.Kind != KindToolCall {
+					if ev.Kind != KindToolCall && ev.Kind != KindStatus {
 						t.Fatalf("意外事件: %s(%+v)", ev.Kind, ev.Payload)
 					}
 					continue

@@ -108,6 +108,50 @@ describe('ToolGroupCard 行点击', () => {
     expect(targets[1].text()).toBe('TODO · /root/anywork/src')
     expect(targets[2].text()).toBe('**/*.spec.ts')
   })
+
+  // 回归:折叠卡里【什么都不藏】—— 用户明确要求(自用工具,不要安全过滤)。
+  // 曾经:UUID 目录 / 长文件名被「长随机串 = 密钥」的启发式吞掉,整行只剩
+  // 「N 行」;命令超 72 字符被截断。现在原样显示,靠行横向滚动看全。
+  it('什么都不藏:UUID 目录、命令里的长裸串都照原样显示', async () => {
+    const taskPath = '/tmp/claude-0/-root-gittest2/d6a4d8cd-a9e6-4939-a802-ca5f8d5aa9fc/tasks/blldv2me6.output'
+    const cmd = 'export K=$(cat /root/token_abcdefghijklmnopqrstuvwxyz0123456789)'
+    const w = mount(ToolGroupCard, { props: { calls: [
+      { tool: 'Read', toolUseId: 'r1', args: `{"file_path":"${taskPath}"}`, state: 'ok' as const, result: 'a\nb\nc' },
+      { tool: 'Bash', toolUseId: 'b1', args: JSON.stringify({ command: cmd }), state: 'ok' as const, result: 'x' },
+    ] } })
+    await w.find('.group-head').trigger('click')
+    const targets = w.findAll('.group-item .item-target')
+    expect(targets[0]!.text()).toBe(taskPath)
+    expect(w.find('.group-title').text()).toContain('blldv2me6.output')
+    expect(w.findAll('.group-item .item-lines')[0]!.text()).toBe('3 行')
+    expect(targets[1]!.text()).toBe(cmd)
+  })
+
+  // 参数键千奇百怪(每个工具/MCP 各不同),键表必然漏。漏了就退到第一个字符串
+  // 值,而不是留一行没有目标的图标(实测 PushNotification / CronCreate 就是空的)。
+  it('键表没覆盖的工具:退到第一个字符串值,不留空行', async () => {
+    const w = mount(ToolGroupCard, { props: { calls: [
+      { tool: 'PushNotification', toolUseId: 'p1', args: '{"message":"推送测试:收到请留意","status":"proactive"}', state: 'ok' as const, result: 'ok' },
+      { tool: 'CronCreate', toolUseId: 'c1', args: '{"cron":"*/5 * * * *","prompt":"喝水提醒"}', state: 'ok' as const, result: 'ok' },
+      { tool: 'ApplyPatch', toolUseId: 'a1', args: '{"changes":[{"path":"/root/a.ts","kind":{"type":"add"},"diff":"x"}]}', state: 'ok' as const, result: 'ok' },
+    ] } })
+    await w.find('.group-head').trigger('click')
+    const targets = w.findAll('.group-item .item-target')
+    expect(targets[0]!.text()).toBe('推送测试:收到请留意')
+    expect(targets[1]!.text()).toBe('喝水提醒')
+    expect(targets[2]!.text()).toBe('/root/a.ts')
+  })
+
+  // 参数整个丢了(事件被分页截断在工具行前面)时退到工具名:只剩一枚图标 +
+  // 「N 行」的话,这行到底执行了什么就完全认不出了。
+  it('参数缺失时退到工具名', async () => {
+    const w = mount(ToolGroupCard, { props: { calls: [
+      { tool: 'Bash', toolUseId: 'b2', args: '', state: 'ok' as const, result: 'ok' },
+    ] } })
+    await w.find('.group-head').trigger('click')
+    expect(w.find('.group-item .item-target').exists()).toBe(false)
+    expect(w.find('.group-item .item-name').text()).toBe('Bash')
+  })
 })
 
 // hapi 同款图标样式:分类图标替代文字工具名(读/写/命令有专属图标,

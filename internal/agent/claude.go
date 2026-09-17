@@ -69,6 +69,11 @@ type claudeDriver struct {
 	// 错误已从那条路透出)。ExitDetail 据此去重:崩溃退出(没 result 行)
 	// 才补 stderr 尾部,免得 resume 失败报两张重复的错误卡。
 	sawResult atomic.Bool
+	// running 本回合的 running 状态是否已发过(去重:一条 running 只在回合
+	// 第一次冒出主 agent 输出时发)。不能只靠 Send 发 —— CLI 自己也会起回合
+	// (后台任务完成注入通知、队列消息被 absorbed_mid_turn 吸收、Monitor 事件
+	// 唤醒),那些回合 Send 根本没被调用,状态会一直停在"在线"。
+	running bool
 
 	events   chan Event
 	done     chan struct{}
@@ -223,7 +228,7 @@ func (d *claudeDriver) Send(text string) error {
 		return fmt.Errorf("会话未运行")
 	}
 	// 回合开始:状态事件先于正文入队,Manager 落库时把会话置 running。
-	d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
+	d.markRunningLocked()
 	msg := map[string]any{
 		"type":    "user",
 		"message": map[string]any{"role": "user", "content": text},
@@ -360,6 +365,23 @@ func (d *claudeDriver) emit(ev Event) {
 		// 订阅端(Manager.pump)消费停滞时丢消息比卡死 driver 好:
 		// 消息不落库就丢了,但历史还能靠 claude 原生转录续聊找回。
 	}
+}
+
+// markRunningLocked 回合开跑:每个回合只发一次 running,幂等。
+// 调用方须持有 d.mu。
+func (d *claudeDriver) markRunningLocked() {
+	if d.running {
+		return
+	}
+	d.running = true
+	d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
+}
+
+// markRunning 同上,自己拿锁(主 agent 冒出输出时调)。
+func (d *claudeDriver) markRunning() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.markRunningLocked()
 }
 
 func (d *claudeDriver) waitExit() {
@@ -691,6 +713,11 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 				continue
 			}
 			if msg.Type == "assistant" {
+				// 主 agent 冒输出 = 回合在跑:CLI 自己起的回合(后台任务完成
+				// 注入通知、Monitor 唤醒、队列消息被吸收)也走这里,补上 Send
+				// 不会发的那条 running,否则界面一直停在"在线"(幂等)。
+				// 回显那条 user 不发:回合一定有 assistant 输出在前,不必重复。
+				d.markRunning()
 				d.handleAssistant(msg.Message)
 			} else {
 				d.handleUserEcho(msg.Message)
@@ -699,6 +726,10 @@ func (d *claudeDriver) readStdout(r io.Reader) {
 			d.handleStreamEvent(msg)
 		case "result":
 			d.sawResult.Store(true)
+			// 回合收尾:下一条主 agent 输出要重新发一次 running。
+			d.mu.Lock()
+			d.running = false
+			d.mu.Unlock()
 			// 打断的回合也是 is_error,但没有任何文本:用户自己按的中断,
 			// 不报错(报了也是空 message 的错误卡)。真失败带 result 文本;
 			// resume 失败(error_during_execution)的文本在 errors 数组里。
@@ -1074,6 +1105,9 @@ func (d *claudeDriver) handleStreamEvent(msg claudeLine) {
 	if msg.ParentToolUseID != "" || len(msg.Event) == 0 {
 		return
 	}
+	// 主 agent 的流式增量先于完整 assistant 消息到达:在这里就翻成"进行中",
+	// 否则长思考/长正文那几秒界面还是"在线"(子 agent 的流上面已经挡掉)。
+	d.markRunning()
 	var ev claudeStreamEvent
 	if err := json.Unmarshal(msg.Event, &ev); err != nil || ev.Type != "content_block_delta" || ev.Delta == nil {
 		return

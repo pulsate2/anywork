@@ -51,19 +51,34 @@ function parseArgsLenient(c: AgentToolCall | null): Record<string, unknown> | nu
 }
 
 // 摘要行给一眼能认出的关键参数:命令(Bash 的 command)、路径、文件名。
+// 这些键都没有时【不】退到"第一个值"——那只会显示一个孤零零的 ok / true 之类,
+// 认不出是什么(用户实测)。交给 command 走原文:整个参数 JSON 摆出来,不藏。
 const brief = computed(() => {
   const args = parseArgs(props.call)
   if (!args) return ''
-  for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'task_name', 'description', 'task_id', 'target', 'message']) {
+  for (const key of ['command', 'file_path', 'path', 'notebook_path', 'pattern', 'url', 'query', 'task_name', 'description', 'message', 'prompt', 'task_id', 'target']) {
     if (typeof args[key] === 'string' && (args[key] as string)) return args[key] as string
   }
-  const first = Object.values(args)[0]
-  if (typeof first === 'string' && first) return first
   return ''
 })
 
 // 完整命令/参数值:能解析出 command 等关键值就单取它,解析不出再贴 args 原文。
 const command = computed(() => brief.value || props.call?.args || '')
+
+// 纯查看类工具的路径:这类调用的参数主体就是文件路径,单独拎成标题行显示
+// (见模板 .tool-path),而不是当"命令"塞进灰底参数块 —— 弹窗里得一眼看见
+// 看的是哪个文件,长路径换行铺开,不省略。
+const PATH_TOOLS = ['Read', 'NotebookRead', 'LS', 'view_image']
+const readPath = computed(() => {
+  const c = props.call
+  if (!c || !PATH_TOOLS.includes(c.tool)) return ''
+  const args = parseArgsLenient(c)
+  for (const k of ['file_path', 'notebook_path', 'path', 'target']) {
+    const v = args?.[k]
+    if (typeof v === 'string' && v) return v
+  }
+  return ''
+})
 
 // ---- 编辑类工具的 diff ----
 interface DiffBlock { old: string; new: string; path?: string }
@@ -195,6 +210,7 @@ const lightboxOpen = computed({
 
 <template>
   <div class="tool-detail">
+    <div v-if="readPath" class="tool-path">{{ readPath }}</div>
     <template v-if="diffBlocks">
       <DiffView
         v-for="(b, i) in diffBlocks" :key="i"
@@ -206,7 +222,8 @@ const lightboxOpen = computed({
     <div v-else-if="patchFiles" class="patch-files">
       <div v-for="(f, i) in patchFiles" :key="i" class="patch-file">{{ f }}</div>
     </div>
-    <pre v-else-if="command" class="tool-block">{{ command }}</pre>
+    <!-- 路径已提成上面的标题行,这里不再重复一遍 -->
+    <pre v-else-if="command && !readPath" class="tool-block">{{ command }}</pre>
     <pre v-if="call?.result" class="tool-block result">{{ call.result }}</pre>
     <div v-else-if="call?.state === 'running'" class="tool-wait">等待结果…</div>
     <div v-if="imageUrls.length" class="tool-imgs">
@@ -233,6 +250,16 @@ const lightboxOpen = computed({
   color: var(--lr-fg);
 }
 .tool-modal .tool-block.result { background: rgba(127, 127, 127, .06); }
+/* 查看类工具的文件路径(相当于 Edit 的 diff 头):长路径换行铺开,不省略 ——
+   省略号一吃,弹窗里就认不出看的是哪个文件了。 */
+.tool-modal .tool-path {
+  padding: 6px 10px;
+  border: 1px solid rgba(127, 127, 127, .14); border-radius: var(--lr-radius);
+  background: rgba(127, 127, 127, .07);
+  font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5;
+  color: var(--lr-fg-muted);
+  overflow-wrap: anywhere;
+}
 .tool-modal .tool-wait { padding: 8px 10px; font-size: 12px; color: var(--lr-fg-muted); }
 .tool-modal .patch-files { display: flex; flex-direction: column; gap: 4px; }
 .tool-modal .patch-file {
