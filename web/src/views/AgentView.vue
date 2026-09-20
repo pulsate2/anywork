@@ -6,7 +6,7 @@ import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
 import { AddOutline, CheckboxOutline, CopyOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
-import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentResumableSession, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
+import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentReasoning, type AgentResumableSession, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
 import { useImmersive } from '@/utils/immersive'
@@ -32,8 +32,10 @@ const selected = computed(() => sessions.value.find((s) => s.id === selectedId.v
 // 聊天打开 → 沉浸模式(导航滑走);返回列表即退出。视图卸载时在 onBeforeUnmount 兜底复位。
 watch(selectedId, (v) => { immersive.value = !!v })
 
-async function loadSessions() {
-  loading.value = true
+// quiet:后台静默刷新(切回前台时用),不翻 loading —— 列表本来就是有内容的,
+// 闪一下转圈反而像重新加载。
+async function loadSessions(quiet = false) {
+  if (!quiet) loading.value = true
   try {
     sessions.value = await api.agentSessions()
   } catch (e: any) {
@@ -103,8 +105,9 @@ interface Card {
   key: string
   kind: 'user' | 'assistant' | 'reasoning' | 'tool' | 'toolgroup' | 'approval' | 'askuser' | 'error' | 'system'
   text?: string
-  // 思考块的生成耗时(相邻事件的 createdAt 差):claude code 的思考
-  // 过程摘要在收尾时同样报时长,这里对齐。
+  // 思考块的生成耗时。优先用服务端落库时记下的实测值(payload.durationMs),
+  // 老数据没有时回退到相邻事件的 createdAt 差 —— claude code 的思考过程摘要
+  // 在收尾时同样报时长,这里对齐。
   thinkMs?: number
   call?: AgentToolCall
   // 系统提示线(上下文压缩/api_error/回合统计等):居中淡色一行,不占聊天气泡。
@@ -281,23 +284,38 @@ const cards = computed<Card[]>(() => {
       case 'assistant_text':
         if (typeof ev.payload === 'string' && ev.payload) out.push({ key: `m${ev.seq}`, kind: 'assistant', text: ev.payload })
         break
-      case 'reasoning':
-        // 思考耗时 = 生成跨度:前一条事件(用户消息/权限答复/上一工具)到
-        // 本条的时间差。不能量"本条→下一条"—— thinking 完整消息与其后的
-        // 正文/工具调用同一秒落库,那个差恒为 0(DB 实测)。
-        if (typeof ev.payload === 'string' && ev.payload) {
-          let ms = 0
-          for (let j = i - 1; j >= 0; j--) {
-            const prev = messages.value[j]
-            if (prev.kind === 'reasoning_delta' || prev.kind === 'assistant_delta') continue
-            const t0 = Date.parse(prev.createdAt)
-            const t1 = Date.parse(ev.createdAt)
-            if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) ms = t1 - t0
-            break
+      case 'reasoning': {
+        // 耗时优先用服务端记下的实测值:Manager 在思考段收尾时把「首个思考增量
+        // → 完整思考块落库」的跨度写进 payload.durationMs(见 internal/agent
+        // 的 pump)。它不受 created_at 秒精度、也不受中途穿插的子 agent 通知影响。
+        // 老数据是裸字符串(那时没记起点),回退到推算:前一条事件(用户消息/
+        // 权限答复/上一工具)到本条的时间差。不能量"本条→下一条"—— thinking
+        // 完整消息与其后的正文/工具调用同一秒落库,那个差恒为 0(DB 实测)。
+        // created_at 是秒精度(RFC3339),短思考常与上一条事件同秒:此时差为 0,
+        // 但"有上一条可量"本身就该报时间(fmtThink 兜底报 1 秒),不能用真值
+        // 判空 —— 否则卡片只剩"思考过程"四个字(实测 103 条里踩中 13 条)。
+        const rp = ev.payload
+        const text = typeof rp === 'string' ? rp : (rp as AgentReasoning | null)?.text
+        if (typeof text === 'string' && text) {
+          let thinkMs: number | undefined
+          if (typeof rp === 'object' && rp !== null && typeof (rp as AgentReasoning).durationMs === 'number') {
+            thinkMs = (rp as AgentReasoning).durationMs
           }
-          out.push({ key: `m${ev.seq}`, kind: 'reasoning', text: ev.payload, thinkMs: ms })
+          if (thinkMs == null) {
+            for (let j = i - 1; j >= 0; j--) {
+              const prev = messages.value[j]
+              if (prev.kind === 'reasoning_delta' || prev.kind === 'assistant_delta') continue
+              const t0 = Date.parse(prev.createdAt)
+              const t1 = Date.parse(ev.createdAt)
+              if (Number.isFinite(t0) && Number.isFinite(t1)) thinkMs = Math.max(0, t1 - t0)
+              break
+            }
+          }
+          out.push({ key: `m${ev.seq}`, kind: 'reasoning', text, thinkMs })
         }
         break
+      }
+
       case 'error': {
         const p = ev.payload as { message?: string } | null
         // message 为空时不能拿 payload 对象兜底 —— 模板插值对象会渲染成
@@ -691,7 +709,10 @@ watch(streamThink, (v, old) => {
     // Date.now() 只差首字延迟,那也是 agent 在干活的时间,算进去更诚实。
     const last = messages.value[messages.value.length - 1]
     const t0 = last?.createdAt ? Date.parse(last.createdAt) : NaN
-    thinkStartAt.value = Number.isFinite(t0) ? t0 : Date.now()
+    // 夹到本地当下:created_at 是秒精度、又来自另一台机器,服务器时钟万一走在
+    // 前面,起点落到未来会被 max(0,…) 夹在 0 —— 读数看着就是卡死的。宁可少算
+    // 首字那点时间,也不能不动。
+    thinkStartAt.value = Number.isFinite(t0) ? Math.min(t0, Date.now()) : Date.now()
     thinkNow.value = Date.now()
     thinkTimer = setInterval(() => { thinkNow.value = Date.now() }, 1000)
   } else if (!v && thinkTimer) {
@@ -714,9 +735,19 @@ const ws = new AgentWS((e) => {
       else streamThink.value += t
       return
     }
-    // 任何持久化事件都意味着当前流式块已收尾(完整消息就是下一个事件)。
-    streamText.value = ''
-    streamThink.value = ''
+    // 收尾事件(完整消息、工具调用、错误…)清掉直播缓冲区,但有些事件不结束
+    // 当前的生成块:子 agent 通知(task_notification)、API 重试进度(api_error)
+    // 与 running 状态 —— 它们常在思考进行中穿插到达(子 agent 跑着时通知每
+    // 1-2 秒一条)。清了不只是直播卡闪断:下一个增量会以"刚刚"为起点重新起表,
+    // 秒表读数就永远停在 1 秒、再也不涨。
+    const midStream = ev.kind === 'queued_add' || ev.kind === 'queued_remove'
+      || (ev.kind === 'status' && (ev.payload as { state?: string } | null)?.state === 'running')
+      || (ev.kind === 'system_info'
+        && ['task_notification', 'api_error'].includes((ev.payload as { type?: string } | null)?.type || ''))
+    if (!midStream) {
+      streamText.value = ''
+      streamThink.value = ''
+    }
     // 排队消息的入队/出队:不落库(无 seq),不走 seq 去重。出队有两种
     // 来源 —— 服务端回合结束放行(随后的 user 事件照常到达)与撤回。
     if (ev.kind === 'queued_add') {
@@ -759,17 +790,66 @@ function markDead(id: string) {
   // 排队消息不清:队列在服务端持久化,会话复活后回合结束会接着放行。
 }
 
+// 补差一页的服务端上限(handler:limit>1000 不合法,回落到 200)。断线久了
+// ——手机切后台几十分钟——丢的推送远超一页,只补一页会把时间线永远卡在切走
+// 那一刻:补回来的最后一条与随后到达的实时推送之间隔着一整个空洞,画面上
+// 就是"还在冒切出去那会儿的消息"。必须循环拉到追平(不满一页即到底)。
+const CATCHUP_PAGE = 1000
+
 async function catchUp() {
   const id = selectedId.value
   if (!id) return
   try {
-    const got = await api.agentMessages(id, { afterSeq: maxSeq.value })
-    for (const ev of got) {
-      if (ev.seq > maxSeq.value) messages.value.push(ev)
+    for (;;) {
+      const after = maxSeq.value
+      const got = await api.agentMessages(id, { afterSeq: after, limit: CATCHUP_PAGE })
+      // 补差期间用户换了会话:这批事件不属于当前时间线,丢弃重来。
+      if (selectedId.value !== id) return
+      for (const ev of got) {
+        if (ev.seq > maxSeq.value) messages.value.push(ev)
+      }
+      // 补到了落库消息 = 切走时那段流式已经收尾:清掉瞬态缓冲区。否则残留的
+      // 半截文字会跟完整消息并排显示,而且 agent 早已跑完、不再有事件来清它。
+      if (got.length) { streamText.value = ''; streamThink.value = '' }
+      // 不满一页 = 追平;maxSeq 没前进 = 补回来的全是已有事件,保底断循环。
+      if (got.length < CATCHUP_PAGE || maxSeq.value <= after) break
+      // 一页上千条,让出一帧再拉下一页:手机上别把主线程堵死。
+      await nextTick()
     }
     // 排队事件不落库,seq 补差找不回:断线期间的入队/放行/撤回重拉一遍。
     queued.value = await api.agentQueue(id)
   } catch { /* 下次重连再补 */ }
+}
+
+// ---- 切后台回来 ----
+// 手机切走一段时间再回来:后台期间 WS 多半已经断了,而且常常是半开的 ——
+// readyState 还报 OPEN、onclose 不触发,于是既不重连也不补差,时间线就停在
+// 切走那一刻(与 TerminalView 同款问题,那里靠 probe 探活)。
+// 这里不看连接状态,直接换一条新连接:半开连接接收缓冲里压着的旧流式增量
+// 也一并丢掉,老老实实按 seq 从库里重放 —— 否则那些增量会在回来后一次性
+// "流"出来,把切走那段又演一遍,而 agent 其实早跑到后面去了。
+// 有些 WebView / iOS 从后台回来只报 focus 不报 visibilitychange,两个都听;
+// 1 秒内只当一次,桌面上来回切窗口不至于反复重连。
+let resumeAt = 0
+// 真被切到后台过(手机切走 / 桌面切标签页)才换连接:半开连接只有拆掉重连
+// 才能救。只是窗口失焦又回来(桌面 Alt-Tab)时连接好着呢,补一次差就够。
+let wasHidden = false
+function onVisibility() {
+  if (document.hidden) { wasHidden = true; return }
+  onResume()
+}
+function onResume() {
+  if (document.hidden) return
+  const now = Date.now()
+  if (now - resumeAt < 1000) return
+  resumeAt = now
+  if (wasHidden) {
+    wasHidden = false
+    ws.connect() // onopen → 重订阅 + catchUp
+  } else if (selectedId.value) {
+    catchUp() // 连接还在,只把断档补上
+  }
+  loadSessions(true) // 后台期间的状态/标题变化补上
 }
 
 // ---- 会话打开/关闭 ----
@@ -1392,9 +1472,17 @@ onMounted(async () => {
   // watch:观察全部会话状态,列表的运行/空闲/结束点实时刷新(不只当前会话)。
   ws.connect()
   ws.watch()
+  // 手机切后台被断网(且多半是半开连接),回来时靠这几个事件把连接和时间线拉回来。
+  // visibilitychange 两向都要收:切走时记下"真的离开过",回来才能判断要不要重连。
+  document.addEventListener('visibilitychange', onVisibility)
+  window.addEventListener('focus', onResume)
+  window.addEventListener('online', onResume)
   await Promise.all([loadSessions(), wsStore.ensure()])
 })
 onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onVisibility)
+  window.removeEventListener('focus', onResume)
+  window.removeEventListener('online', onResume)
   ws.close()
   immersive.value = false
   window.clearTimeout(copyTimer)
@@ -1553,7 +1641,7 @@ onBeforeUnmount(() => {
           </div>
           <div v-else-if="c.kind === 'assistant'" class="agent-plain agent-md-body" v-html="renderMarkdown(c.text || '')" />
           <details v-else-if="c.kind === 'reasoning'" class="reasoning">
-            <summary>思考过程{{ c.thinkMs ? ` · ${fmtThink(c.thinkMs)}` : '' }}</summary>
+            <summary>思考过程{{ c.thinkMs != null ? ` · ${fmtThink(c.thinkMs)}` : '' }}</summary>
             <div class="reasoning-body agent-md-body" v-html="renderMarkdown(c.text || '')" />
           </details>
           <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" @detail="detailCall = $event" />

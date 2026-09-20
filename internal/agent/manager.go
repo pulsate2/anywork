@@ -207,11 +207,36 @@ func (m *Manager) append(ls *liveSession, ev *Event) (*Event, error) {
 // 流式增量(assistant_delta/reasoning_delta)是瞬态事件:完整消息随后到达
 // 并持久化,增量只走广播,历史回放与落库体积都不受影响。
 func (m *Manager) pump(ls *liveSession) {
+	// 当前思考段的起点:首个 reasoning_delta 到达时记下,完整 thinking 块落库前
+	// 换算成耗时写进 payload。pump 是每会话单 goroutine,局部变量足够 ——
+	// 后端把时间"记"在思考开始处,比前端拿相邻事件的 created_at(秒精度)做差准。
+	var thinkStart time.Time
 	for ev := range ls.driver.Events() {
 		if ev.Kind == KindAssistantDelta || ev.Kind == KindReasoningDelta {
+			if ev.Kind == KindReasoningDelta && thinkStart.IsZero() {
+				thinkStart = time.Now()
+			}
 			ev.SessionID = ls.id
 			m.broadcast(ls, &ev)
 			continue
+		}
+		// 思考段收尾:带上实测耗时再落库(必须赶在 append 之前 —— append 当场
+		// 序列化 payload,之后再改就晚了)。
+		if ev.Kind == KindReasoning && !thinkStart.IsZero() {
+			if text, ok := ev.Payload.(string); ok {
+				ev.Payload = &ReasoningPayload{Text: text, DurationMs: time.Since(thinkStart).Milliseconds()}
+			}
+			thinkStart = time.Time{}
+		}
+		// 回合边界作废起点:用户打断一段思考时未必有收尾的 reasoning 事件,
+		// 不重置的话旧起点会带到下一段,读出一个虚高的耗时。
+		if ev.Kind == KindUser {
+			thinkStart = time.Time{}
+		}
+		if ev.Kind == KindStatus {
+			if sp, ok := ev.Payload.(*StatusPayload); ok && sp.State == StatusIdle {
+				thinkStart = time.Time{}
+			}
 		}
 		// system/init 到达后就有 session_id 了:立即落 external_id,
 		// 进程哪怕只活了一秒,续聊凭据也不能丢。

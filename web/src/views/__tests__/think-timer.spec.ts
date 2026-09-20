@@ -97,8 +97,9 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
     await vi.advanceTimersByTimeAsync(5000)
     expect(summary()).toBe('思考中 · 5 秒')
 
-    // 任意持久化事件到达 = 思考段收尾:直播卡清掉,秒表停
-    await fire({ type: 'message', event: { sessionId: SID, kind: 'status', payload: { state: 'running' }, seq: 1 } })
+    // 生成块收尾事件(思考段结束,正文开始)到达:直播卡清掉,秒表停。
+    // 注意不是"任意持久化事件"都收尾 —— 子 agent 通知/running 状态见下一个用例。
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'assistant_text', payload: '结论是……', seq: 1 } })
     expect(w.find('.chat-row.reasoning').exists()).toBe(false)
     // 停表后时间再走,也不会有遗留的 setInterval(没有可断言的 DOM,只要
     // 不报错且卡片保持消失)
@@ -107,8 +108,7 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
     w.unmount()
   })
 
-  it('退出重进:起点回退到上一条持久化事件的 createdAt,计时续上不归零', async () => {
-    const w = mount({
+  it('退出重进:起点回退到上一条持久化事件的 createdAt,计时续上不归零', async () => {    const w = mount({
       components: { NMessageProvider, AgentView },
       template: '<n-message-provider><agent-view /></n-message-provider>',
     }, { global: { plugins: [createPinia()] } })
@@ -128,6 +128,104 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
     // 时间再走 5 秒:在已有基础上跳
     await vi.advanceTimersByTimeAsync(5000)
     expect(summary()).toBe('思考中 · 1 分 10 秒')
+    w.unmount()
+  })
+
+  // 子 agent 通知(task_notification)/API 重试进度常在一段思考进行中穿插到达。
+  // 它们不结束当前生成块:清了缓冲区,下一个增量会以"刚刚"为起点重新起表,
+  // 读数就永远停在 1 秒 —— 子 agent 跑着时通知每 1-2 秒一条,秒表等于死了。
+  it('子 agent 通知穿插到达不打断秒表,更不会把读数重置回 1 秒', async () => {
+    const w = mount({
+      components: { NMessageProvider, AgentView },
+      template: '<n-message-provider><agent-view /></n-message-provider>',
+    }, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+    const vm = w.findComponent(AgentView).vm as any
+    await vm.openSession(SID)
+    await flushPromises()
+
+    const summary = () => w.find('.chat-row.reasoning summary').text()
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning_delta', payload: '先理思路' } })
+    expect(summary()).toBe('思考中 · 1 秒')
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(summary()).toBe('思考中 · 4 秒')
+
+    // 子 agent 通知(不结束生成块):直播卡不消失、读数不清零
+    await fire({
+      type: 'message',
+      event: { sessionId: SID, kind: 'system_info', payload: { type: 'task_notification', text: '子任务完成' }, seq: 1 },
+    })
+    expect(w.find('.chat-row.reasoning').exists()).toBe(true)
+    expect(summary()).toBe('思考中 · 4 秒')
+
+    // running 状态同理:它落在回合开始,不是生成块的边界
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'status', payload: { state: 'running' }, seq: 2 } })
+    expect(summary()).toBe('思考中 · 4 秒')
+
+    // 通知之后的增量:接着原来的起点走,不是重新从 1 秒起
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning_delta', payload: '继续想' } })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(summary()).toBe('思考中 · 6 秒')
+
+    // 真正的收尾事件(工具调用)照旧结束它
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'tool_call', payload: { tool: 'Bash', toolUseId: 't1' }, seq: 3 } })
+    expect(w.find('.chat-row.reasoning').exists()).toBe(false)
+    w.unmount()
+  })
+
+  // 服务端在思考段收尾时把实测跨度记进 payload.durationMs(见 internal/agent
+  // 的 pump):前端直接用,不再按相邻事件的 created_at 推算 —— 那条推算链在
+  // 秒精度和穿插的子 agent 通知面前都不可靠。
+  it('落库的 reasoning 带 durationMs:直接用实测耗时,不走时间戳推算', async () => {
+    const w = mount({
+      components: { NMessageProvider, AgentView },
+      template: '<n-message-provider><agent-view /></n-message-provider>',
+    }, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+    const vm = w.findComponent(AgentView).vm as any
+    await vm.openSession(SID)
+    await flushPromises()
+
+    // 与上一条事件同秒落库:按推算只能得到 0(兜底 1 秒),实测值是 7 秒。
+    const t = '2026-09-15T12:00:00Z'
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'user', payload: '想想', seq: 1, createdAt: t } })
+    await fire({
+      type: 'message',
+      event: {
+        sessionId: SID, kind: 'reasoning', seq: 2, createdAt: t,
+        payload: { text: '想了一会儿', durationMs: 7000 },
+      },
+    })
+    expect(w.find('.chat-row.reasoning summary').text()).toBe('思考过程 · 7 秒')
+    // 正文照旧从 payload.text 取,不能把对象名当正文渲染。
+    expect(w.find('.reasoning-body').text()).toContain('想了一会儿')
+    w.unmount()
+  })
+
+  // created_at 是秒精度(RFC3339),短思考常与上一条事件同秒落库 → 差为 0。
+  // 旧实现把 0 当真值判空,卡片只剩"思考过程"四个字(实测 103 条里踩中 13 条)。
+  it('思考与上一条事件同秒:仍要报出耗时(兜底 1 秒),不能整段不显示', async () => {
+    const w = mount({
+      components: { NMessageProvider, AgentView },
+      template: '<n-message-provider><agent-view /></n-message-provider>',
+    }, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+    const vm = w.findComponent(AgentView).vm as any
+    await vm.openSession(SID)
+    await flushPromises()
+
+    const t = '2026-09-15T12:00:00Z' // 同一秒:用户消息与思考块一起落库
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'user', payload: '看看这个', seq: 1, createdAt: t } })
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning', payload: '很短的一段思考', seq: 2, createdAt: t } })
+    expect(w.find('.chat-row.reasoning summary').text()).toBe('思考过程 · 1 秒')
+
+    // 有真实间隔时照常报真实耗时
+    await fire({
+      type: 'message',
+      event: { sessionId: SID, kind: 'reasoning', payload: '想了一会儿', seq: 3, createdAt: '2026-09-15T12:00:42Z' },
+    })
+    const summaries = w.findAll('.chat-row.reasoning summary').map((x) => x.text())
+    expect(summaries[summaries.length - 1]).toBe('思考过程 · 42 秒')
     w.unmount()
   })
 })

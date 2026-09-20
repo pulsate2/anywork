@@ -321,6 +321,10 @@ export interface AgentToolCall {
 export interface AgentPermissionReq { reqId: string; tool: string; args: string; parentToolUseId?: string }
 export interface AgentPermissionResult { reqId: string; allow: boolean }
 export interface AgentStatusPayload { state: 'running' | 'idle' }
+// KindReasoning 负载。durationMs 是服务端在思考段收尾时记下的实测跨度
+// (首个 reasoning_delta → 完整思考块落库),前端直接用,不再按相邻事件的
+// created_at 推算。老数据是裸字符串 payload,没有这个字段。
+export interface AgentReasoning { text: string; durationMs?: number }
 export interface AgentErrorPayload { message: string }
 // KindUsage 负载:当前上下文占用 token(claude=input+cache;codex input 含缓存)。
 // window 是真实上下文窗口(claude result 的 modelUsage 透传;0/缺省回落启发式)。

@@ -137,6 +137,18 @@ type PermissionResultPayload struct {
 	Session bool `json:"session,omitempty"`
 }
 
+// ReasoningPayload KindReasoning 的负载。
+// DurationMs 是这段思考的实测跨度:Manager 在第一个 reasoning_delta 到达时记下
+// 起点,完整 thinking 块落库前换算成毫秒填进来(见 pump)。后端"记"下来,前端
+// 就不必拿相邻事件的 created_at 做差 —— 那个差受 created_at 秒精度(短思考同秒
+// 落库,差为 0)和穿插进来的子 agent 通知双重干扰。
+// 老数据是裸字符串(没有起点可记),前端保留推算兜底,所以解析时按
+// `string | ReasoningPayload` 两种形状处理。
+type ReasoningPayload struct {
+	Text       string `json:"text"`
+	DurationMs int64  `json:"durationMs,omitempty"`
+}
+
 // StatusPayload KindStatus 的负载。
 type StatusPayload struct {
 	State string `json:"state"` // running | idle
