@@ -7,12 +7,42 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // bufCloser 测试用 stdin:写进缓冲,Close 无操作。
-type bufCloser struct{ bytes.Buffer }
+// 加锁:回写由 driver 的 handler goroutine 做,测试主 goroutine 靠
+// waitWritten 轮询同一个缓冲 —— 裸 bytes.Buffer 在 -race 下会报数据竞争。
+type bufCloser struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *bufCloser) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *bufCloser) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *bufCloser) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func (b *bufCloser) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
 
 func (b *bufCloser) Close() error { return nil }
 

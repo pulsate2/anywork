@@ -281,10 +281,12 @@ func (m *Manager) pump(ls *liveSession) {
 					if m.NotifyTurnDone != nil {
 						go m.NotifyTurnDone(m.titleOf(ls.id))
 					}
-					// 回合结束:放行一条排队消息。同步做:pump 串行,
-					// 连续两个 idle 不会挤进同一回合;页面前端不再负责
-					// 放行,队列在服务端,关了页面也照发。
-					m.releaseQueued(ls)
+					// 回合结束:放行一条排队消息。页面前端不再负责放行,
+					// 队列在服务端,关了页面也照发。
+					// 异步:放行要写子进程 stdin(持 driver 锁),进程半死时
+					// 写会阻塞 —— 同步做会把 pump 卡死,这个会话连同它的
+					// 审批答复/打断按钮一起失去响应(见 releaseQueued)。
+					go m.releaseQueued(ls)
 				}
 			}
 		}
@@ -411,9 +413,11 @@ func (m *Manager) Enqueue(sessionID, text string) (queued bool, item *QueueItem,
 	return true, item, nil, nil
 }
 
-// releaseQueued 放行队首一条(pump 在 idle 时同步调用)。与 Enqueue 的
-// 空闲直发路径竞争同一个 idle 槽位:两边都先抢占式置 running 再发,
-// 后到者看到 running 即退出,保证一个回合只进一条消息。
+// releaseQueued 放行队首一条(pump 在 idle 时异步调用)。与 Enqueue 的空闲
+// 直发路径竞争同一个 idle 槽位:两边都先抢占式置 running 再发,后到者看到
+// running 即退出,保证一个回合只进一条消息。
+// 从 pump 里异步调(写 stdin 可能阻塞,不能挡住事件泵),所以抢到槽位后要再看
+// 一眼会话还在不在:进程刚死的话这一条留在队列里,别去复活一个刚没的会话。
 func (m *Manager) releaseQueued(ls *liveSession) {
 	if m.ReadOnly {
 		return
@@ -426,6 +430,16 @@ func (m *Manager) releaseQueued(ls *liveSession) {
 	ls.state = StatusRunning // 抢占 idle
 	ls.mu.Unlock()
 
+	if m.get(ls.id) == nil {
+		// 会话已退出(pump 正在收尾/已被删):什么都不发,归还槽位,
+		// 消息还在队列里,下次复活(用户再发一条)时照常放行。
+		ls.mu.Lock()
+		if ls.state == StatusRunning {
+			ls.state = StatusIdle
+		}
+		ls.mu.Unlock()
+		return
+	}
 	item, err := m.store.PopQueued(ls.id)
 	if err != nil || item == nil {
 		// 队列空(或取出失败):归还槽位,等下一个 idle 事件。
@@ -464,21 +478,25 @@ func (m *Manager) CancelQueued(sessionID string, id int64) error {
 	return nil
 }
 
-// revive 复活死会话:用 DB 里存的 external_id + 设置重新 spawn,挂回 sessions。
-// external_id 为空(CLI 侧还没建过会话)时按新会话起,不报错,见 reviveLocked。
-// 运行中保存的模型/强度/权限(claude 约定"续聊时生效")正是在这里落地。
-// spawn 拿着 Manager 锁:并发复活同一会话只会有一个真跑,其它会话的操作
-// 最多阻塞一个进程启动的功夫(百毫秒级)。
+// revive 拿到(必要时新起)会话:external_id 为空(CLI 侧还没建过)时按新会话
+// 起,有凭据的续聊;运行中保存的模型/强度/权限(claude 约定"续聊时生效")正是
+// 在 spawn 里落地。快路径只用 Manager 锁做个查表,真正的进程启动在锁外做。
 func (m *Manager) revive(id string) (*liveSession, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.reviveLocked(id)
-}
-
-func (m *Manager) reviveLocked(id string) (*liveSession, error) {
-	if ls, ok := m.sessions[id]; ok { // 双检:等锁的后来者直接复用
+	if ls := m.get(id); ls != nil {
 		return ls, nil
 	}
+	ls, err := m.spawn(id)
+	if err != nil {
+		return nil, err
+	}
+	return m.register(ls)
+}
+
+// spawn 起一个新进程并装好 liveSession(不注册、不起 pump)。**慢**:除进程
+// 启动外,codex 的握手(initialize + thread/start)各带 30s 超时,对端不答话
+// 能拖满。所以调用方一律不得持有 Manager 锁 —— 早先这里是 reviveLocked,
+// 持锁 spawn,一次 codex 握手失败就把整个服务冻最长 60s(会话列表都刷不出来)。
+func (m *Manager) spawn(id string) (*liveSession, error) {
 	sess, err := m.store.GetSession(id)
 	if err != nil {
 		return nil, err
@@ -511,32 +529,46 @@ func (m *Manager) reviveLocked(id string) (*liveSession, error) {
 	}); err != nil {
 		return nil, err
 	}
-	ls := &liveSession{
+	return &liveSession{
 		id:          id,
 		driver:      driver,
 		subscribers: map[Subscriber]struct{}{},
 		model:       driver.CurrentModel(),
 		state:       StatusIdle,
+	}, nil
+}
+
+// register 把 spawn 出来的会话装上并起泵。双检:并发的两条消息各 spawn 了一个
+// 进程时只有一个生效,后到者把自己的进程关掉复用先到的 —— 抢锁窗口只有一次
+// 查表,不在锁里等进程。
+func (m *Manager) register(ls *liveSession) (*liveSession, error) {
+	m.mu.Lock()
+	if cur, ok := m.sessions[ls.id]; ok {
+		m.mu.Unlock()
+		ls.driver.Close()
+		return cur, nil
 	}
-	m.sessions[id] = ls
-	m.store.SetStatus(id, StatusIdle)
+	m.sessions[ls.id] = ls
+	m.mu.Unlock()
+	m.store.SetStatus(ls.id, StatusIdle)
 	go m.pump(ls)
 	return ls, nil
 }
 
 // restart 弃旧换新(stale 会话,见 liveSession.stale):杀掉旧进程,按 DB 里
 // 的新设置重新 spawn。订阅者直接转挂到新会话 —— 前端自始至终不知道换过
-// 进程,连订阅都不用重发。整个操作持有 Manager 锁:并发的两条消息只会
-// 触发一次重启,后到者直接复用新会话。
+// 进程,连订阅都不用重发。
+// 只有"摘掉旧会话"这一段持 Manager 锁;新进程的启动(可能含 codex 的协议握手)
+// 在锁外做,并发的重启靠 register 的双检收敛成一次。
 func (m *Manager) restart(ls *liveSession) (*liveSession, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	cur := m.sessions[ls.id]
 	if cur != ls {
+		m.mu.Unlock()
 		if cur != nil { // 别的请求已经重启过了,直接复用
 			return cur, nil
 		}
-		return m.reviveLocked(ls.id)
+		return m.revive(ls.id)
 	}
 	ls.mu.Lock()
 	ls.superseded = true
@@ -548,9 +580,13 @@ func (m *Manager) restart(ls *liveSession) (*liveSession, error) {
 	ls.mu.Unlock()
 	delete(m.sessions, ls.id)
 	ls.driver.Close() // 异步:旧 pump 会自己收尾(superseded 分支)
+	m.mu.Unlock()
 
-	fresh, err := m.reviveLocked(ls.id)
+	fresh, err := m.spawn(ls.id)
 	if err != nil {
+		return nil, err
+	}
+	if fresh, err = m.register(fresh); err != nil {
 		return nil, err
 	}
 	fresh.mu.Lock()

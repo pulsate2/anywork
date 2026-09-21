@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -328,8 +329,31 @@ func TestCodexMultiAgent(t *testing.T) {
 	}
 }
 
-// fakeStdin 给 Send 拦截测试用:记下写进来的行,Close 空实现。
-type fakeStdin struct{ bytes.Buffer }
+// fakeStdin 给 Send/答复拦截测试用:记下写进来的行,Close 空实现。
+// 加锁:答复由驱动侧 goroutine 写(handleServerRequest → respond),测试主
+// goroutine 同时在读,裸 bytes.Buffer 在 -race 下必报数据竞争。
+type fakeStdin struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (f *fakeStdin) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buf.Write(p)
+}
+
+func (f *fakeStdin) String() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buf.String()
+}
+
+func (f *fakeStdin) Reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.buf.Reset()
+}
 
 func (f *fakeStdin) Close() error { return nil }
 

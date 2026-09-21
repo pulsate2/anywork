@@ -78,6 +78,10 @@ type claudeDriver struct {
 	events   chan Event
 	done     chan struct{}
 	doneOnce sync.Once
+	// evMu/evClosed 让 emit 与 close(events) 互斥(见 emit 的注释)。
+	// 单独一把锁:emit 会在 d.mu 临界区里被调(markRunningLocked),不能复用。
+	evMu     sync.RWMutex
+	evClosed bool
 }
 
 // approveDecision 一次审批的答复。Session=本会话允许;
@@ -358,7 +362,17 @@ func (d *claudeDriver) Close() error {
 	return nil
 }
 
+// emit 投递一条事件。与 close(d.events) 用 evMu 互斥:进程退出那一刻,读循环
+// (bufio 里还压着没消化的行)、转录 tailer、审批/提问的等待 goroutine 手里都可能
+// 还有事件要发,关流后再裸发就是 send on closed channel —— 那不是丢一条消息,是
+// 把整个服务进程带走(非 HTTP goroutine 的 panic 没人 recover)。实测 10 次里
+// 8 次能撞上,触发时机正是「报错退出/被打断」。
 func (d *claudeDriver) emit(ev Event) {
+	d.evMu.RLock()
+	defer d.evMu.RUnlock()
+	if d.evClosed {
+		return
+	}
 	select {
 	case d.events <- ev:
 	default:
@@ -389,14 +403,25 @@ func (d *claudeDriver) waitExit() {
 	d.mu.Lock()
 	d.exitErr = err
 	d.stdin = nil
-	// 进程死了,挂起的审批/提问永远等不到用户答复,全部按拒绝收尾
-	// (claude 已经收不到 control_response,只是清掉 pending/asks map;
-	// handleAskUser 见 asks 里没有该项就不再回写)。
+	// 进程死了,挂起的审批/提问永远等不到用户答复:先给等待中的 goroutine
+	// 逐个别发一个收尾信号(它们卡在 <-ch 上,光清 map 解不开,pump 收尾时
+	// 就永久漏一个 goroutine),再清空。通道都带 1 格缓冲,非阻塞发不会卡。
+	for _, ch := range d.pending {
+		select {
+		case ch <- &approveDecision{}: // allow=false:claude 已收不到 control_response
+		default:
+		}
+	}
 	d.pending = map[string]chan *approveDecision{}
 	d.asks = map[string]*askPending{}
 	d.mu.Unlock()
 	d.doneOnce.Do(func() { close(d.done) })
+	// 关流这步必须和 emit 互斥:读循环手里没发完的行、tailer、审批 goroutine
+	// 都可能正往 events 里塞(见 emit)。
+	d.evMu.Lock()
+	d.evClosed = true
 	close(d.events)
+	d.evMu.Unlock()
 }
 
 // readStderr 聚合 stderr 尾部,退出异常时作为 error 事件给出可读原因。

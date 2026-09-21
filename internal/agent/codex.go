@@ -65,6 +65,10 @@ type codexDriver struct {
 	events   chan Event
 	done     chan struct{}
 	doneOnce sync.Once
+	// evMu/evClosed 让 emit 与 close(events) 互斥(见 emit 的注释)。
+	// 单独一把锁:emit 会在 d.mu 临界区里被调,不能复用。
+	evMu     sync.RWMutex
+	evClosed bool
 }
 
 func newCodexDriver() *codexDriver {
@@ -560,7 +564,15 @@ func (d *codexDriver) Close() error {
 	return nil
 }
 
+// emit 投递一条事件。与 close(d.events) 用 evMu 互斥:进程退出那一刻,读循环
+// 手里还压着没消化的行,关流后再裸发就是 send on closed channel —— 那会把整个
+// 服务进程带走(非 HTTP goroutine 的 panic 没人 recover)。
 func (d *codexDriver) emit(ev Event) {
+	d.evMu.RLock()
+	defer d.evMu.RUnlock()
+	if d.evClosed {
+		return
+	}
 	select {
 	case d.events <- ev:
 	default:
@@ -590,7 +602,11 @@ func (d *codexDriver) waitExit() {
 	d.userInputs = map[string]chan *userInputDecision{}
 	d.mu.Unlock()
 	d.doneOnce.Do(func() { close(d.done) })
+	// 关流这步必须和 emit 互斥(见 emit):读循环手里没消化的行还在往外发。
+	d.evMu.Lock()
+	d.evClosed = true
 	close(d.events)
+	d.evMu.Unlock()
 }
 
 func (d *codexDriver) readStderr(r io.Reader) {
