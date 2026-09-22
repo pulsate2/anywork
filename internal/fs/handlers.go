@@ -108,6 +108,22 @@ var inlineTypes = map[string]string{
 	".svg":  "image/svg+xml",
 }
 
+// sandboxedTypes 是"可以 inline 打开,但必须配 CSP sandbox"的类型。html 是唯一
+// 渲染即执行的类型:内容里的脚本要能跑(单文件报告/图表全指望它),所以关不掉脚本;
+// 那就用 CSP 的 sandbox 指令把文档按进不透明源 —— 拿不到本应用的 cookie/DOM/storage,
+// 也没有表单、弹窗、顶层跳转。与前端预览那张 iframe(sandbox="allow-scripts")同一套
+// 取舍,差别只是这里换成响应头,因为"外部打开"是浏览器新标签里的顶层文档,框不住。
+//
+// 少了这一条,「外部打开」就只能退回同源直出 —— 那正是 inlineTypes 上面那句注释要堵的洞:
+// 一个能跑脚本的同源文档,可以拿着 Cookie 调 /api/fs/write 改任意文件。
+var sandboxedTypes = map[string]string{
+	".html": "text/html; charset=utf-8",
+	".htm":  "text/html; charset=utf-8",
+}
+
+// sandboxCSP 里的 allow-scripts 有意保留;其余一律不给。
+const sandboxCSP = "sandbox allow-scripts"
+
 func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
 	f, _, _, err := h.svc.ReadInfo(p)
@@ -117,14 +133,25 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	name := filepath.Base(p)
-	ct := inlineTypes[strings.ToLower(filepath.Ext(name))]
-	if r.URL.Query().Get("inline") == "1" && ct != "" {
+	ext := strings.ToLower(filepath.Ext(name))
+	ct := inlineTypes[ext]
+	inline := r.URL.Query().Get("inline") == "1"
+	switch {
+	case inline && ct != "":
 		w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(name))
 		w.Header().Set("Content-Type", ct)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		// <img> 里的 SVG 本来就不执行脚本,但地址栏直接打开这个 URL 会;sandbox 掉。
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
-	} else {
+	case inline && sandboxedTypes[ext] != "":
+		w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(name))
+		w.Header().Set("Content-Type", sandboxedTypes[ext])
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", sandboxCSP)
+		// 页面里的外链(CDN 的图表库、字体……)会带上 Referer,而这个 URL 的
+		// query 里就是文件的绝对路径 —— 没理由把本机目录结构告诉第三方。
+		w.Header().Set("Referrer-Policy", "no-referrer")
+	default:
 		w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(name))
 		if ct == "" {
 			ct = mime.TypeByExtension(filepath.Ext(name))

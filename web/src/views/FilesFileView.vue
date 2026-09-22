@@ -13,7 +13,7 @@ import {
   ChevronBackOutline, ChevronForwardOutline, SearchOutline, CreateOutline, SaveOutline,
   CloseOutline, ChevronUpOutline, ChevronDownOutline, SwapHorizontalOutline,
   ArrowUndoOutline, ArrowRedoOutline, EyeOutline, CodeOutline, DownloadOutline,
-  ReturnDownForwardOutline,
+  OpenOutline, ReturnDownForwardOutline,
 } from '@vicons/ionicons5'
 import { api, type FsArchiveEntry, type FsSqliteInfo, type FsSqliteRows } from '@/api/client'
 import { highlightCode } from '@/utils/highlight'
@@ -755,7 +755,7 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="file-view page-content">
+  <div class="file-view page-content" :class="{ 'fv-html-mode': htmlRendered }">
     <!-- 顶部工具栏:固定在最上,滚动代码时始终可见。图标钮→点一下在下方展开对应输入行。 -->
     <div class="tom-bar">
       <div class="tom-row">
@@ -796,6 +796,15 @@ onMounted(load)
             :title="htmlRendered ? '看源码' : '看预览'" :aria-label="htmlRendered ? '看源码' : '看预览'"
             @click="htmlRendered = !htmlRendered">
             <template #icon><n-icon :component="htmlRendered ? CodeOutline : EyeOutline" /></template>
+          </n-button>
+          <!-- html 的「外部打开」:浏览器新标签里直接看这一页。走后端那条 inline 直出
+               (响应头带 CSP sandbox,见 internal/fs 的 sandboxedTypes)—— 新标签里的
+               顶层文档框不住,只能靠响应头沙箱,所以不能像页内预览那样用 srcdoc。
+               与页内预览的取舍一致:脚本放行,同源不给。 -->
+          <n-button v-if="isHtml && !editing" quaternary size="small" tag="a"
+            :href="api.fsInlineUrl(path)" target="_blank" rel="noopener noreferrer"
+            title="在浏览器新标签打开" aria-label="在浏览器新标签打开">
+            <template #icon><n-icon :component="OpenOutline" /></template>
           </n-button>
           <!-- 自动换行:只作用于源码编辑器(markdown 渲染视图本来就折行,二进制类没有正文)。
                工具栏全是图标钮,跟着用图标:开=Return(U 形回车箭头,折行语义)高亮,
@@ -859,7 +868,7 @@ onMounted(load)
     </div>
 
     <!-- 主体 -->
-    <n-spin :show="loading" class="fv-body" :class="{ 'fv-fill': htmlRendered }">
+    <n-spin :show="loading" class="fv-body">
       <div v-if="loadError" class="fv-error">
         {{ loadError }}
         <!-- 文本类被拒(如超过 5MB)时工具栏没有下载钮,这里补一条退路。 -->
@@ -1039,10 +1048,15 @@ onMounted(load)
   font-family: ui-monospace, monospace; white-space: nowrap;
 }
 .fv-body { flex: 1; min-height: 0; }
-/* HTML 预览:iframe 得填满可视区,而百分比高度要求祖先有确定高度 —— n-spin 里面那层
-   .n-spin-content 是 naive 的包装(高度 auto),不拉满的话 iframe 只会按默认的 150px
-   显示。所以只在这一支上加 .fv-fill 处理,其余分支照旧内容撑高、整页滚动。 */
-.fv-fill :deep(.n-spin-content) { height: 100%; }
+/* HTML 预览:iframe 要吃掉整屏。之所以要单独把页面钉在视口高上,是因为这一页平时
+   是"内容撑高、整页滚动"的 —— .file-view 的 height: 100% 顺着往上找,碰到的是
+   .app-root 的 min-height: 100%,而 min-height 不构成确定高度,百分比会回落成 auto
+   (iframe 于是退回默认的 300×150 那个小方块)。
+   钉住之后 .fv-body 的 flex: 1 才真拿到剩余高度,高度不用猜工具栏多高 —— 工具栏
+   是 flex: none,展开搜索/替换行时自己变高,预览区跟着变矮。
+   其余分支(图片/压缩包/sqlite/markdown/源码)不加这个类,照旧整页滚动。 */
+.file-view.fv-html-mode { height: 100dvh; }
+.fv-html-mode :deep(.n-spin-content) { height: 100%; }
 .fv-html {
   display: block;
   width: 100%; height: 100%;
@@ -1227,6 +1241,15 @@ onMounted(load)
    表列表改成顶部横向滚动的胶囊条,数据表格纵向接在下面。
    侧栏/主区的 DOM 不动,纯 CSS 换排:桌面左右、手机上下。 */
 @media (max-width: 767px) {
+  /* HTML 预览层在手机上照样钉住真实可见高度,不用 dvh:手机上 dvh 与真实视口常差
+     一截(地址栏/WebView,见 main.css 那张全屏层的处理),差出来的部分是整个预览区
+     的整体偏移。fixed + inset: 0 就是真实视口,层内的内边距已经留出底部导航的
+     位置(padding-bottom 里的 72px + safe-area),导航不会被压住,也还能点。 */
+  .file-view.fv-html-mode {
+    position: fixed; inset: 0; z-index: 90;
+    height: auto;
+    background: var(--lr-bg);
+  }
   .fv-sqlite { flex-direction: column; gap: 4px; }
   .sq-side {
     width: auto;
