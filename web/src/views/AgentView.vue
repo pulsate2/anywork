@@ -2010,7 +2010,9 @@ onBeforeUnmount(() => {
 .chat-col {
   flex: 2 1 480px; min-width: 0;
   display: flex; flex-direction: column;
-  height: calc(100dvh - var(--lr-page-pad) - var(--lr-page-pad-bottom));
+  /* 高度由父容器给:桌面端 .agent-page 已钉在视口高上(见文末媒体查询),这里占满
+     即可,不必再自己拿 dvh 减内边距算一遍 —— 那份算法只在页面不滚时才成立。 */
+  height: 100%;
 }
 .chat-head {
   display: flex; align-items: center; gap: 10px;
@@ -2315,5 +2317,14 @@ onBeforeUnmount(() => {
 /* 桌面端两栏常驻,返回按钮没存在必要 */
 @media (min-width: 768px) {
   .chat-back { display: none; }
+  /* 两列各自固定:整页高度钉死在视口上(box-sizing: border-box,上下内边距已经算在里面),
+     文档就不再滚 —— 滚动下沉到左右两列内部,翻左侧会话列表/滚右边时间线互不干扰,
+     也不再出现"页面滚到一半,右边输入框跟着跑出屏幕"。
+     只写桌面端:移动端是"列表↔聊天"全屏互斥的另一套布局,不适用。 */
+  .agent-page {
+    height: 100dvh;
+    overflow: hidden;
+  }
+  .list-col { overflow-y: auto; }
 }
 </style>
