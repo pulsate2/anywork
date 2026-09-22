@@ -18,7 +18,7 @@ import {
 import { api, type FsArchiveEntry, type FsSqliteInfo, type FsSqliteRows } from '@/api/client'
 import { highlightCode } from '@/utils/highlight'
 import { renderMarkdown } from '@/utils/markdown'
-import { fileIcon, isArchivePath, isImagePath, isMarkdownPath, isSqlitePath } from '@/utils/fileIcon'
+import { fileIcon, isArchivePath, isHtmlPath, isImagePath, isMarkdownPath, isSqlitePath } from '@/utils/fileIcon'
 
 const route = useRoute()
 const router = useRouter()
@@ -37,6 +37,7 @@ const MAX_EDIT = 512 * 1024
 // 按扩展名一次定型:图片/压缩包/sqlite 库都是二进制,读正文只会拿到 400。
 const kind = isImagePath(path) ? 'image' : isArchivePath(path) ? 'archive' : isSqlitePath(path) ? 'sqlite' : 'text'
 const isMd = isMarkdownPath(path)
+const isHtml = isHtmlPath(path)
 // 搜索结果带过来的命中行号(没有则 0)。
 const targetLine = Number(route.query.line) || 0
 // 一级搜索的关键词与开关。带了关键词就在本页复用文件内搜索那套命中标记,
@@ -227,6 +228,17 @@ function openArchiveRow(row: ArchiveRow) {
 const mdRendered = ref(isMd && !targetLine && !initialQ)
 const mdHtml = computed(() => (mdRendered.value ? renderMarkdown(content.value) : ''))
 
+// ---- HTML 预览(只读态可切) ----
+// 后端明确不把 html 当 inline 直出(见 internal/fs 的 inlineTypes:同源直出即同源 XSS),
+// 这里也就不新增端点,直接把已读到的正文喂给 iframe srcdoc。
+// sandbox 给 allow-scripts 但**不给** allow-same-origin:页面里的 JS 照跑(图表、交互类
+// 页面才预览得出来),而帧是不透明源 —— 碰不到本应用的 DOM/Cookie/storage,也没有表单、
+// 弹窗与顶层跳转。代价两条,都是明确的取舍:
+//   1. 相对路径的 css/js/图片取不到(帧内的基准地址是本页地址,不是文件所在目录),
+//      内联 <style>/<script> 不受影响;
+//   2. 预览是"看"用的,编辑仍回源码 —— 所以 enterEdit / 搜索都会把它切回源码。
+const htmlRendered = ref(isHtml && !targetLine && !initialQ)
+
 // 自动换行:默认关(横向滚动 + 行号对齐是源码的精确读法);长行多的文件在手机上
 // 滚来滚去烦,打开后按屏宽折行。随路由参数持久化,返回列表再进来不丢(同 GitFileView)。
 const wrapping = ref(route.query.wrap === '1')
@@ -245,6 +257,7 @@ function enterEdit() {
   editText.value = content.value
   resetHistory()
   mdRendered.value = false // 渲染态没法编辑,切回源码
+  htmlRendered.value = false // 同上
   editing.value = true
 }
 
@@ -458,6 +471,7 @@ function doSearch() {
   }
   // 命中标记只存在于源码视图里,渲染态搜索先切回源码。
   mdRendered.value = false
+  htmlRendered.value = false
   const sig = sigOf()
   hits.value = collectHits(searchQ.value)
   // 关键:若这次与上次是同一查询(关键词/开关都没变),重复点击视为"跳到下一个命中"。
@@ -776,10 +790,17 @@ onMounted(load)
             @click="mdRendered = !mdRendered">
             <template #icon><n-icon :component="mdRendered ? CodeOutline : EyeOutline" /></template>
           </n-button>
+          <!-- html 只读态:页面预览 ↔ 源码视图。放在 markdown 那颗钮的位置与语义上,
+               两者互斥(扩展名决定),不会同时出现。 -->
+          <n-button v-if="isHtml && !editing" quaternary size="small" :type="htmlRendered ? 'primary' : 'default'"
+            :title="htmlRendered ? '看源码' : '看预览'" :aria-label="htmlRendered ? '看源码' : '看预览'"
+            @click="htmlRendered = !htmlRendered">
+            <template #icon><n-icon :component="htmlRendered ? CodeOutline : EyeOutline" /></template>
+          </n-button>
           <!-- 自动换行:只作用于源码编辑器(markdown 渲染视图本来就折行,二进制类没有正文)。
                工具栏全是图标钮,跟着用图标:开=Return(U 形回车箭头,折行语义)高亮,
                关=同图标灰态。title/aria-label 兜底提示。 -->
-          <n-button v-if="kind === 'text' && !mdRendered" quaternary size="small"
+          <n-button v-if="kind === 'text' && !mdRendered && !htmlRendered" quaternary size="small"
             :type="wrapping ? 'primary' : 'default'"
             :title="wrapping ? '自动换行:开' : '自动换行:关'" aria-label="自动换行"
             @click="wrapping = !wrapping">
@@ -838,7 +859,7 @@ onMounted(load)
     </div>
 
     <!-- 主体 -->
-    <n-spin :show="loading" class="fv-body">
+    <n-spin :show="loading" class="fv-body" :class="{ 'fv-fill': htmlRendered }">
       <div v-if="loadError" class="fv-error">
         {{ loadError }}
         <!-- 文本类被拒(如超过 5MB)时工具栏没有下载钮,这里补一条退路。 -->
@@ -940,6 +961,10 @@ onMounted(load)
       <!-- markdown 渲染视图(F7):只读态可切,渲染 HTML 由 markdown-it 生成(html: false)。 -->
       <div v-else-if="mdRendered" class="md-body" v-html="mdHtml"></div>
 
+      <!-- HTML 预览:正文已经读进 content,直接 srcdoc 给帧,不额外发请求。 -->
+      <iframe v-else-if="htmlRendered" class="fv-html" :srcdoc="content" sandbox="allow-scripts"
+        :title="`预览 ${name}`"></iframe>
+
       <!-- 预览/编辑 共用编辑器:高亮 <pre> 打底 + 透明 <textarea> 覆盖,行号在左侧粘性栏。 -->
       <div v-else ref="editorEl" class="code-editor" :class="{ wrap: wrapping }" @mousedown="onEditorMouseDown">
         <div ref="gutterEl" class="ce-gutter">
@@ -1014,6 +1039,18 @@ onMounted(load)
   font-family: ui-monospace, monospace; white-space: nowrap;
 }
 .fv-body { flex: 1; min-height: 0; }
+/* HTML 预览:iframe 得填满可视区,而百分比高度要求祖先有确定高度 —— n-spin 里面那层
+   .n-spin-content 是 naive 的包装(高度 auto),不拉满的话 iframe 只会按默认的 150px
+   显示。所以只在这一支上加 .fv-fill 处理,其余分支照旧内容撑高、整页滚动。 */
+.fv-fill :deep(.n-spin-content) { height: 100%; }
+.fv-html {
+  display: block;
+  width: 100%; height: 100%;
+  border: 0;
+  /* 帧内不留底色时文档画布是透明的,会透出本应用的页底(深色主题下尤其怪)。
+     按浏览器默认给白底,和直接用浏览器打开这个文件观感一致。 */
+  background: #fff;
+}
 .fv-error {
   margin: 8px 0; padding: 8px 12px; border-radius: 4px;
   color: var(--lr-danger, #d03050); background: rgba(208, 48, 80, 0.1);

@@ -142,6 +142,9 @@ const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', '
 const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'tbz2', 'xz', 'txz', 'rar', '7z'])
 // SQLite 数据库同理:走 表列表+数据表格 的专用预览,而不是文本。
 const SQLITE_EXTS = new Set(['db', 'sqlite', 'sqlite3', 'db3', 's3db'])
+// HTML 同理:只读态可切 iframe 预览而不是源码。之所以要单独判一次扩展名,
+// 是因为它和 markdown 一样属于"文本但有第二种看法",不能只看 isText。
+const HTML_EXTS = new Set(['html', 'htm'])
 
 function basename(path: string): string {
   return path.split(/[/\\]/).filter(Boolean).pop() || path
@@ -170,6 +173,10 @@ export function isSqlitePath(path: string): boolean {
 export function isMarkdownPath(path: string): boolean {
   const ext = extOf(path)
   return ext === 'md' || ext === 'markdown'
+}
+
+export function isHtmlPath(path: string): boolean {
+  return HTML_EXTS.has(extOf(path))
 }
 
 export function fileIcon(path: string, isDir = false): FileIcon {
