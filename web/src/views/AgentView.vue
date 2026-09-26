@@ -6,7 +6,7 @@ import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
 import { AddOutline, CheckboxOutline, CopyOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
-import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentReasoning, type AgentResumableSession, type AgentSession, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
+import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentReasoning, type AgentResumableSession, type AgentSession, type AgentStreamSnapshot, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
 import { useImmersive } from '@/utils/immersive'
@@ -32,16 +32,67 @@ const selected = computed(() => sessions.value.find((s) => s.id === selectedId.v
 // 聊天打开 → 沉浸模式(导航滑走);返回列表即退出。视图卸载时在 onBeforeUnmount 兜底复位。
 watch(selectedId, (v) => { immersive.value = !!v })
 
+// 会话列表分页:每个工作区先只拉最近 SESSION_PAGE 条,分组底部"加载更多"再翻
+// 这个目录的下一页(服务端按 workspace+offset 翻)。会话攒久了(清理阈值 30 天)
+// 一次性全拉又慢又占内存;只回一页也就没有总数,还有没有更多按"上一页是不是满的"
+// 判断(与消息历史的"加载更早"同一套)。
+const SESSION_PAGE = 10
+// 每页请求上限(与 handler 的 maxSessionPage 对齐):翻到这个深度就不再往上加。
+const SESSION_MAX = 200
+// 还有更多的工作区。
+const moreGroups = ref(new Set<string>())
+// 当前请求的每目录条数:用户翻过更深的页之后,刷新(切回前台/增删改后)按同样
+// 的深度重拉,不至于一次刷新就把翻出来的页整个收回去。
+const sessionDepth = ref(SESSION_PAGE)
+// 正在翻页的工作区(按钮上显示"加载中…",同时挡住连点重复拉同一页)。
+const loadingMore = ref(new Set<string>())
+
 // quiet:后台静默刷新(切回前台时用),不翻 loading —— 列表本来就是有内容的,
 // 闪一下转圈反而像重新加载。
 async function loadSessions(quiet = false) {
   if (!quiet) loading.value = true
   try {
-    sessions.value = await api.agentSessions()
+    sessions.value = await api.agentSessions({ limit: sessionDepth.value })
+    moreGroups.value = groupsWithMore(sessions.value)
   } catch (e: any) {
     message.error(e?.message || '加载会话失败')
   } finally {
     loading.value = false
+  }
+}
+
+// groupsWithMore 哪些工作区可能还有更早的会话:组内条数回到了本次请求的每目录
+// 上限,就是还没到底。
+function groupsWithMore(list: AgentSession[]): Set<string> {
+  const counts = new Map<string, number>()
+  for (const s of list) counts.set(s.workspace, (counts.get(s.workspace) || 0) + 1)
+  const out = new Set<string>()
+  for (const [ws, n] of counts) if (n >= sessionDepth.value) out.add(ws)
+  return out
+}
+
+// loadMoreSessions 翻某个目录的下一页(按组内已加载条数当 offset)。
+// 翻页期间有新会话冒出来会让 offset 偏移,所以按 id 去重兜住重复。
+async function loadMoreSessions(workspace: string) {
+  if (loadingMore.value.has(workspace)) return
+  loadingMore.value = new Set(loadingMore.value).add(workspace)
+  const offset = sessions.value.filter((s) => s.workspace === workspace).length
+  try {
+    const got = await api.agentSessions({ workspace, offset, limit: SESSION_PAGE })
+    const known = new Set(sessions.value.map((s) => s.id))
+    for (const s of got) if (!known.has(s.id)) sessions.value.push(s)
+    const next = new Set(moreGroups.value)
+    if (got.length < SESSION_PAGE) next.delete(workspace)
+    else next.add(workspace)
+    moreGroups.value = next
+    const depth = Math.min(offset + got.length, SESSION_MAX)
+    if (depth > sessionDepth.value) sessionDepth.value = depth
+  } catch (e: any) {
+    message.error(e?.message || '加载更多失败')
+  } finally {
+    const rest = new Set(loadingMore.value)
+    rest.delete(workspace)
+    loadingMore.value = rest
   }
 }
 
@@ -689,39 +740,68 @@ const pendingAsk = computed(() =>
 // ---- 流式输出(瞬态增量,不进 messages) ----
 // assistant_delta / reasoning_delta 是 --include-partial-messages 的逐段增量:
 // 只在 WS 上广播、不落库,完整消息随后到达并落库。这里攒两块缓冲区直播,
-// 任意持久化事件(含完整消息、状态、错误)到达即清空 —— 缓冲区只负责
-// "正在生成"的那一段,历史回放完全靠落库消息,不依赖它。
+// 生成块边界(完整消息、工具调用、错误、回合结束)到达即清空 —— 缓冲区只负责
+// "正在生成"的那一段,历史回放完全靠落库消息,不依赖它。服务端在同一个边界上
+// 清它的缓冲(manager 的 isStreamBoundary),并给中途订阅的客户端补一份
+// stream_snapshot;两边的边界判断是一对,必须同步改。
 const streamText = ref('')
 const streamThink = ref('')
 // 思考秒表(直播卡"思考中 · N 秒"用):首个思考增量到达起表、每秒跳一下,
-// 流式缓冲区清空(完整消息落库,思考段收尾)停表。正式卡上的 thinkMs 走
-// 事件时间差,秒表只管"正在思考"的实时读数 —— 一次回合里多段思考各计各的。
+// 生成块边界停表 —— 一次回合里多段思考各计各的。
+// 起点就是增量到达的这一刻:上一条持久化消息可能是十几秒前的工具调用/审批,
+// 拿它当起点会读出虚高的读数(实际想了 3 秒,表上却是 8 秒)。服务端在思考
+// 起点处记时(落库的 durationMs),这里与之对齐。
 const thinkStartAt = ref(0)
 const thinkNow = ref(0)
 let thinkTimer: ReturnType<typeof setInterval> | undefined
+// 直播快照带回来的"这段思考已经走了多久":快照要先把正文塞进 streamThink,
+// 而下面这个 watch 是延迟执行的 —— 先记在这里,由它消费一次。
+let snapThinkMs = 0
 const thinkElapsedMs = computed(() => Math.max(0, thinkNow.value - thinkStartAt.value))
 watch(streamThink, (v, old) => {
   if (v && !old) {
-    // 起点 = 最近一条持久化事件的 createdAt,不是 Date.now():思考 burst
-    // 紧随其后开始,与正式卡的 thinkMs(上一条事件→本条的时间差)同一
-    // 算法,直播读数收尾时无缝衔接。退出重进时 burst 早已开始 —— 增量是
-    // 瞬态的,回放里没有,从 0 重计会假装思考刚起步;现场看时它与
-    // Date.now() 只差首字延迟,那也是 agent 在干活的时间,算进去更诚实。
-    const last = messages.value[messages.value.length - 1]
-    const t0 = last?.createdAt ? Date.parse(last.createdAt) : NaN
-    // 夹到本地当下:created_at 是秒精度、又来自另一台机器,服务器时钟万一走在
-    // 前面,起点落到未来会被 max(0,…) 夹在 0 —— 读数看着就是卡死的。宁可少算
-    // 首字那点时间,也不能不动。
-    thinkStartAt.value = Number.isFinite(t0) ? Math.min(t0, Date.now()) : Date.now()
+    // 夹到 0 以上再走:快照给的时长来自另一台机器,万一比本地时钟还大,起点
+    // 会落到未来、读数被 max(0,…) 夹死在 0(看着就是卡住)。
+    const done = Math.max(0, snapThinkMs)
+    snapThinkMs = 0
+    thinkStartAt.value = Date.now() - done
     thinkNow.value = Date.now()
     thinkTimer = setInterval(() => { thinkNow.value = Date.now() }, 1000)
-  } else if (!v && thinkTimer) {
-    clearInterval(thinkTimer)
-    thinkTimer = undefined
+  } else if (!v) {
+    // 缓冲清空 = 生成块结束:停表。
+    snapThinkMs = 0
+    if (thinkTimer) {
+      clearInterval(thinkTimer)
+      thinkTimer = undefined
+    }
+  } else {
+    // 同一段思考的后续增量(值非空→非空):表接着跑。这里也不留快照时长,
+    // 免得它被下一段思考当成自己的起点。
+    snapThinkMs = 0
   }
 })
 onBeforeUnmount(() => { if (thinkTimer) clearInterval(thinkTimer) })
 watch([streamText, streamThink], () => scrollBottom())
+
+// ---- 重连标识 ----
+// WS 断开(弱网、服务重启、手机切后台被系统断网)时顶部挂一条"正在重连",接回来
+// 再留 2 秒"已重新连接"。退避最长 15 秒,不给标识的话画面就是彻底不动 —— 用户
+// 分不清是网断了还是 agent 卡住了。首连不显示:进页面本来就没有内容,标识只会
+// 闪一下;桌面 Alt-Tab 也不显示(连接还好着,只补差),只有真换了连接才挂。
+type WSState = 'ok' | 'down' | 'back'
+const wsState = ref<WSState>('ok')
+let wsBackTimer: number | undefined
+function wsDown() {
+  // 收尾计时器一并清掉:"已重新连接"的 2 秒里又断了的话,它到点会把标识收走,
+  // 而那会儿其实是断线状态,得一直亮着。
+  window.clearTimeout(wsBackTimer)
+  wsState.value = 'down'
+}
+function wsUp() {
+  if (wsState.value !== 'down') return // 首连/重复 open:不闪标识
+  wsState.value = 'back'
+  wsBackTimer = window.setTimeout(() => { wsState.value = 'ok' }, 2000)
+}
 
 // ---- WS 推送 ----
 const ws = new AgentWS((e) => {
@@ -735,11 +815,26 @@ const ws = new AgentWS((e) => {
       else streamThink.value += t
       return
     }
+    // 直播快照:订阅(退出重进、切后台回来)时服务端把当前生成块已经流过的
+    // 正文/思考一次补来 —— 增量是瞬态的,只靠增量会从半截开始显示。这里是
+    // 覆盖不是追加(快照即当前全量),秒表也按它带的已进行时长续上。
+    if (ev.kind === 'stream_snapshot') {
+      const p = ev.payload as AgentStreamSnapshot | null
+      const prevThink = streamThink.value
+      streamText.value = p?.text || ''
+      snapThinkMs = p?.think ? (p.thinkMs ?? 0) : 0
+      streamThink.value = p?.think || ''
+      // 值与缓冲里一样时 watch 不会跑(重连时本来就有内容):这次的时长自己
+      // 消费掉,别留给下一段思考。
+      if (streamThink.value === prevThink) snapThinkMs = 0
+      return
+    }
     // 收尾事件(完整消息、工具调用、错误…)清掉直播缓冲区,但有些事件不结束
     // 当前的生成块:子 agent 通知(task_notification)、API 重试进度(api_error)
     // 与 running 状态 —— 它们常在思考进行中穿插到达(子 agent 跑着时通知每
     // 1-2 秒一条)。清了不只是直播卡闪断:下一个增量会以"刚刚"为起点重新起表,
-    // 秒表读数就永远停在 1 秒、再也不涨。
+    // 秒表读数就永远停在 1 秒、再也不涨。服务端拿同一套判断清它的直播缓冲
+    // (manager 的 isStreamBoundary),两处必须同步改。
     const midStream = ev.kind === 'queued_add' || ev.kind === 'queued_remove'
       || (ev.kind === 'status' && (ev.payload as { state?: string } | null)?.state === 'running')
       || (ev.kind === 'system_info'
@@ -778,8 +873,12 @@ const ws = new AgentWS((e) => {
       s.status = e.status
       if (e.title && !s.title) s.title = e.title
     }
+  } else if (e.type === 'close') {
+    // 断了:ws 自己按退避重连,这里只负责把标识挂上。
+    wsDown()
   } else if (e.type === 'open') {
     // (重)连上:按 seq 补差,期间丢的推送都找得回来。
+    wsUp()
     catchUp()
   }
 })
@@ -845,7 +944,10 @@ function onResume() {
   resumeAt = now
   if (wasHidden) {
     wasHidden = false
-    ws.connect() // onopen → 重订阅 + catchUp
+    // 半开连接的 readyState 还报 OPEN、onclose 根本不会触发,所以这里主动补一次
+    // "重连中":这次换连接的断档是实打实的(后台里断了几十分钟),标识得亮出来。
+    wsDown()
+    ws.connect() // onopen → 重订阅 + catchUp(标识转"已重新连接")
   } else if (selectedId.value) {
     catchUp() // 连接还在,只把断档补上
   }
@@ -1483,6 +1585,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibility)
   window.removeEventListener('focus', onResume)
   window.removeEventListener('online', onResume)
+  window.clearTimeout(wsBackTimer)
   ws.close()
   immersive.value = false
   window.clearTimeout(copyTimer)
@@ -1491,13 +1594,23 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="page-content agent-page" :class="{ 'chat-open': !!selectedId }">
+    <!-- 重连标识:贴在视口顶部的一条窄条(断线即刻出现,接回来 2 秒后收)。
+         不插进文档流里 —— 桌面端整页高度钉死在视口上,插一条会把时间线与输入区
+         整体推一下;盖在顶上只在状态变化时出现,布局纹丝不动。列表态与聊天态
+         (移动端是全屏覆盖层)都能看到,不用两边各放一份。 -->
+    <div v-if="wsState !== 'ok'" class="ws-banner" :class="wsState"
+      role="status" aria-live="polite">
+      <span class="ws-dot" aria-hidden="true"></span>
+      <span>{{ wsState === 'down' ? '连接已断开,正在重连…' : '已重新连接' }}</span>
+    </div>
+
     <!-- ---- 会话列表 ---- -->
     <div class="list-col">
       <div class="agent-head">
         <h2>Agent 会话</h2>
         <div class="agent-head-ops">
           <template v-if="selectMode">
-            <n-button size="small" secondary @click="toggleSelectAll">{{ allSelected ? '取消全选' : '全选' }}</n-button>
+            <n-button size="small" secondary @click="toggleSelectAll">{{ allSelected ? '取消全选' : (moreGroups.size ? '全选已加载' : '全选') }}</n-button>
             <n-popconfirm @positive-click="deleteSelected">
               <template #trigger>
                 <n-button size="small" type="error" :disabled="!selectedIds.size" :loading="deletingSelected">
@@ -1532,8 +1645,8 @@ onBeforeUnmount(() => {
             <button type="button" class="sess-group-head" @click="toggleGroup(g)">
               <span class="sess-chevron" :class="{ open: !isCollapsed(g) }">▸</span>
               <span class="sess-group-path">{{ g.workspace }}</span>
-              <!-- 折叠时露个数量,展开就不占地方 -->
-              <span v-if="isCollapsed(g)" class="sess-count">{{ g.list.length }}</span>
+              <!-- 折叠时露个数量,展开就不占地方。"+" = 这个目录还有更早的没拉 -->
+              <span v-if="isCollapsed(g)" class="sess-count">{{ g.list.length }}{{ moreGroups.has(g.workspace) ? '+' : '' }}</span>
             </button>
             <template v-if="!isCollapsed(g)">
               <div
@@ -1577,6 +1690,13 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </template>
+            <!-- 分组分页:每个目录先只拉一页,更早的按需翻 -->
+            <button
+              v-if="!isCollapsed(g) && moreGroups.has(g.workspace)"
+              type="button" class="sess-more"
+              :disabled="loadingMore.has(g.workspace)"
+              @click="loadMoreSessions(g.workspace)"
+            >{{ loadingMore.has(g.workspace) ? '加载中…' : '加载更多' }}</button>
           </div>
         </div>
       </n-spin>
@@ -1926,6 +2046,34 @@ onBeforeUnmount(() => {
 <style scoped>
 .agent-page { display: flex; gap: 14px; }
 
+/* ---- 重连标识 ----
+   顶部一条窄条,左右与页面留白对齐(桌面端左边要空出侧栏,--lr-page-pad-left
+   已经把侧栏宽度算进去了)。底色用 elevated + 主题边框:深浅两套主题都不用另
+   写一份颜色,文字直接用主题的 warn/ok —— 填色块反而要自己凑对比度。
+   z-index 取 95:盖得住移动端聊天那层全屏覆盖层(90),但仍在底部导航(100)之下。
+   下沿带圆角、贴屏幕的那条边直角:看着像从屏幕边沿垂下来的一条状态条。 */
+.ws-banner {
+  position: fixed; z-index: 95; top: 0;
+  left: var(--lr-page-pad-left); right: var(--lr-page-pad);
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 6px 12px;
+  background: var(--lr-bg-elevated);
+  border: 1px solid var(--lr-border); border-top: none;
+  border-radius: 0 0 var(--lr-radius) var(--lr-radius);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
+  font-size: 13px;
+}
+.ws-banner.down { color: var(--lr-warn); }
+.ws-banner.back { color: var(--lr-ok); }
+/* 圆点用 currentColor 跟着文字走;重连中让它呼吸 —— 静止的小色块在窄条上太
+   容易被当成装饰忽略过去。 */
+.ws-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.ws-banner.down .ws-dot { animation: ws-pulse 1s ease-in-out infinite; }
+@keyframes ws-pulse { 50% { opacity: .2; } }
+@media (prefers-reduced-motion: reduce) {
+  .ws-banner.down .ws-dot { animation: none; }
+}
+
 /* ---- 列表列 ---- */
 .list-col { flex: 1 1 320px; min-width: 0; }
 .agent-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -1963,6 +2111,15 @@ onBeforeUnmount(() => {
   font-size: 11px; line-height: 18px; border-radius: 999px;
   background: rgba(127, 127, 127, .16);
 }
+/* 分组底部的"加载更多":整行可点,34px 够手指;加载中半透明防连点 */
+.sess-more {
+  width: 100%; min-height: 34px;
+  appearance: none; border: 0; border-top: 1px solid rgba(127, 127, 127, .1);
+  background: transparent; font: inherit; font-size: 12px; cursor: pointer;
+  color: var(--lr-accent);
+  -webkit-tap-highlight-color: transparent;
+}
+.sess-more:disabled { opacity: .5; cursor: default; }
 /* 状态圆点:与聊天头同一套颜色/脉动语义 */
 .sess-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--lr-ok); }
 .sess-dot.running { background: var(--lr-warn); animation: dot-pulse 1.2s ease-in-out infinite; }

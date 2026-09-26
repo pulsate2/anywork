@@ -56,6 +56,10 @@ const (
 	// 页面一关排队消息就没了。
 	KindQueuedAdd    = "queued_add"
 	KindQueuedRemove = "queued_remove"
+	// KindStreamSnapshot 直播快照:订阅一个正在生成中的会话时,把当前生成块
+	// 已经流过的增量一次补给这个订阅者(见 Manager.Subscribe)。增量只广播不
+	// 落库,新订阅者(退出重进、切后台回来)本来只能看到半截正文/思考。
+	KindStreamSnapshot = "stream_snapshot"
 )
 
 // 会话状态。
@@ -253,6 +257,15 @@ type QueuedPayload struct {
 	CreatedAt string `json:"createdAt,omitempty"`
 }
 
+// StreamSnapshotPayload KindStreamSnapshot 的负载:当前生成块已流过的全部内容。
+// ThinkMs 是这一段思考已经走了多久(Think 非空时有效)—— 前端秒表据此续上,
+// 写 0 是有意义的("刚开始"),所以不带 omitempty。
+type StreamSnapshotPayload struct {
+	Text    string `json:"text"`
+	Think   string `json:"think"`
+	ThinkMs int64  `json:"thinkMs"`
+}
+
 // Session 一条 agent_sessions 记录。
 type Session struct {
 	ID             string
@@ -383,12 +396,66 @@ func (s *Store) GetSession(id string) (*Session, error) {
 
 // ListSessions 全部会话,新的在前。dead 但未清理的历史会话也在里面(可续聊)。
 func (s *Store) ListSessions() ([]Session, error) {
-	rows, err := s.db.Query(`SELECT id, app, workspace, title, external_id, permission_mode,
-		COALESCE(model,''), COALESCE(effort,''), status, created_at, updated_at
-		FROM agent_sessions ORDER BY created_at DESC`)
+	rows, err := s.db.Query(listSessionsSQL+` ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
+	return scanSessions(rows)
+}
+
+// listSessionsSQL 会话列表的公共选择列(见 sessionCols)。
+const listSessionsSQL = `SELECT ` + sessionCols + ` FROM agent_sessions`
+
+// sessionCols 会话行的列顺序,scanSessions 按同一顺序 Scan。
+const sessionCols = `id, app, workspace, title, external_id, permission_mode,
+	COALESCE(model,''), COALESCE(effort,''), status, created_at, updated_at`
+
+// ListSessionsPage 某工作区的一页会话:最近活动的在前(updated_at 倒序,
+// id 兜底保证分页稳定),offset/limit 翻页。会话列表不再一次全拉 —— 打开时
+// 每个目录只看最近一页,更早的由前端逐页"加载更多"。
+func (s *Store) ListSessionsPage(workspace string, limit, offset int) ([]Session, error) {
+	rows, err := s.db.Query(listSessionsSQL+`
+		WHERE workspace=? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,
+		workspace, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	return scanSessions(rows)
+}
+
+// ListRecentByWorkspace 每个工作区最近 limit 条(会话列表首屏):先取目录清单
+// 再逐目录取一页。会话总数远小于消息,目录数更少,够用且不必上窗口函数
+// (SQLite 与 PostgreSQL 的写法都要照顾)。
+func (s *Store) ListRecentByWorkspace(limit int) ([]Session, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT workspace FROM agent_sessions ORDER BY workspace`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	workspaces := []string{}
+	for rows.Next() {
+		var ws string
+		if err := rows.Scan(&ws); err != nil {
+			return nil, err
+		}
+		workspaces = append(workspaces, ws)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	list := []Session{}
+	for _, ws := range workspaces {
+		page, err := s.ListSessionsPage(ws, limit, 0)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, page...)
+	}
+	return list, nil
+}
+
+// scanSessions 收集会话行(保持查询本身的顺序)。
+func scanSessions(rows *sql.Rows) ([]Session, error) {
 	defer rows.Close()
 	list := []Session{}
 	for rows.Next() {
@@ -399,7 +466,10 @@ func (s *Store) ListSessions() ([]Session, error) {
 		}
 		list = append(list, sess)
 	}
-	return list, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 // AppendMessage 落一条消息并分配 seq(会话内单调递增),返回带 seq 的完整事件。

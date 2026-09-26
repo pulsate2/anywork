@@ -149,8 +149,8 @@ func (f *fakeDriver) Close() error {
 	return nil
 }
 
-// TestReleaseQueued 回合结束放行:pump 每 idle 放一条,逐条串行;放行后
-// 队列里少一条、时间线上多一条 user 消息。
+// TestReleaseQueued 回合结束放行:一次把队列放完(不再一轮只放队首一条),
+// 逐条按序 Send、逐条落库成 user 消息;放行后队列空、idle 槽位被占成 running。
 func TestReleaseQueued(t *testing.T) {
 	s := newTestStore(t)
 	sess := createTestSession(t, s)
@@ -172,29 +172,25 @@ func TestReleaseQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 第一个 idle:放行队首。
+	// 一个 idle 把两条一起交出去:顺序不能乱。
 	m.releaseQueued(ls)
-	if got := fd.sent; len(got) != 1 || got[0] != "排队A" {
-		t.Fatalf("第一次放行应只发「排队A」,发了 %v", got)
+	if got := fd.sent; len(got) != 2 || got[0] != "排队A" || got[1] != "排队B" {
+		t.Fatalf("放行应一次发完「排队A」「排队B」,发了 %v", got)
 	}
-	if left, _ := s.Queued(sess.ID); len(left) != 1 || left[0].Text != "排队B" {
-		t.Fatalf("放行后队列应剩「排队B」: %v", left)
+	if left, _ := s.Queued(sess.ID); len(left) != 0 {
+		t.Fatalf("放行后队列该空了: %v", left)
 	}
-	// 连续两个 idle 不该挤进同一回合:放行后 state 已被抢占成 running。
+	// 放行后 state 已被抢占成 running:这一轮里其余 idle 事件不再放行,
+	// 也就不会挤进同一回合重复发。
 	if ls.state != StatusRunning {
 		t.Fatalf("放行后 state 应为 running,得到 %s", ls.state)
 	}
-
-	// 模拟下一回合结束(pump 置回 idle)再放行第二条。
-	ls.mu.Lock()
-	ls.state = StatusIdle
-	ls.mu.Unlock()
 	m.releaseQueued(ls)
-	if got := fd.sent; len(got) != 2 || got[1] != "排队B" {
-		t.Fatalf("第二次放行应发「排队B」,发了 %v", got)
+	if got := fd.sent; len(got) != 2 {
+		t.Fatalf("回合进行中不该再放行: %v", got)
 	}
 
-	// 两条都该作为 user 消息落库(时间线上可见)。
+	// 两条都该作为 user 消息落库(时间线上可见,顺序不变)。
 	msgs, err := s.Messages(sess.ID, 0, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -213,12 +209,24 @@ func TestReleaseQueued(t *testing.T) {
 		t.Fatalf("放行的两条都应落库为 user 事件: %v", users)
 	}
 
-	// 队列清空后再 idle:不再发送。
+	// 新回合里又攒了一条:下一个 idle 照常放行。
+	if _, err := s.Enqueue(sess.ID, "排队C"); err != nil {
+		t.Fatal(err)
+	}
 	ls.mu.Lock()
 	ls.state = StatusIdle
 	ls.mu.Unlock()
 	m.releaseQueued(ls)
-	if got := fd.sent; len(got) != 2 {
+	if got := fd.sent; len(got) != 3 || got[2] != "排队C" {
+		t.Fatalf("下一个 idle 应放行「排队C」,发了 %v", got)
+	}
+
+	// 队列清空后再 idle:不再发送,state 归还 idle。
+	ls.mu.Lock()
+	ls.state = StatusIdle
+	ls.mu.Unlock()
+	m.releaseQueued(ls)
+	if got := fd.sent; len(got) != 3 {
 		t.Fatalf("空队列放行不应发送: %v", got)
 	}
 	if ls.state != StatusIdle {

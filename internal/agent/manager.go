@@ -32,6 +32,13 @@ type liveSession struct {
 
 	mu          sync.Mutex
 	subscribers map[Subscriber]struct{}
+	// partialText / partialThink 当前生成块的直播缓冲(流式增量不落库,攒在
+	// 这里才能补给后来的订阅者,见 Subscribe 的直播快照);thinkStart 是当前
+	// 思考段的起点,首个 reasoning_delta 到达时记下,收尾时换算成耗时落库。
+	// 三者都由 ls.mu 保护,且只在 broadcastDelta/clearStream/Subscribe 里动。
+	partialText  string
+	partialThink string
+	thinkStart   time.Time
 	// state 当前回合状态(running/idle):pump 收到状态事件时更新,
 	// Enqueue 的"空闲直发"与 releaseQueued 的"回合结束放行"都靠它判断,
 	// 抢占式置 running 关闭两边的竞争窗口(见 releaseQueued)。
@@ -207,36 +214,27 @@ func (m *Manager) append(ls *liveSession, ev *Event) (*Event, error) {
 // 流式增量(assistant_delta/reasoning_delta)是瞬态事件:完整消息随后到达
 // 并持久化,增量只走广播,历史回放与落库体积都不受影响。
 func (m *Manager) pump(ls *liveSession) {
-	// 当前思考段的起点:首个 reasoning_delta 到达时记下,完整 thinking 块落库前
-	// 换算成耗时写进 payload。pump 是每会话单 goroutine,局部变量足够 ——
-	// 后端把时间"记"在思考开始处,比前端拿相邻事件的 created_at(秒精度)做差准。
-	var thinkStart time.Time
 	for ev := range ls.driver.Events() {
 		if ev.Kind == KindAssistantDelta || ev.Kind == KindReasoningDelta {
-			if ev.Kind == KindReasoningDelta && thinkStart.IsZero() {
-				thinkStart = time.Now()
-			}
 			ev.SessionID = ls.id
-			m.broadcast(ls, &ev)
+			m.broadcastDelta(ls, &ev, ev.Kind == KindReasoningDelta)
 			continue
 		}
 		// 思考段收尾:带上实测耗时再落库(必须赶在 append 之前 —— append 当场
 		// 序列化 payload,之后再改就晚了)。
-		if ev.Kind == KindReasoning && !thinkStart.IsZero() {
+		if ev.Kind == KindReasoning {
 			if text, ok := ev.Payload.(string); ok {
-				ev.Payload = &ReasoningPayload{Text: text, DurationMs: time.Since(thinkStart).Milliseconds()}
+				// 起点在首个 reasoning_delta 到达时记下(见 broadcastDelta):
+				// 没有增量可记(老协议/没开 partial messages)就照旧落裸字符串。
+				if ms, started := ls.takeThink(); started {
+					ev.Payload = &ReasoningPayload{Text: text, DurationMs: ms}
+				}
 			}
-			thinkStart = time.Time{}
 		}
-		// 回合边界作废起点:用户打断一段思考时未必有收尾的 reasoning 事件,
-		// 不重置的话旧起点会带到下一段,读出一个虚高的耗时。
-		if ev.Kind == KindUser {
-			thinkStart = time.Time{}
-		}
-		if ev.Kind == KindStatus {
-			if sp, ok := ev.Payload.(*StatusPayload); ok && sp.State == StatusIdle {
-				thinkStart = time.Time{}
-			}
+		// 生成块边界:直播缓冲清空。用户打断一段思考时未必有收尾的 reasoning
+		// 事件,不清的话旧起点/半截正文会带到下一个生成块(读出一个虚高的耗时)。
+		if isStreamBoundary(&ev) {
+			m.clearStream(ls)
 		}
 		// system/init 到达后就有 session_id 了:立即落 external_id,
 		// 进程哪怕只活了一秒,续聊凭据也不能丢。
@@ -413,9 +411,9 @@ func (m *Manager) Enqueue(sessionID, text string) (queued bool, item *QueueItem,
 	return true, item, nil, nil
 }
 
-// releaseQueued 放行队首一条(pump 在 idle 时异步调用)。与 Enqueue 的空闲
-// 直发路径竞争同一个 idle 槽位:两边都先抢占式置 running 再发,后到者看到
-// running 即退出,保证一个回合只进一条消息。
+// releaseQueued 回合结束放行排队消息(pump 在 idle 时异步调用):队列里攒了
+// 几条就一次全发出去,不再一轮只放队首一条。与 Enqueue 的空闲直发路径竞争
+// 同一个 idle 槽位:两边都先抢占式置 running 再发,后到者看到 running 即退出。
 // 从 pump 里异步调(写 stdin 可能阻塞,不能挡住事件泵),所以抢到槽位后要再看
 // 一眼会话还在不在:进程刚死的话这一条留在队列里,别去复活一个刚没的会话。
 func (m *Manager) releaseQueued(ls *liveSession) {
@@ -440,22 +438,37 @@ func (m *Manager) releaseQueued(ls *liveSession) {
 		ls.mu.Unlock()
 		return
 	}
-	item, err := m.store.PopQueued(ls.id)
-	if err != nil || item == nil {
-		// 队列空(或取出失败):归还槽位,等下一个 idle 事件。
-		ls.mu.Lock()
-		if ls.state == StatusRunning {
-			ls.state = StatusIdle
+	// 一次把队列放完:回合结束时攒下的消息该全部交出去,不能一条一个回合一
+	// 条一条地等(用户:多条排队消息不该等几次会话才发完)。逐条 Send 而不是
+	// 拼成一条 —— 每条排队消息在时间线上仍是独立的 user 回合,拼起来会改掉
+	// 用户写下的内容边界。第二条起是"回合进行中即插话",由 driver 自己排队
+	// (claude 的 stream-json 输入就是这样);driver 拒绝(进程垂死)就停下,
+	// 剩下的消息留在队列里,下次放行照常。
+	// state 已在上面抢占成 running:这一轮里其余 idle 事件不会再进放行路径。
+	sent := false
+	for {
+		item, err := m.store.PopQueued(ls.id)
+		if err != nil || item == nil {
+			// 队列空(或取出失败):一条都没发出去才归还槽位。发过就把
+			// running 留着 —— 过程真的在跑,收尾交给下一轮状态事件。
+			if !sent {
+				ls.mu.Lock()
+				if ls.state == StatusRunning {
+					ls.state = StatusIdle
+				}
+				ls.mu.Unlock()
+			}
+			return
 		}
-		ls.mu.Unlock()
-		return
-	}
-	// 先广播出队再发送:user 事件随后由 Send 广播,前端两项各自处理。
-	m.broadcast(ls, &Event{Kind: KindQueuedRemove, SessionID: ls.id,
-		Payload: &QueuedPayload{ID: item.ID}})
-	if _, err := m.Send(ls.id, item.Text); err != nil {
-		// 消息已由 Send 落库、错误已在时间线上;state 留给下一个状态
-		// 事件纠正(能走到这的 Send 失败基本都是进程垂死,马上就 dead)。
+		// 先广播出队再发送:user 事件随后由 Send 广播,前端两项各自处理。
+		m.broadcast(ls, &Event{Kind: KindQueuedRemove, SessionID: ls.id,
+			Payload: &QueuedPayload{ID: item.ID}})
+		if _, err := m.Send(ls.id, item.Text); err != nil {
+			// 消息已由 Send 落库、错误已在时间线上;剩下的留在队列里(进程垂死
+			// 时接着发也只是接着报错),state 交给下一个状态事件纠正。
+			return
+		}
+		sent = true
 	}
 }
 
@@ -750,6 +763,16 @@ func (m *Manager) Subscribe(sessionID string, sub Subscriber) error {
 	}
 	ls.mu.Lock()
 	ls.subscribers[sub] = struct{}{}
+	// 直播快照:这个会话正生成到一半的话,把已经流过的增量一并补给新订阅者。
+	// 增量是瞬态的(不落库,历史里没有),少了这一步,退出立刻重进就只能看到
+	// 半截正文/思考,而且秒表会假装思考刚起步。ThinkMs 让秒表接着走。
+	if ls.partialText != "" || ls.partialThink != "" {
+		p := &StreamSnapshotPayload{Text: ls.partialText, Think: ls.partialThink}
+		if !ls.thinkStart.IsZero() {
+			p.ThinkMs = time.Since(ls.thinkStart).Milliseconds()
+		}
+		sub.SendEvent(&Event{Kind: KindStreamSnapshot, SessionID: sessionID, Payload: p})
+	}
 	ls.mu.Unlock()
 	return nil
 }
@@ -829,6 +852,75 @@ func (m *Manager) broadcast(ls *liveSession, stored *Event) {
 	for _, s := range subs {
 		s.SendEvent(stored)
 	}
+}
+
+// broadcastDelta 直播增量(瞬态,不落库):先累进会话缓冲,再投给订阅者 ——
+// 两件事在同一把锁里做完。这样 Subscribe 发的直播快照与增量不会交错:后到的
+// 订阅者要么已经在快照里拿到这段文本,要么作为增量随后收到,不会漏也不会重。
+// 锁内直接 SendEvent 是安全的:Subscriber 实现必须非阻塞投递(见 handler.go
+// 的 wsClient),且不得回调 Manager。
+func (m *Manager) broadcastDelta(ls *liveSession, ev *Event, think bool) {
+	text, ok := ev.Payload.(string)
+	if !ok || text == "" {
+		return
+	}
+	ls.mu.Lock()
+	if think {
+		// 起点记在"首个增量到达"这一刻,不是上一条消息落库那一刻:一次回合里
+		// 工具调用/审批可以耗掉十几秒,从上一条消息起算会读出虚高的耗时。
+		if ls.thinkStart.IsZero() {
+			ls.thinkStart = time.Now()
+		}
+		ls.partialThink += text
+	} else {
+		ls.partialText += text
+	}
+	for s := range ls.subscribers {
+		s.SendEvent(ev)
+	}
+	ls.mu.Unlock()
+}
+
+// clearStream 生成块结束:直播缓冲与思考起点一起清掉。
+func (m *Manager) clearStream(ls *liveSession) {
+	ls.mu.Lock()
+	ls.partialText, ls.partialThink, ls.thinkStart = "", "", time.Time{}
+	ls.mu.Unlock()
+}
+
+// takeThink 取走当前思考段的起点并换算成耗时;这段思考没见过增量(没起点)
+// 时返回 started=false,调用方照旧落裸字符串。
+func (ls *liveSession) takeThink() (int64, bool) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.thinkStart.IsZero() {
+		return 0, false
+	}
+	ms := time.Since(ls.thinkStart).Milliseconds()
+	ls.thinkStart = time.Time{}
+	return ms, true
+}
+
+// isStreamBoundary 这个事件是否结束当前生成块(直播缓冲该清)。与前端
+// AgentView 的 midStream 判断是一对,两边必须同步改:子 agent 通知
+// (task_notification)、API 重试进度(api_error)与 running 状态都可能在
+// 一段思考/正文进行中穿插到达(子 agent 跑着时每 1-2 秒一条),把它们当成
+// 边界不只是直播卡闪断 —— 下一个增量会以"刚刚"为起点重新起表,秒表读数就
+// 永远停在 1 秒、再也不涨。
+func isStreamBoundary(ev *Event) bool {
+	switch ev.Kind {
+	// exit 是 Manager 自己合成的收尾帧(不经过 pump),列在这里只是确保
+	// 语义完整:它不是生成块内部的插曲。
+	case KindAssistantDelta, KindReasoningDelta, KindQueuedAdd, KindQueuedRemove, "exit":
+		return false
+	case KindStatus:
+		sp, ok := ev.Payload.(*StatusPayload)
+		return !ok || sp.State != StatusRunning
+	case KindSystemInfo:
+		si, ok := ev.Payload.(*SystemInfoPayload)
+		return !ok || (si.Type != "task_notification" && si.Type != "api_error")
+	}
+	return true
 }
 
 func (m *Manager) titleOf(id string) string {

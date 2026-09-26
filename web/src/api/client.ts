@@ -198,7 +198,16 @@ export const api = {
   pushTest: () => request<{ ok: boolean; sent: number; failed: number }>('POST', '/api/push/test'),
 
   // ---- Agent 会话(DESIGN-AGENT.md;推送通道见 api/agent.ts) ----
-  agentSessions: () => request<AgentSession[]>('GET', '/api/agent/sessions'),
+  // 会话列表按工作区分页:不带参数 = 每个目录最近一页(后端默认 10 条);
+  // 带 workspace+offset = 该目录更早的一页(分组里的"加载更多")。
+  agentSessions: (p: { workspace?: string; offset?: number; limit?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (p.workspace) qs.set('workspace', p.workspace)
+    if (p.offset) qs.set('offset', String(p.offset))
+    if (p.limit) qs.set('limit', String(p.limit))
+    const q = qs.toString()
+    return request<AgentSession[]>('GET', `/api/agent/sessions${q ? `?${q}` : ''}`)
+  },
   // CLI 不在服务器上时后端回 409,提示先装。resume = 要续聊的旧会话 id。
   agentSessionCreate: (b: { app: AgentApp; workspace: string; resume?: string; resumeExternal?: string; title?: string; permissionMode?: string; model?: string; effort?: string }) =>
     request<AgentSession>('POST', '/api/agent/sessions', b),
@@ -325,6 +334,10 @@ export interface AgentStatusPayload { state: 'running' | 'idle' }
 // (首个 reasoning_delta → 完整思考块落库),前端直接用,不再按相邻事件的
 // created_at 推算。老数据是裸字符串 payload,没有这个字段。
 export interface AgentReasoning { text: string; durationMs?: number }
+// KindStreamSnapshot 负载:订阅(重)连上时服务端补的直播快照 —— 当前生成块
+// 已经流过的正文与思考(增量不落库,历史回放里没有)。thinkMs 是这段思考已经
+// 进行的毫秒数,秒表起点据此续上,不必去猜"上一条持久化消息是什么时候"。
+export interface AgentStreamSnapshot { text: string; think: string; thinkMs: number }
 export interface AgentErrorPayload { message: string }
 // KindUsage 负载:当前上下文占用 token(claude=input+cache;codex input 含缓存)。
 // window 是真实上下文窗口(claude result 的 modelUsage 透传;0/缺省回落启发式)。

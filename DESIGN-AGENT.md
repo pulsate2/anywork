@@ -154,7 +154,7 @@ type Driver interface {
 
 **REST(所有操作)**
 ```
-GET    /api/agent/sessions                        # 列表:运行中 + 可恢复的历史
+GET    /api/agent/sessions                        # 列表(按工作区分页:每目录最近 10 条,?workspace=&offset=&limit= 翻更早)
 POST   /api/agent/sessions                        # 建会话 {app, workspaceID, resume?, permissionMode?}
 GET    /api/agent/sessions/:id/messages           # 历史/增量:?afterSeq=&limit=(首次 afterSeq=0)
 POST   /api/agent/sessions/:id/messages           # 发消息 {text};回合进行中 = 插话
@@ -173,6 +173,8 @@ DELETE /api/agent/sessions/:id                    # 结束并归档
 
 - 同一会话多个订阅者广播(多标签页/换设备)。
 - **断线恢复不靠 WS 回放**:重连 → 重新 subscribe → `GET messages?afterSeq=本地最大seq` 补差。与 hapi 的 afterSeq 游标同思路,但库就在本机,不需要它的三层兜底。
+- **直播快照**:流式增量(assistant_delta/reasoning_delta)只广播不落库,中途订阅(退出立刻重进、切后台回来)的客户端本来只能看到半截正文/思考。订阅时服务端补一条 `stream_snapshot`(当前生成块已流过的全部内容 + 这段思考已进行的毫秒数),前端覆盖缓冲、秒表续上。生成块边界(完整消息/工具调用/错误/回合结束)两边同步清空。
+- **重连标识**:WS 断开时页面顶部挂一条"连接已断开,正在重连…",接回来转"已重新连接"留 2 秒。退避重连最长 15 秒,没有标识的话画面就是彻底不动,用户分不清是网断了还是 agent 卡住。半开连接(切后台回来,readyState 仍报 OPEN、onclose 不触发)由前端主动换连接,这条路径没有 close 事件,标识在前端补挂。
 - 消息全量落库,历史加载就是普通分页查询,不引入环形缓冲(见 5.4 边界)。
 
 ### 5.4 存储
@@ -295,7 +297,7 @@ web/src/components/agent/
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/agent/sessions` | 会话列表(运行中 + 可恢复) |
+| GET | `/api/agent/sessions` | 会话列表(按工作区分页,每目录默认 10 条;`?workspace=&offset=&limit=` 翻更早) |
 | POST | `/api/agent/sessions` | 建会话(app/workspaceID/resume/permissionMode);CLI 不存在回 409 |
 | GET | `/api/agent/sessions/:id/messages` | 历史/增量(`afterSeq`+`limit` 游标分页) |
 | POST | `/api/agent/sessions/:id/messages` | 发消息;回合进行中 = 插话 |

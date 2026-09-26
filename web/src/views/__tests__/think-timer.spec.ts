@@ -108,7 +108,8 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
     w.unmount()
   })
 
-  it('退出重进:起点回退到上一条持久化事件的 createdAt,计时续上不归零', async () => {    const w = mount({
+  it('退出重进:起点是首个增量,不再拿上一条持久化消息的时间当起点', async () => {
+    const w = mount({
       components: { NMessageProvider, AgentView },
       template: '<n-message-provider><agent-view /></n-message-provider>',
     }, { global: { plugins: [createPinia()] } })
@@ -117,15 +118,43 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
     await vm.openSession(SID)
     await flushPromises()
 
-    // 重进前的现场:思考 65 秒前就开始了,但增量是瞬态的,回放里没有 ——
-    // 时间线最后一条持久化事件(用户消息)的 createdAt 就是思考的起点。
+    // 用户消息是 65 秒前落的,但那 65 秒里 agent 在跑工具 —— 思考是刚刚才开始
+    // 的。拿上一条消息的时间当起点会一上来就从 1 分 5 秒跳起(用户:实际思考
+    // 3 秒,你却从 8 秒开始),现在从首个增量这一刻起表。
     const t0 = new Date(Date.now() - 65_000).toISOString()
     await fire({ type: 'message', event: { sessionId: SID, kind: 'user', payload: '跑吧', seq: 1, createdAt: t0 } })
-    // 重进后第一条增量:直播卡出现,读数直接接上(1 分 5 秒,不是 1 秒)
     await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning_delta', payload: '继续想' } })
     const summary = () => w.find('.chat-row.reasoning summary').text()
+    expect(summary()).toBe('思考中 · 1 秒')
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(summary()).toBe('思考中 · 3 秒')
+    w.unmount()
+  })
+
+  // 退出立刻重进:增量是瞬态的、回放里没有,订阅时服务端补一份直播快照
+  // (stream_snapshot)—— 正文要从头显示,秒表按已进行时长续上,不是归零重来。
+  it('订阅快照:正文补全,秒表按已进行时长续上', async () => {
+    const w = mount({
+      components: { NMessageProvider, AgentView },
+      template: '<n-message-provider><agent-view /></n-message-provider>',
+    }, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+    const vm = w.findComponent(AgentView).vm as any
+    await vm.openSession(SID)
+    await flushPromises()
+
+    await fire({
+      type: 'message',
+      event: {
+        sessionId: SID, kind: 'stream_snapshot', seq: 0, createdAt: '2026-09-15T12:00:00Z',
+        payload: { text: '结论是……', think: '先理一下思路 **重点是并发**', thinkMs: 65_000 },
+      },
+    })
+    const summary = () => w.find('.chat-row.reasoning summary').text()
+    // 正文是按快照覆盖进来的(不是从半截开始,也不是追加)。
+    expect(w.find('.reasoning-body').html()).toContain('<strong>')
     expect(summary()).toBe('思考中 · 1 分 5 秒')
-    // 时间再走 5 秒:在已有基础上跳
+    // 时间再走 5 秒:在已有基础上跳,不是从 1 秒重来。
     await vi.advanceTimersByTimeAsync(5000)
     expect(summary()).toBe('思考中 · 1 分 10 秒')
     w.unmount()

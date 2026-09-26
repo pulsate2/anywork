@@ -24,6 +24,12 @@ const (
 	settingCleanupAuto    = "agent.cleanup.auto"    // 默认关
 	settingCleanupLastRun = "agent.cleanup.lastRun" // 最近一次自动清理结果 JSON
 	defaultCleanupDays    = 30
+
+	// defaultSessionPage 会话列表每页条数(按工作区):每个目录先只回最近 10
+	// 条。会话攒久了(清理阈值 30 天)一次全拉又慢又占内存,更早的由前端在
+	// 分组里"加载更多"逐页翻。maxSessionPage 挡住 limit=100000 这种请求。
+	defaultSessionPage = 10
+	maxSessionPage     = 200
 )
 
 // Handlers agent 域的 REST + WS 入口。
@@ -62,9 +68,29 @@ func toSessionJSON(s *Session, running bool) sessionJSON {
 	}
 }
 
-// List GET /api/agent/sessions —— 全部会话(含已结束、可续聊),新的在前。
+// List GET /api/agent/sessions?workspace=&offset=&limit= —— 会话列表(分页)。
+// 不带 workspace:每个工作区最近 limit 条(首屏,组内最近活动的在前);
+// 带 workspace:该目录的一页,offset 往更早翻(前端分组的"加载更多")。
+// 只回 limit 条,前端按"有没有回到满一页"判断后面还有没有,不必再要一个总数。
 func (h *Handlers) List(w http.ResponseWriter, r *http.Request) {
-	sessions, err := h.store.ListSessions()
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > maxSessionPage {
+		limit = defaultSessionPage
+	}
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	var (
+		sessions []Session
+		err      error
+	)
+	if ws := q.Get("workspace"); ws != "" {
+		sessions, err = h.store.ListSessionsPage(ws, limit, offset)
+	} else {
+		sessions, err = h.store.ListRecentByWorkspace(limit)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
