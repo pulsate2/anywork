@@ -74,7 +74,7 @@ const (
 	PermPlan   = "plan"   // 只读规划:claude plan / codex untrusted+read-only
 	PermAsk    = "ask"    // 每次询问(默认):claude default / codex on-request
 	PermEdits  = "edits"  // 放行编辑:claude acceptEdits / codex on-failure
-	PermAccept = "accept" // 全放行:claude bypassPermissions / codex never
+	PermAccept = "accept" // 全放行:claude stdio 由服务端代答(不经沙箱)/ codex never
 )
 
 // validPermMode 校验权限模式取值。

@@ -2,6 +2,7 @@
 // Agent 会话远控:会话列表 + 聊天时间线(DESIGN-AGENT.md)。普通聊天风格:
 // 消息气泡、工具调用折叠卡、审批卡;REST 操作 + WS 推送(断线 afterSeq 补差)。
 import { computed, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
@@ -21,6 +22,8 @@ import StatusBar from '@/components/agent/StatusBar.vue'
 
 const message = useMessage()
 const wsStore = useWorkspaceStore()
+const route = useRoute()
+const router = useRouter()
 // 聊天打开时进沉浸模式:底部导航滑走(BottomNav 消费),返回列表/离开页面即恢复。
 const immersive = useImmersive()
 
@@ -31,6 +34,28 @@ const selectedId = ref<string | null>(null)
 const selected = computed(() => sessions.value.find((s) => s.id === selectedId.value) ?? null)
 // 聊天打开 → 沉浸模式(导航滑走);返回列表即退出。视图卸载时在 onBeforeUnmount 兜底复位。
 watch(selectedId, (v) => { immersive.value = !!v })
+
+// ---- URL ↔ 会话绑定 ----
+// 会话 id 记进 URL(/agent?session=<id>):刷新浏览器回到同一会话,浏览器前进/
+// 后退也在会话之间走。URL 是唯一事实来源 —— openSession/backToList 每次改动都
+// 写回 URL,反向由下面的 route 监听驱动;靠 query 与 selectedId 相等时短路,
+// 避免"改 URL 触发监听、监听又改 URL"的回环。
+function syncUrl(id: string | null, replace = false) {
+  const cur = (route.query.session as string) || null
+  if (cur === id) return // 已一致:不产生多余的历史记录/导航
+  const query: Record<string, string> = {}
+  for (const [k, v] of Object.entries(route.query)) if (v != null) query[k] = String(v)
+  if (id) query.session = id
+  else delete query.session
+  const to = { path: route.path, query }
+  replace ? router.replace(to) : router.push(to)
+}
+watch(() => route.query.session, (v) => {
+  const id = (v as string) || null
+  if (id === selectedId.value) return // 是我们自己写进去的,别重复打开
+  if (id) openSession(id)
+  else backToList()
+})
 
 // 会话列表分页:每个工作区先只拉最近 SESSION_PAGE 条,分组底部"加载更多"再翻
 // 这个目录的下一页(服务端按 workspace+offset 翻)。会话攒久了(清理阈值 30 天)
@@ -968,6 +993,7 @@ const messagesLoading = ref(false)
 async function openSession(id: string) {
   if (selectedId.value && selectedId.value !== id) ws.unsubscribe(selectedId.value)
   selectedId.value = id
+  syncUrl(id) // 打开即写进 URL:刷新/后退都能回到这个会话
   messages.value = []
   messagesLoading.value = true
   streamText.value = ''
@@ -977,6 +1003,11 @@ async function openSession(id: string) {
   pendingBubbles.value = []
   queued.value = []
   hasOlder.value = false
+  // 清掉上一会话残留的浮标与"在翻历史"标记:否则打开新会话时首屏消息
+  // 落库(maxSeq 0→N)会撞上旧的 scrolledUp,凭空记一条"有 1 条新消息"。
+  // 两个 ref 声明在本函数下方,但只在此处被调用时读取(非 setup 期),无 TDZ。
+  newMsgCount.value = 0
+  scrolledUp.value = false
   try {
     const got = await api.agentMessages(id, { limit: MSG_PAGE })
     messages.value = got
@@ -991,6 +1022,9 @@ async function openSession(id: string) {
   }
   ws.subscribe(id)
   scrollBottom(true)
+  // 强制跟底后再确认一次:加载/重排期间挤出的计数一律作废。此刻人就在
+  // 底部,计数值只可能来自开场的假事件,清成 0 是对的(有别的新事件会照常再计)。
+  nextTick(() => { newMsgCount.value = 0 })
 }
 
 async function loadOlder() {
@@ -1020,8 +1054,11 @@ async function loadOlder() {
 function backToList() {
   if (selectedId.value) ws.unsubscribe(selectedId.value)
   selectedId.value = null
+  syncUrl(null, true) // replace:返回列表不该在历史里留一条"会话"记录,否则浏览器后退又弹回去
   messages.value = []
   queued.value = []
+  newMsgCount.value = 0
+  scrolledUp.value = false
   loadSessions()
 }
 
@@ -1044,6 +1081,8 @@ const scrolledUp = ref(false)
 function onTimelineScroll() {
   const el = timelineEl.value
   if (!el) return
+  // 加载历史期间布局还在变,挤出的 scroll 事件别当成"用户在翻历史"。
+  if (messagesLoading.value) return
   const up = el.scrollHeight - el.scrollTop - el.clientHeight > 120
   // 用户滚回底部:浮标即刻消失(顺滑,不必等事件)。
   if (!up && newMsgCount.value) newMsgCount.value = 0
@@ -1369,14 +1408,23 @@ function openSettings() {
 
 // 应用设置并同步本地会话记录;note 非空 = 保存了但不立即生效(claude 续聊才生效)。
 async function applySettings(patch: { model?: string; effort?: string; permissionMode?: string }) {
-  if (!selectedId.value) return
+  const id = selectedId.value
+  if (!id) return
   setBusy.value = true
   try {
-    const res = await api.agentSettings(selectedId.value, patch)
-    const i = sessions.value.findIndex((x) => x.id === selectedId.value)
+    // 切换权限模式不弹提示:后端那条 note("已保存:当前回合由服务端代答 / 下一条
+    // 消息起重启会话")是噪音 —— 设置弹窗里已经写明 claude 改设置续聊生效。放行
+    // 模式下后端每次应用都回这条,所以只要落到"放行"也一并静默。
+    const prev = sessions.value.find((x) => x.id === id)
+    const quiet = patch.permissionMode === 'accept'
+      || (patch.permissionMode !== undefined && patch.permissionMode !== prev?.permissionMode)
+    const res = await api.agentSettings(id, patch)
+    const i = sessions.value.findIndex((x) => x.id === id)
     if (i >= 0) sessions.value[i] = { ...sessions.value[i], ...res.session }
-    if (res.note) message.warning(res.note)
-    else message.success('已生效(下一回合起)')
+    if (!quiet) {
+      if (res.note) message.warning(res.note)
+      else message.success('已生效(下一回合起)')
+    }
     settingsModal.value = false
   } catch (e: any) {
     message.error(e?.message || '设置失败')
@@ -1580,6 +1628,9 @@ onMounted(async () => {
   window.addEventListener('focus', onResume)
   window.addEventListener('online', onResume)
   await Promise.all([loadSessions(), wsStore.ensure()])
+  // 刷新页面:URL 里记着会话就直接进去(放在列表加载之后,侧栏/标题能立刻对上)。
+  const sid = (route.query.session as string) || null
+  if (sid) openSession(sid)
 })
 onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibility)

@@ -702,33 +702,18 @@ func TestClaudeExitDetail(t *testing.T) {
 	}
 }
 
-// TestClaudeEnvSandbox 放行模式必须注入 IS_SANDBOX=1:root 部署下 claude
-// 拒启 bypassPermissions,不注入的话"全部放行"形同虚设;其它模式不带,
-// 宿主环境里的 IS_SANDBOX 也不该漏进非放行会话。
-func TestClaudeEnvSandbox(t *testing.T) {
-	t.Setenv("IS_SANDBOX", "")
-	os.Unsetenv("IS_SANDBOX")
+// TestClaudeEnvNoSandbox 沙箱模式会禁用一批工具,绝不能落进 claude:全放行
+// (accept)现在靠服务端 stdio 代答,不再需要 IS_SANDBOX=1;宿主环境里的
+// IS_SANDBOX(服务本身可能就跑在沙箱里)也必须摘掉,免得工具被减。
+func TestClaudeEnvNoSandbox(t *testing.T) {
+	t.Setenv("IS_SANDBOX", "1") // 模拟宿主带毒,必须被剔除
 
-	for _, tc := range []struct {
-		mode   string
-		want   bool
-		effort string
-	}{
-		{PermAccept, true, ""},
-		{PermAccept, true, EffortHigh},
-		{PermAsk, false, ""},
-		{PermPlan, false, ""},
-		{PermEdits, false, ""},
-	} {
-		env := claudeEnv(nil, tc.effort, tc.mode)
-		got := false
+	for _, effort := range []string{"", EffortLow, EffortMedium, EffortHigh} {
+		env := claudeEnv(nil, effort)
 		for _, kv := range env {
-			if kv == "IS_SANDBOX=1" {
-				got = true
+			if strings.HasPrefix(kv, "IS_SANDBOX=") {
+				t.Errorf("claudeEnv(effort=%q) 泄漏了 %s", effort, kv)
 			}
-		}
-		if got != tc.want {
-			t.Errorf("claudeEnv(perm=%s) IS_SANDBOX=1 = %v,期望 %v", tc.mode, got, tc.want)
 		}
 	}
 }

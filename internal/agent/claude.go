@@ -31,9 +31,10 @@ type claudeDriver struct {
 	// 会话级放行规则(本会话允许):Bash 存完整命令串(和 Bash(cmd) 语义对齐),
 	// 其它工具存工具名。同类请求来时直接放行,不再推审批卡。
 	sessionRules map[string]bool
-	// autoAllow 全部放行的中途接管(ApplySettings 置位):权限模式运行中切
-	// 到 accept 时进程还是旧模式在弹询问,重启又要等下一条消息 —— 这段
-	// 空窗里 driver 替用户答应。重启后由 bypassPermissions 接棒,不再询问。
+	// autoAllow 全部放行的中途接管:accept 模式在 Start 里就置位(本会话
+	// 每条询问由服务端直接答 allow,不进沙箱);权限模式运行中切到 accept
+	// 时进程仍是旧模式在弹询问,也由它代答。两种情形都靠 handleCanUseTool
+	// 的 autoAllow 分支直接放行,不再推审批卡。
 	autoAllow bool
 	// 审批挂起时记下工具与参数,Resolve 时生成会话规则用。
 	lastReqTool map[string]string
@@ -141,11 +142,16 @@ func (d *claudeDriver) Start(opts StartOpts) error {
 		// 流式增量:partial message 事件(text_delta/thinking_delta)随生成
 		// 逐段到达,完整消息照旧在后面;不接的话长思考期间远端一直空白。
 		"--include-partial-messages"}
-	// 权限询问走 stdio 控制协议(plan/ask/edits 都可能产生询问);
-	// accept 直接 bypass,不会有询问。映射:plan/acceptEdits/bypassPermissions。
+	// 权限询问一律走 stdio 控制协议,由服务端代答。
+	// plan/edits 另带 --permission-mode(只读规划 / 自动放行编辑),询问照常
+	// 推给用户。accept(全放行)不再用 bypassPermissions:它在 root 下要靠
+	// IS_SANDBOX=1 才肯启动,而沙箱模式会禁用一批工具(见 claudeEnv)。改成
+	// 同样走 stdio,但 driver 内存里 autoAllow 把每条询问直接答 allow ——
+	// 不弹卡、不落事件,放行效果与 bypass 一致,却不进沙箱、工具不做减法。
 	switch opts.PermissionMode {
 	case PermAccept:
-		args = append(args, "--permission-mode", "bypassPermissions")
+		args = append(args, "--permission-prompt-tool", "stdio")
+		d.autoAllow = true
 	case PermPlan:
 		args = append(args, "--permission-mode", "plan", "--permission-prompt-tool", "stdio")
 	case PermEdits:
@@ -162,7 +168,7 @@ func (d *claudeDriver) Start(opts StartOpts) error {
 
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = opts.Cwd
-	cmd.Env = claudeEnv(opts.Env, opts.Effort, opts.PermissionMode)
+	cmd.Env = claudeEnv(opts.Env, opts.Effort)
 	// 独立进程组:kill 时整棵进程树一起收(claude 起的 bash/node 不留孤儿)。
 	setProcessGroup(cmd)
 
@@ -196,7 +202,10 @@ func (d *claudeDriver) Start(opts StartOpts) error {
 // claudeEnv 会话环境:DISABLE_AUTOUPDATER 防自动更新打断回合;
 // CLAUDE_CODE_ENTRYPOINT 归一成 sdk —— 服务进程可能是从某个 claude 会话里启动的,
 // 不归一会把宿主会话的标记带进去。
-func claudeEnv(extra []string, effort, permMode string) []string {
+// IS_SANDBOX 一律剔除:沙箱模式会禁用一批工具,而全放行(accept)现在靠
+// 服务端 stdio 代答、根本不用 bypassPermissions,不需要它;宿主环境若带着
+// IS_SANDBOX=1(服务本身跑在沙箱里)也必须摘掉,否则 claude 又落回沙箱、工具又少。
+func claudeEnv(extra []string, effort string) []string {
 	env := make([]string, 0, len(os.Environ())+5)
 	for _, kv := range os.Environ() {
 		switch k, _, _ := strings.Cut(kv, "="); k {
@@ -206,12 +215,6 @@ func claudeEnv(extra []string, effort, permMode string) []string {
 		env = append(env, kv)
 	}
 	env = append(env, "DISABLE_AUTOUPDATER=1", "CLAUDE_CODE_ENTRYPOINT=sdk")
-	// root 下 bypassPermissions 会被 claude 直接拒启("cannot be used with
-	// root/sudo privileges")—— 本工作台常见部署形态就是 root,不放行模式
-	// 会形同虚设。IS_SANDBOX=1 是 claude 官方给容器/沙箱环境的豁免开关。
-	if permMode == PermAccept {
-		env = append(env, "IS_SANDBOX=1")
-	}
 	// 思考强度档位 → 思考 token 预算(claude 官方档位语义,none = 不设,交给默认)。
 	switch effort {
 	case EffortLow:
