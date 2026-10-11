@@ -36,6 +36,13 @@ function actionKind(tool: string): Kind {
   if (tool === 'Bash' || tool === 'CodexBash' || tool === 'shell_command' || tool === 'run_shell_command') return 'command'
   if (['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'CodexPatch', 'CodexDiff', 'ApplyPatch'].includes(tool)) return 'mutation'
   if (tool === 'WebFetch' || tool === 'WebSearch') return 'web'
+  // pi(小写):读/搜/命令/改文件/网页,与 toolIcons.toolCategoryIcon 对齐。
+  const t = tool.toLowerCase()
+  if (['read', 'read_file', 'cat', 'view'].includes(t)) return 'read'
+  if (['grep', 'ripgrep', 'glob', 'find', 'fd', 'ls', 'list', 'tree', 'search'].includes(t)) return 'search'
+  if (['bash', 'shell', 'sh', 'powershell', 'run'].includes(t)) return 'command'
+  if (['write', 'edit', 'replace', 'replace_match', 'insert', 'copy', 'move', 'undo_last_change', 'create'].includes(t)) return 'mutation'
+  if (['fetch', 'web_fetch', 'webfetch', 'web_search', 'websearch', 'browse'].includes(t)) return 'web'
   return 'other'
 }
 
@@ -104,17 +111,37 @@ function diffPath(args: Record<string, unknown> | null): string | null {
   return m ? m[1].trim() : null
 }
 
+// pi 的 replace/insert/copy/move 参数里只有锚点、没有文件名,文件名在结果
+// 回填的 patch(c.diff)的 "+++ 路径" 头里 —— 不取就会退到首值露出锚点。
+function diffFieldPath(c: AgentToolCall): string | null {
+  const d = c.diff
+  if (typeof d !== 'string' || !d) return null
+  const m = d.match(/^\+\+\+ (?:b\/)?([^\t\n]+)/m)
+  return m ? m[1].trim() : null
+}
+
 function basename(v: string): string {
   return v.replace(/\\/g, '/').split('/').filter(Boolean).pop() || v
 }
+
+// pi 的锚点改文件工具:参数里只有锚点、没有路径,文件名只在结果回填的 c.diff 里。
+// diff 没回填前(running)取不到名字 —— 此时宁可退到工具名,也不能把锚点(首值
+// 兜底)当目标露出来(就是 TLFI/BYZO 的来源)。
+const PI_ANCHOR_EDIT = new Set(['replace', 'replace_match', 'insert', 'copy', 'move', 'undo_last_change'])
 
 // 一条工具的目标摘要:按意图取对应字段,取不到退到兜底。
 function callTarget(c: AgentToolCall): string | null {
   const args = parseArgs(c)
   const kind = actionKind(c.tool)
   if (kind === 'read' || kind === 'mutation') {
-    return label(argString(args, ['file_path', 'path', 'file', 'filePath', 'notebook_path']))
-      ?? patchPaths(args) ?? diffPath(args) ?? argLabel(args, [])
+    // pi 的 replace/insert/copy/move 参数无路径(只有锚点),diffFieldPath 从结果
+    // 回填的 c.diff 里取文件名,排在首值兜底前,否则会露出 TLFI/BYZO。
+    const path = label(argString(args, ['file_path', 'path', 'file', 'filePath', 'notebook_path']))
+      ?? patchPaths(args) ?? diffPath(args) ?? diffFieldPath(c)
+    if (path) return path
+    // 锚点工具:取不到路径就别退首值(那是锚点),返回 null 让行显示工具名。
+    if (PI_ANCHOR_EDIT.has((c.tool || '').toLowerCase())) return null
+    return argLabel(args, [])
   }
   if (kind === 'search') return argLabel(args, ['pattern', 'query'])
   if (kind === 'command') return argLabel(args, ['command', 'cmd'])

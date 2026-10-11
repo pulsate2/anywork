@@ -89,12 +89,23 @@ export const ToolStatusIcon: FunctionalComponent<{ state: string }> = (props) =>
 
 // 工具 → 分类图标(hapi knownTools 注册表精简):读=眼、搜=放大镜、
 // 写=折角文件、命令=终端、网页=地球,其余(mcp__*、子 agent、未知)扳手。
+// claude/codex 的工具名是 PascalCase / 带前缀,pi 的是小写下划线(read/
+// edit/replace_match/grep/ls…),两套命名不撞,分别匹配;pi 没列进来就全落
+// 扳手了(用户实测:pi 的读写类工具一水儿扳手)。
 export function toolCategoryIcon(tool: string): FunctionalComponent {
-  if (tool === 'Read' || tool === 'NotebookRead' || tool === 'Grep' || tool === 'view_image') return EyeIcon
-  if (tool === 'Glob' || tool === 'LS') return SearchIcon
+  // claude / codex(原样大小写)
+  if (['Read', 'NotebookRead', 'Grep', 'view_image'].includes(tool)) return EyeIcon
+  if (['Glob', 'LS'].includes(tool)) return SearchIcon
   if (['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'CodexPatch', 'CodexDiff', 'ApplyPatch'].includes(tool)) return FileDiffIcon
-  if (tool === 'Bash' || tool === 'CodexBash' || tool === 'shell_command' || tool === 'run_shell_command') return TerminalIcon
-  if (tool === 'WebFetch' || tool === 'WebSearch') return GlobeIcon
+  if (['Bash', 'CodexBash', 'shell_command', 'run_shell_command'].includes(tool)) return TerminalIcon
+  if (['WebFetch', 'WebSearch'].includes(tool)) return GlobeIcon
+  // pi(小写;edit 类见 pi_gate.mjs 的 EDIT 集)
+  const t = tool.toLowerCase()
+  if (['read', 'read_file', 'cat', 'view'].includes(t)) return EyeIcon
+  if (['grep', 'ripgrep', 'glob', 'find', 'fd', 'ls', 'list', 'tree', 'search'].includes(t)) return SearchIcon
+  if (['write', 'edit', 'replace', 'replace_match', 'insert', 'copy', 'move', 'undo_last_change', 'create'].includes(t)) return FileDiffIcon
+  if (['bash', 'shell', 'sh', 'powershell', 'run'].includes(t)) return TerminalIcon
+  if (['fetch', 'web_fetch', 'webfetch', 'web_search', 'websearch', 'browse'].includes(t)) return GlobeIcon
   return WrenchIcon
 }
 

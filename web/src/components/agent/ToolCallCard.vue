@@ -127,15 +127,41 @@ function parseArgsLenient(): Record<string, unknown> | null {
 // 摘要行给一眼能认出的关键参数:命令(Bash 的 command)、路径、文件名,
 // 多智能体工具(spawn_agent 的 task_name、send_message 的 message 等),
 // 子 agent(Agent/Task 的 description、TaskOutput 的 task_id)。
+// pi 的编辑类工具里,replace/replace_match/insert/copy/move 的参数只有 4 字
+// 锚点(remove_from/replace_from/anchor/source_from…),没有文件名 —— 文件名
+// 只在结果回填的 unified patch(call.diff)里。这些工具绝不能退到"首个参数值"
+// 兜底,否则卡头显示成 "TLFI"/"BYZO" 这种锚点(用户实测)。
+const PI_ANCHOR_EDIT = new Set(['replace', 'replace_match', 'insert', 'copy', 'move', 'undo_last_change', 'edit', 'write'])
 const brief = computed(() => {
   const args = parseArgs()
   if (!args) return ''
   for (const key of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'task_name', 'description', 'task_id', 'target', 'message']) {
     if (typeof args[key] === 'string' && (args[key] as string)) return args[key] as string
   }
+  // pi 锚点编辑类:路径交给 diffBrief 从 patch 取,别盲取首值露出锚点。
+  if (PI_ANCHOR_EDIT.has((props.call.tool || '').toLowerCase())) return ''
   const first = Object.values(args)[0]
   if (typeof first === 'string' && first) return first
   return ''
+})
+
+// pi 编辑类工具的文件名摘要:从结果回填的 unified patch(call.diff)第一个
+// "+++ 路径" 取基名,多文件标 (+n)。pi 的 replace/insert/copy/move 参数里没有
+// 文件名,只有锚点,文件名只能从 patch 头取。
+const diffBrief = computed(() => {
+  const d = props.call.diff
+  if (!d) return ''
+  let name = ''
+  let files = 0
+  for (const line of d.split('\n')) {
+    if (line.startsWith('+++ ')) {
+      files++
+      if (!name) name = line.replace(/^\+\+\+ (b\/)?/, '')
+    }
+  }
+  if (!name) return ''
+  const base = name.split('/').pop() || name
+  return files > 1 ? `${base} (+${files - 1})` : base
 })
 
 // CodexDiff 的行摘要:取 unified diff 里第一个 "+++ 路径" 的文件名,
@@ -297,7 +323,7 @@ const inlineDiff = computed(() =>
       <!-- 分类图标替代文字工具名(hapi 同款);兜底类保留名字 -->
       <span class="tool-icon"><component :is="headIcon" /></span>
       <span v-if="headNamed" class="tool-name">{{ call.tool || '工具' }}</span>
-      <span v-if="codexDiffBrief || applyPatchBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || brief }}</span>
+      <span v-if="codexDiffBrief || applyPatchBrief || diffBrief || brief" class="tool-brief">{{ codexDiffBrief || applyPatchBrief || diffBrief || brief }}</span>
       <span class="tool-state" :class="statusState"><ToolStatusIcon :state="statusState" /></span>
     </button>
     <!-- 子 agent 过程:一行触发(数量 + 实时进展),点开左右两栏弹窗 -->
