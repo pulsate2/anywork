@@ -140,6 +140,10 @@ function parseUnifiedDiff(text: string): DiffBlock[] {
   for (const line of text.split('\n')) {
     if (line.startsWith('diff --git')) { flush(); continue }
     if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
+      // 裸多文件 patch(pi 的 move、批次合并)无 diff --git 分隔,文件边界只剩
+      // --- / +++ 头对:正收着上一个文件的 hunk 时遇到新 +++ 头,先 flush 切块,
+      // 否则两文件的增删行糊成一块、路径还取了后一个。
+      if (inHunk) flush()
       fileName = line.replace(/^\+\+\+ (b\/)?/, '')
       continue
     }
@@ -171,6 +175,19 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
       return blocks.length ? blocks : null
     }
     return null
+  }
+  // pi 编辑类:后端把结果的标准 unified patch 挂在 call.diff 上(edit/
+  // replace_match/insert/copy/move),直接解析呈现。
+  if (typeof c.diff === 'string' && c.diff) {
+    const blocks = parseUnifiedDiff(c.diff)
+    if (blocks.length) return blocks
+  }
+  // pi 的 write:无 patch,按 start 入参的 content/path 当新建内容呈现。
+  if (t === 'write') {
+    const a = parseArgsLenient(c)
+    const content = typeof a?.content === 'string' ? a.content : ''
+    const path = typeof a?.path === 'string' ? a.path : typeof a?.file_path === 'string' ? a.file_path : ''
+    return content ? [{ old: '', new: content, path }] : null
   }
   if (t !== 'Edit' && t !== 'MultiEdit' && t !== 'Write' && t !== 'NotebookEdit') return null
   const args = parseArgsLenient(c)

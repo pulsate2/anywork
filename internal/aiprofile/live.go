@@ -13,6 +13,14 @@ type codexPayload struct {
 	Config string         `json:"config"`
 }
 
+// piPayload Pi 的配置载荷:auth.json(providerId → {type:"api_key",key} / oauth)
+// 与 models.json({"providers":{…}} —— baseUrl/api/模型表)。两者都是 JSON,
+// 分别落回 ~/.pi/agent/auth.json 与 models.json。
+type piPayload struct {
+	Auth   map[string]any `json:"auth"`
+	Models map[string]any `json:"models"`
+}
+
 func (s *Service) claudeSettings() string {
 	return filepath.Join(s.home, ".claude", "settings.json")
 }
@@ -20,6 +28,19 @@ func (s *Service) claudeSettings() string {
 func (s *Service) codexConfig() string { return filepath.Join(s.home, ".codex", "config.toml") }
 
 func (s *Service) codexAuth() string { return filepath.Join(s.home, ".codex", "auth.json") }
+
+// piAgentDir ~/.pi/agent;PI_CODING_AGENT_DIR 覆盖(与驱动 / 续聊列表同规则,
+// 保证写进去的凭据正是 pi 启动时读的那份)。
+func (s *Service) piAgentDir() string {
+	if d := os.Getenv("PI_CODING_AGENT_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(s.home, ".pi", "agent")
+}
+
+func (s *Service) piAuth() string { return filepath.Join(s.piAgentDir(), "auth.json") }
+
+func (s *Service) piModels() string { return filepath.Join(s.piAgentDir(), "models.json") }
 
 // validate 只查能确定的部分:Claude 必须是 JSON 对象,Codex 必须是
 // {"auth":{…},"config":"…"}。config.toml 的语法不校验(项目里没有 TOML 依赖),
@@ -41,12 +62,19 @@ func validate(app string, cfg json.RawMessage) error {
 			return invalid(`codex 配置要形如 {"auth":{…},"config":"…"}: %v`, err)
 		}
 		return nil
+	case AppPi:
+		var p piPayload
+		if err := json.Unmarshal(cfg, &p); err != nil {
+			return invalid(`pi 配置要形如 {"auth":{…},"models":{…}}: %v`, err)
+		}
+		return nil
 	}
 	return ErrApp
 }
 
 // liveExists 主配置文件还在不在。codex 的 auth.json 不算:它主要装 OAuth 登录态,
-// 缺了也不代表 config.toml 没了。
+// 缺了也不代表 config.toml 没了。pi 则相反 —— key 就在 auth.json 里,所以
+// models.json 在、或 auth.json 有实质内容(非空对象),都算已有配置。
 func (s *Service) liveExists(app string) bool {
 	var path string
 	switch app {
@@ -54,6 +82,19 @@ func (s *Service) liveExists(app string) bool {
 		path = s.claudeSettings()
 	case AppCodex:
 		path = s.codexConfig()
+	case AppPi:
+		if _, err := os.Stat(s.piModels()); err == nil {
+			return true
+		}
+		raw, err := os.ReadFile(s.piAuth())
+		if err != nil {
+			return false
+		}
+		var m map[string]any
+		if json.Unmarshal(raw, &m) != nil {
+			return false
+		}
+		return len(m) > 0
 	default:
 		return false
 	}
@@ -87,6 +128,27 @@ func (s *Service) readLive(app string) json.RawMessage {
 		p := codexPayload{Auth: map[string]any{}, Config: string(conf)}
 		if authErr == nil {
 			_ = json.Unmarshal(auth, &p.Auth)
+		}
+		out, err := json.Marshal(p)
+		if err != nil {
+			return nil
+		}
+		return out
+	case AppPi:
+		auth, authErr := os.ReadFile(s.piAuth())
+		models, modelsErr := os.ReadFile(s.piModels())
+		if authErr != nil && modelsErr != nil {
+			return nil
+		}
+		p := piPayload{Auth: map[string]any{}}
+		if authErr == nil {
+			_ = json.Unmarshal(auth, &p.Auth)
+		}
+		if modelsErr == nil {
+			var m map[string]any
+			if json.Unmarshal(models, &m) == nil {
+				p.Models = m
+			}
 		}
 		out, err := json.Marshal(p)
 		if err != nil {
@@ -129,6 +191,31 @@ func (s *Service) writeLive(app string, cfg json.RawMessage) error {
 			return err
 		}
 		return writeAtomic(s.codexAuth(), append(data, '\n'), 0o600)
+	case AppPi:
+		var p piPayload
+		if err := json.Unmarshal(cfg, &p); err != nil {
+			return invalid(`pi 配置要形如 {"auth":{…},"models":{…}}: %v`, err)
+		}
+		// models.json 为空就不动:可能只用 pi 内置 provider,靠 auth.json 的 key 跑。
+		if len(p.Models) > 0 {
+			data, err := json.MarshalIndent(p.Models, "", "  ")
+			if err != nil {
+				return err
+			}
+			if err := writeAtomic(s.piModels(), append(data, '\n'), 0o600); err != nil {
+				return err
+			}
+		}
+		// auth.json 为空不动:OAuth 登录态也存这儿,删了等于把人踢下线;
+		// 切走时的回填已经把它收进了旧记录。
+		if len(p.Auth) == 0 {
+			return nil
+		}
+		data, err := json.MarshalIndent(p.Auth, "", "  ")
+		if err != nil {
+			return err
+		}
+		return writeAtomic(s.piAuth(), append(data, '\n'), 0o600)
 	}
 	return ErrApp
 }

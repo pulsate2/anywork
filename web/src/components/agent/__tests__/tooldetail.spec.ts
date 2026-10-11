@@ -67,4 +67,51 @@ describe('详情弹窗的文件名', () => {
     expect(w.find('.tool-path').exists()).toBe(false)
     expect(w.find('.tool-block').text()).toContain('truncated')
   })
+
+  // pi 编辑类工具:后端把结果 details.patch 挂到 call.diff,详情弹窗据此渲染 diff。
+  it('pi edit:call.diff(标准 unified patch)渲染成 DiffView', () => {
+    const w = mount(ToolDetailBody, { props: { call: {
+      tool: 'edit', toolUseId: 'pe1', state: 'ok' as const,
+      args: JSON.stringify({ path: '/root/a.md' }),
+      result: 'Successfully replaced 1 block(s).',
+      diff: '--- /root/a.md\n+++ /root/a.md\n@@ -1 +1 @@\n-old\n+new\n',
+    } } })
+    expect(w.find('.diff-path').text()).toBe('/root/a.md')
+    expect(w.find('.diff-badge.add').text()).toBe('+1')
+  })
+
+  // pi 的 write:无 patch,按 start 入参的 content 当新建内容呈现。
+  it('pi write:无 diff 字段时按 content 入参呈现新建内容', () => {
+    const w = mount(ToolDetailBody, { props: { call: {
+      tool: 'write', toolUseId: 'pw1', state: 'ok' as const,
+      args: JSON.stringify({ path: '/root/new.md', content: 'hello\nworld' }),
+      result: 'Successfully wrote to /root/new.md',
+    } } })
+    expect(w.find('.diff-path').text()).toBe('/root/new.md')
+    expect(w.find('.diff-badge.add').text()).toBe('+2')
+  })
+
+  // pi 的 move/批次合并 patch 是裸多文件(无 diff --git,靠 --- / +++ 头切文件):
+  // 必须拆成每文件一张 DiffView,不能糊成一块、路径还取后一个。
+  it('pi 裸多文件 patch:按 --- / +++ 头拆成多张 DiffView', () => {
+    const diff = [
+      '--- edit_src.txt', '+++ edit_src.txt', '@@ -1,5 +1,4 @@',
+      ' line4: delta', '-line5: epsilon',
+      '--- edit_dst.txt', '+++ edit_dst.txt', '@@ -3,4 +3,5 @@',
+      ' DEST-C', '+line5: epsilon', '',
+    ].join('\n')
+    const w = mount(ToolDetailBody, { props: { call: {
+      tool: 'move', toolUseId: 'mv1', state: 'ok' as const,
+      args: JSON.stringify({ path: 'edit_src.txt' }),
+      result: 'ok', diff,
+    } } })
+    // 修复前:无 diff --git 分隔,两文件糊成一张卡、路径取后一个。
+    const views = w.findAll('.diff-view')
+    expect(views.length).toBe(2)
+    expect(views[0].find('.diff-path').text()).toBe('edit_src.txt')
+    expect(views[1].find('.diff-path').text()).toBe('edit_dst.txt')
+    // 各卡徽标互不串:第一文件有删除、第二文件有新增。
+    expect(views[0].find('.diff-badge.del').exists()).toBe(true)
+    expect(views[1].find('.diff-badge.add').exists()).toBe(true)
+  })
 })

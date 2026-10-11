@@ -216,12 +216,16 @@ func claudeEnv(extra []string, effort string) []string {
 	}
 	env = append(env, "DISABLE_AUTOUPDATER=1", "CLAUDE_CODE_ENTRYPOINT=sdk")
 	// 思考强度档位 → 思考 token 预算(claude 官方档位语义,none = 不设,交给默认)。
+	// anywork 的 7 档对 claude 没那么多级:minimal 给最小预算,xhigh/max 与 high
+	// 同为上限(claude 单请求思考预算就这个量级)。
 	switch effort {
+	case EffortMinimal:
+		env = append(env, "MAX_THINKING_TOKENS=1024")
 	case EffortLow:
 		env = append(env, "MAX_THINKING_TOKENS=4000")
 	case EffortMedium:
 		env = append(env, "MAX_THINKING_TOKENS=10000")
-	case EffortHigh:
+	case EffortHigh, EffortXHigh, EffortMax:
 		env = append(env, "MAX_THINKING_TOKENS=31999")
 	}
 	env = append(env, extra...)
@@ -282,8 +286,14 @@ func (d *claudeDriver) Resolve(reqID string, allow, session bool) error {
 	return nil
 }
 
+// claudeEditTools 改文件的工具归一类:allow-session 任选其一 = 整个编辑类本会话
+// 放行(对齐 pi/codex,别再为 Edit/Write/MultiEdit/NotebookEdit 逐个弹卡)。
+var claudeEditTools = map[string]bool{
+	"Edit": true, "Write": true, "MultiEdit": true, "NotebookEdit": true,
+}
+
 // reqRuleKey 会话规则的键:Bash 用 Bash(命令) 语义(同命令自动放行),
-// 其它工具用工具名(该工具整个会话放行)。
+// 编辑类统一记 "edit"(整类放行),其余工具用工具名(该工具整个会话放行)。
 func reqRuleKey(tool string, args string) string {
 	if tool == "Bash" && args != "" {
 		var parsed struct {
@@ -292,6 +302,9 @@ func reqRuleKey(tool string, args string) string {
 		if json.Unmarshal([]byte(args), &parsed) == nil && parsed.Command != "" {
 			return "Bash(" + parsed.Command + ")"
 		}
+	}
+	if claudeEditTools[tool] {
+		return "edit"
 	}
 	return tool
 }

@@ -118,6 +118,9 @@ type ToolCallPayload struct {
 	// KindToolCall 信封走"过程"管线,但不是工具调用 —— Tool/Args 为空,
 	// 前端按 text 渲染成消息行(hapi trace 的 Message 同款)。
 	Text string `json:"text,omitempty"`
+	// Diff 非空 = 编辑类工具的改动(标准 unified diff);pi 的 edit/replace_match/
+	// insert/copy/move 把结果里的 details.patch 挂这里,前端据此渲染 diff。
+	Diff string `json:"diff,omitempty"`
 }
 
 // PermissionReqPayload KindPermissionReq 的负载。
@@ -139,6 +142,10 @@ type PermissionResultPayload struct {
 	// Session=true 表示当时选的是"本会话允许"(仅 Allow=true 有意义),
 	// 前端据此把结论显示成"本会话已允许"。
 	Session bool `json:"session,omitempty"`
+	// Cancelled=true 表示这条 result 不是用户答复,而是会话重启/复活时系统
+	// 替没来得及审批的旧请求补的收尾(Allow 必为 false):前端据此显示"已失效"
+	// 而非"已拒绝"——用户并没拒绝,是旧进程没了、这次审批作废。
+	Cancelled bool `json:"cancelled,omitempty"`
 }
 
 // ReasoningPayload KindReasoning 的负载。

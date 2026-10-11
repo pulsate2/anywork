@@ -717,3 +717,29 @@ func TestClaudeEnvNoSandbox(t *testing.T) {
 		}
 	}
 }
+
+// TestReqRuleKey 本会话规则的键:Bash 按命令、编辑类统一归 "edit"(整类放行,
+// 对齐 pi/codex)、其余按工具名。allow-session 任一编辑工具后,别的编辑工具
+// 也命中同一条规则不再弹卡。
+func TestReqRuleKey(t *testing.T) {
+	cases := []struct {
+		tool, args, want string
+	}{
+		{"Bash", `{"command":"ls /"}`, "Bash(ls /)"},
+		{"Bash", ``, "Bash"}, // 无入参退回工具名
+		{"Edit", `{"file_path":"/a"}`, "edit"},
+		{"Write", `{"file_path":"/a"}`, "edit"},
+		{"MultiEdit", `{}`, "edit"},
+		{"NotebookEdit", `{}`, "edit"},
+		{"Read", `{"file_path":"/a"}`, "Read"}, // 非编辑类仍按工具名
+	}
+	for _, c := range cases {
+		if got := reqRuleKey(c.tool, c.args); got != c.want {
+			t.Errorf("reqRuleKey(%q,%q)=%q,想要 %q", c.tool, c.args, got, c.want)
+		}
+	}
+	// 编辑类共享同一键:Write 选过 allow-session 后 Edit 命中同规则。
+	if reqRuleKey("Write", `{}`) != reqRuleKey("Edit", `{}`) {
+		t.Fatal("编辑类应共享同一会话规则键")
+	}
+}

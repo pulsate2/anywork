@@ -20,6 +20,7 @@ const props = defineProps<{
   sending?: boolean
   sessionId?: string // 附件归属的会话(存独立目录,不进工作区)
   cliCommands?: string[] // CLI 真实 / 指令(claude init 透传 / codex 内置表)
+  effortLevels?: string[] // 当前会话 app 支持的思考档位(/think 提示用)
 }>()
 
 const emit = defineEmits<{
@@ -63,16 +64,17 @@ const canSend = computed(() => !props.disabled && !locked.value && !props.sendin
 
 // ---- "/" 指令 ----
 // 本地指令(管理会话自身):CLI 不认识这些,是我们自己的控制通道。
-const localCommands = [
+// /think 的可选档位随会话 app 变(codex 四档、pi 七档),提示跟着走。
+const localCommands = computed(() => [
   { name: '/model', args: '<模型名>', desc: '设置模型', hasArg: true, local: true },
-  { name: '/think', args: 'none|low|medium|high', desc: '思考强度', hasArg: true, local: true },
+  { name: '/think', args: (props.effortLevels || ['none', 'low', 'medium', 'high']).join('|'), desc: '思考强度', hasArg: true, local: true },
   { name: '/perm', args: 'plan|ask|edits|accept', desc: '权限模式', hasArg: true, local: true },
   { name: '/interrupt', args: '', desc: '打断当前回合', hasArg: false, local: true },
-]
+])
 // CLI 真实指令(claude init 的 slash_commands 透传 / codex 内置表):
 // 原样作为消息发给 CLI 自己处理,不截获。
 const commands = computed(() => [
-  ...localCommands,
+  ...localCommands.value,
   ...(props.cliCommands || []).map((n) => ({
     name: `/${n}`, args: '', desc: '', hasArg: false, local: false,
   })),

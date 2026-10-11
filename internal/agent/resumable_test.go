@@ -131,3 +131,117 @@ func TestListCodexSessions(t *testing.T) {
 		t.Fatalf("没有 codex 历史应返回空列表: %v, %v", empty, err)
 	}
 }
+
+// TestListPiSessions pi 会话:cwd 编码出子目录、标题取 session_info.name
+// (最新值优先、可被清空)否则第一条 user 消息(字符串/text 块两种 content)、
+// 按首行 header.cwd 过滤、非 jsonl 忽略。
+func TestListPiSessions(t *testing.T) {
+	home := withFakeHome(t)
+	cwd := "/w/proj"
+	// 目录编码须与 piEncodeCwd 一致:/w/proj → --w-proj--。
+	dir := filepath.Join(home, ".pi", "agent", "sessions", "--w-proj--")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, lines []string, age time.Duration) {
+		var b []byte
+		for _, l := range lines {
+			b = append(b, []byte(l+"\n")...)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		past := time.Now().Add(-age)
+		os.Chtimes(filepath.Join(dir, name), past, past)
+	}
+
+	// session_info.name 优先于用户消息。
+	write("ta.jsonl", []string{
+		`{"type":"session","id":"id-a","cwd":"/w/proj","timestamp":"2026-09-01T00:00:00Z"}`,
+		`{"type":"session_info","name":"我命名的任务"}`,
+		`{"type":"message","message":{"role":"user","content":"原始的第一条问题"}}`,
+	}, 1*time.Hour) // 最新,应排第一
+	// content 是字符串。
+	write("tb.jsonl", []string{
+		`{"type":"session","id":"id-b","cwd":"/w/proj","timestamp":"2026-09-01T00:00:00Z"}`,
+		`{"type":"message","message":{"role":"assistant","content":"助手不算"}}`,
+		`{"type":"message","message":{"role":"user","content":"字符串形态的用户消息"}}`,
+	}, 2*time.Hour)
+	// content 是 text 块数组。
+	write("tc.jsonl", []string{
+		`{"type":"session","id":"id-c","cwd":"/w/proj","timestamp":"2026-09-01T00:00:00Z"}`,
+		`{"type":"message","message":{"role":"user","content":[{"type":"text","text":"块里的"},{"type":"image"},{"type":"text","text":"文本"}]}}`,
+	}, 3*time.Hour)
+	// name 被后一条 session_info 清空 → 落回用户消息。
+	write("td.jsonl", []string{
+		`{"type":"session","id":"id-d","cwd":"/w/proj","timestamp":"2026-09-01T00:00:00Z"}`,
+		`{"type":"session_info","name":"临时名"}`,
+		`{"type":"session_info","name":""}`,
+		`{"type":"message","message":{"role":"user","content":"清空后兜底的消息"}}`,
+	}, 4*time.Hour)
+	// 首行 cwd 不是本目录(平铺目录里混进来的):过滤掉。
+	write("te.jsonl", []string{
+		`{"type":"session","id":"id-e","cwd":"/other","timestamp":"2026-09-01T00:00:00Z"}`,
+		`{"type":"message","message":{"role":"user","content":"别的目录"}}`,
+	}, 5*time.Hour)
+	// 非 jsonl / 子目录:忽略。
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := listPiSessions(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 4 {
+		t.Fatalf("应列出 4 条(排除别的目录与非 jsonl),得到 %d: %+v", len(list), list)
+	}
+	if list[0].ID != "id-a" || list[0].Title != "我命名的任务" {
+		t.Fatalf("最新一条应取 session_info.name: %+v", list[0])
+	}
+	title := map[string]string{}
+	for _, s := range list {
+		if s.App != AppPi {
+			t.Fatalf("app 字段应为 pi: %+v", s)
+		}
+		title[s.ID] = s.Title
+	}
+	if title["id-b"] != "字符串形态的用户消息" {
+		t.Fatalf("字符串 content 标题没取对: %+v", title)
+	}
+	if title["id-c"] != "块里的 文本" {
+		t.Fatalf("text 块 content 标题没拼对: %+v", title)
+	}
+	if title["id-d"] != "清空后兜底的消息" {
+		t.Fatalf("name 清空后应落回用户消息: %+v", title)
+	}
+	if _, ok := title["id-e"]; ok {
+		t.Fatalf("别的目录的会话不该出现: %+v", title)
+	}
+
+	// 目录不存在 = 空列表。
+	empty, err := listPiSessions("/w/never")
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("没跑过的目录应返回空列表: %v, %v", empty, err)
+	}
+
+	// PI_CODING_AGENT_SESSION_DIR 平铺目录覆盖:多 cwd 共用,仍按 header.cwd 过滤。
+	flat := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", flat)
+	if err := os.WriteFile(filepath.Join(flat, "f1.jsonl"), []byte(
+		`{"type":"session","id":"flat-in","cwd":"/w/proj","timestamp":"2026-09-01T00:00:00Z"}`+"\n"+
+			`{"type":"message","message":{"role":"user","content":"平铺目录里的"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(flat, "f2.jsonl"), []byte(
+		`{"type":"session","id":"flat-out","cwd":"/elsewhere","timestamp":"2026-09-01T00:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flatList, err := listPiSessions(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flatList) != 1 || flatList[0].ID != "flat-in" {
+		t.Fatalf("平铺目录应只按 cwd 过滤出 1 条: %+v", flatList)
+	}
+}

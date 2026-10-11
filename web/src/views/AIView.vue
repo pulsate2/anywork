@@ -7,14 +7,14 @@ import {
 } from 'naive-ui'
 import { api, type AiApp, type AiProvider } from '@/api/client'
 import {
-  API_KEY_PLACEHOLDER, MODEL_PLACEHOLDER,
-  categoryLabel, fillTemplate, hasPlaceholder, presetsFor, type PlaceholderName,
+  PI_API_CHOICES, categoryLabel, presetsFor, readFields, writeField, type FieldName,
 } from '@/config/aiPresets'
 
 // 两套 CLI 各有各的配置落点,切换条的两个档位就是它们。
 const APPS: { value: AiApp; label: string }[] = [
   { value: 'claude', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
+  { value: 'pi', label: 'Pi' },
 ]
 
 const message = useMessage()
@@ -35,16 +35,19 @@ const modelName = ref('')
 const baseUrl = ref('')
 const configText = ref('')
 const authText = ref('')
+// pi 的接口协议(走哪套 wire api),只有 pi 这档显示;写回 models.json 的 provider.api。
+const piApi = ref('openai-completions')
 const saving = ref(false)
+// 回填输入框时置位,挡住下面的 watcher 把刚解析出来的值又原样写回正文。
+const syncing = ref(false)
 
-const keyHint = `保存时替换配置里的 ${API_KEY_PLACEHOLDER}`
+const keyHint = `供应商的 API Key;留空则不写(用官方登录态 / 环境变量)`
 const baseUrlHint = `供应商给的接口地址,如 https://api.example.com`
-// claude 那边一个模型名要钉四个字段(含 haiku/sonnet/opus 别名),所以正文里写占位符,
-// 这个输入框一填全改到。
+// claude 一个模型名要钉四个字段(含 haiku/sonnet/opus 别名),这个框一填全改到。
 const modelHint = computed(() =>
   app.value === 'claude'
-    ? `一次填好 4 个模型字段(${MODEL_PLACEHOLDER});留空则不钉模型`
-    : `替换 config.toml 里的 ${MODEL_PLACEHOLDER};留空则不钉模型`,
+    ? `一次填好 4 个模型字段(含 haiku/sonnet/opus 别名);留空则不钉模型`
+    : `钉死模型名;留空则不钉模型,跟 CLI 默认走`,
 )
 
 const activeApp = computed(() => APPS.find((a) => a.value === app.value) ?? APPS[0])
@@ -56,13 +59,34 @@ const presetOptions = computed(() =>
   })),
 )
 
-// 正文里还留着占位符才需要填对应的输入框;编辑已有配置时里面是真值,这些框就不出现了。
-function needs(name: PlaceholderName): boolean {
-  return hasPlaceholder(configText.value, name) || hasPlaceholder(authText.value, name)
+// 便捷框始终显示;接口协议只有 pi 这档有。n-select 的 options 联合类型挑剔,
+// 摊成最朴素的 {label,value} 再喂进去。
+const apiOptions = PI_API_CHOICES.map((c) => ({ label: c.label, value: c.value }))
+
+// syncInputsFromText 打开弹窗 / 套预设后,从正文解析出四个字段回填输入框;
+// 期间 syncing 置位,挡住 watcher 反向写回。
+function syncInputsFromText() {
+  syncing.value = true
+  const f = readFields(app.value, configText.value, authText.value)
+  baseUrl.value = f.baseUrl
+  apiKey.value = f.key
+  modelName.value = f.model
+  piApi.value = f.api || 'openai-completions'
+  syncing.value = false
 }
-const needsKey = computed(() => needs('API_KEY'))
-const needsModel = computed(() => needs('MODEL'))
-const needsBaseUrl = computed(() => needs('BASE_URL'))
+
+// 改任一便捷框就把那个字段直接写回正文(正文是唯一真相源)。syncing 期间不写,
+// 避免回填时把刚读出来的值又塞一遍、顺带重排 JSON。
+watch(baseUrl, (v) => applyField('baseUrl', v))
+watch(apiKey, (v) => applyField('key', v))
+watch(modelName, (v) => applyField('model', v))
+watch(piApi, (v) => applyField('api', v))
+function applyField(field: FieldName, v: string) {
+  if (syncing.value) return
+  const r = writeField(app.value, field, v, configText.value, authText.value)
+  configText.value = r.config
+  authText.value = r.auth
+}
 
 // 当前生效的排最前,切换时不用满屏找。
 const sorted = computed(() =>
@@ -96,6 +120,7 @@ async function load() {
 function baseUrlOf(p: AiProvider): string {
   const cfg = p.config as any
   if (p.app === 'claude') return cfg?.env?.ANTHROPIC_BASE_URL || '官方直连'
+  if (p.app === 'pi') return piFirstProvider(cfg)?.baseUrl || '官方登录'
   const m = String(cfg?.config || '').match(/^[ \t]*base_url[ \t]*=[ \t]*"([^"]*)"/m)
   return m ? m[1] : '官方登录'
 }
@@ -105,8 +130,18 @@ function baseUrlOf(p: AiProvider): string {
 function modelOf(p: AiProvider): string {
   const cfg = p.config as any
   if (p.app === 'claude') return String(cfg?.env?.ANTHROPIC_MODEL || '')
+  if (p.app === 'pi') return String(piFirstProvider(cfg)?.models?.[0]?.id || '')
   const m = String(cfg?.config || '').match(/^[ \t]*model[ \t]*=[ \t]*"([^"]*)"/m)
   return m ? m[1] : ''
+}
+
+// piFirstProvider models.json 里第一个 provider 配置,摘要行只拿它展示;
+// 官方那档只写 auth.json、models 为空,这里取不到就当官方。
+function piFirstProvider(cfg: any): any {
+  const providers = cfg?.models?.providers
+  if (!providers || typeof providers !== 'object') return null
+  const first = Object.values(providers)[0]
+  return first ?? null
 }
 
 function resetForm() {
@@ -115,21 +150,24 @@ function resetForm() {
   editCategory.value = 'custom'
   editSite.value = ''
   presetName.value = null
-  apiKey.value = ''
-  modelName.value = ''
-  baseUrl.value = ''
   configText.value = app.value === 'claude' ? JSON.stringify({ env: {} }, null, 2) : ''
   authText.value = app.value === 'claude' ? '' : '{}'
+  syncInputsFromText()
 }
 
 function fillForm(p: AiProvider) {
   const cfg = p.config as any
   if (p.app === 'claude') {
     configText.value = JSON.stringify(cfg ?? {}, null, 2)
-    return
+  } else if (p.app === 'pi') {
+    // pi 的正文框装 models.json,auth.json 单独一框,与 codex 一个套路。
+    configText.value = cfg?.models ? JSON.stringify(cfg.models, null, 2) : ''
+    authText.value = JSON.stringify(cfg?.auth ?? {}, null, 2)
+  } else {
+    configText.value = String(cfg?.config || '')
+    authText.value = JSON.stringify(cfg?.auth ?? {}, null, 2)
   }
-  configText.value = String(cfg?.config || '')
-  authText.value = JSON.stringify(cfg?.auth ?? {}, null, 2)
+  syncInputsFromText()
 }
 function openCreate() {
   resetForm()
@@ -161,28 +199,24 @@ function applyPreset(name: string | null) {
   editSite.value = p.websiteUrl
   configText.value = p.config
   authText.value = p.auth ?? ''
-  // 预设自带的模型名只是默认值,直接改这个框就换模型,不用动下面的正文。
-  modelName.value = p.model ?? ''
-  // 端点是跟着预设走的,换预设就别把上一家的地址留下;Key 是用户自己的,留着。
-  baseUrl.value = ''
+  // 预设正文里已经是具体值,解析出来回填四个框;Key 预设里是空的,等用户填。
+  syncInputsFromText()
 }
 
-// buildConfig 把编辑框拼成后端要的载荷,占位符只在这里替换一次。
+// buildConfig 把编辑框拼成后端要的载荷。正文就是真相源,直接解析,不再替换占位符。
 function buildConfig(): unknown {
-  const v = { key: apiKey.value, model: modelName.value, baseUrl: baseUrl.value }
-  const conf = fillTemplate(configText.value, v)
+  const conf = configText.value
   if (app.value === 'claude') return JSON.parse(conf.trim() || '{}')
-  const auth = fillTemplate(authText.value, v).trim()
+  const auth = authText.value.trim()
+  // pi 的正文是 models.json(JSON),codex 的是 config.toml(原样字符串)。
+  if (app.value === 'pi') {
+    return { auth: auth ? JSON.parse(auth) : {}, models: conf.trim() ? JSON.parse(conf) : {} }
+  }
   return { auth: auth ? JSON.parse(auth) : {}, config: conf }
 }
 async function save() {
   if (!editName.value.trim()) {
     message.warning('请填配置名')
-    return
-  }
-  // 端点没填就等于把 base_url 写空,配置直接是坏的 —— 拦在这里。
-  if (needsBaseUrl.value && !baseUrl.value.trim()) {
-    message.warning('请填接口地址')
     return
   }
   let config: unknown
@@ -350,30 +384,33 @@ onMounted(load)
           :placeholder="`选一个 ${activeApp.label} 供应商自动填好,也可以全手填`" @update:value="applyPreset" />
         <label>配置名</label>
         <n-input v-model:value="editName" placeholder="如 Kimi / 公司代理" />
-        <template v-if="needsBaseUrl">
-          <label>接口地址</label>
-          <n-input v-model:value="baseUrl" :placeholder="baseUrlHint" />
+        <template v-if="app === 'pi'">
+          <label>接口协议</label>
+          <n-select v-model:value="piApi" :options="apiOptions" />
+          <div class="ai-hint">选 Claude(Anthropic Messages)时,接口地址要填供应商的 /anthropic 端点。</div>
         </template>
-        <template v-if="needsKey">
-          <label>API Key</label>
-          <n-input v-model:value="apiKey" type="password" show-password-on="click" :placeholder="keyHint" />
-        </template>
-        <template v-if="needsModel">
-          <label>模型</label>
-          <n-input v-model:value="modelName" :placeholder="modelHint" />
-        </template>
+        <label>接口地址</label>
+        <n-input v-model:value="baseUrl" :placeholder="baseUrlHint" />
+        <label>API Key</label>
+        <n-input v-model:value="apiKey" type="password" show-password-on="click" :placeholder="keyHint" />
+        <label>模型</label>
+        <n-input v-model:value="modelName" :placeholder="modelHint" />
         <template v-if="app === 'claude'">
           <label>settings.json</label>
           <n-input v-model:value="configText" type="textarea" :autosize="{ minRows: 8, maxRows: 20 }"
             class="mono" />
         </template>
         <template v-else>
-          <label>config.toml</label>
+          <label>{{ app === 'pi' ? 'models.json' : 'config.toml' }}</label>
           <n-input v-model:value="configText" type="textarea" :autosize="{ minRows: 8, maxRows: 20 }"
             class="mono" />
           <label>auth.json</label>
           <n-input v-model:value="authText" type="textarea" :autosize="{ minRows: 3, maxRows: 8 }" class="mono" />
-          <div class="ai-hint">留空或写成空对象就不动 auth.json —— 官方 ChatGPT 的登录态也存在这个文件里。</div>
+          <div class="ai-hint">
+            {{ app === 'pi'
+              ? '留空或写成空对象就不动 auth.json —— 官方 OAuth 登录态也存在这个文件里。'
+              : '留空或写成空对象就不动 auth.json —— 官方 ChatGPT 的登录态也存在这个文件里。' }}
+          </div>
         </template>
         <label>官网(可选)</label>
         <n-input v-model:value="editSite" placeholder="https://…" />

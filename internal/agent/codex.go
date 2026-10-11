@@ -264,10 +264,27 @@ func (d *codexDriver) Send(text string) error {
 	if d.model != "" {
 		params["model"] = d.model
 	}
-	if d.effort != "" && d.effort != EffortNone {
-		params["effort"] = d.effort
+	if lvl := codexEffort(d.effort); lvl != "" {
+		params["effort"] = lvl
 	}
 	return d.asyncCall("turn/start", params)
+}
+
+// codexEffort anywork Effort → codex reasoning effort。codex(OpenAI)只认
+// minimal/low/medium/high 四档:anywork 多出来的 xhigh/max 向下收敛到 high,
+// none / 空 = 不下发(用默认)。
+func codexEffort(effort string) string {
+	switch effort {
+	case EffortMinimal:
+		return "minimal"
+	case EffortLow:
+		return "low"
+	case EffortMedium:
+		return "medium"
+	case EffortHigh, EffortXHigh, EffortMax:
+		return "high"
+	}
+	return ""
 }
 
 // sendCompactLocked 主动压缩。必须在持有 mu 时调用(同 asyncCall 约定)。

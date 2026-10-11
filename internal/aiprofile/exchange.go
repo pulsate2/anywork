@@ -16,7 +16,7 @@ type dump struct {
 // Export 把全部配置写成一份 JSON。
 func (s *Service) Export(w io.Writer) error {
 	d := dump{Version: 1, Apps: map[string][]Provider{}}
-	for _, app := range []string{AppClaude, AppCodex} {
+	for _, app := range []string{AppClaude, AppCodex, AppPi} {
 		list, err := s.List(app)
 		if err != nil {
 			return err

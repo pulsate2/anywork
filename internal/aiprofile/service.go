@@ -1,7 +1,8 @@
 // Package aiprofile 管理 AI CLI 的配置切换。
 // 一条记录 = 一份能直接落盘的供应商配置:Claude 存 settings.json 的全文,
-// Codex 存 {"auth":{…},"config":"<config.toml>"}。切换就是把它写回真实配置文件,
-// 而不是给终端注入环境变量 —— CLI 下次启动自己就读到了,不用重开会话;
+// Codex 存 {"auth":{…},"config":"<config.toml>"},Pi 存 {"auth":{…},"models":{…}}
+// (分别写回 ~/.pi/agent/auth.json 与 models.json)。切换就是把它写回真实配置
+// 文件,而不是给终端注入环境变量 —— CLI 下次启动自己就读到了,不用重开会话;
 // 切走之前会把真实文件回填进旧记录,在机器上手改过的内容不会丢。
 package aiprofile
 
@@ -27,6 +28,7 @@ var (
 const (
 	AppClaude = "claude"
 	AppCodex  = "codex"
+	AppPi     = "pi"
 )
 
 // invalidErr 入参不合法(名字为空、配置格式不对),HTTP 层映射成 400。
@@ -62,7 +64,7 @@ type Provider struct {
 const selectCols = `SELECT id, app, name, category, website_url, config_json, is_current, created_at, updated_at
 	FROM ai_providers`
 
-func appOK(app string) bool { return app == AppClaude || app == AppCodex }
+func appOK(app string) bool { return app == AppClaude || app == AppCodex || app == AppPi }
 
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
 
@@ -284,7 +286,7 @@ func (s *Service) seedFromLive(app string) error {
 // 返回补写过的 "app/名字",交给调用方打日志;读库或写盘出错只跳过,不拦启动。
 func (s *Service) RestoreMissing() []string {
 	done := []string{}
-	for _, app := range []string{AppClaude, AppCodex} {
+	for _, app := range []string{AppClaude, AppCodex, AppPi} {
 		if s.liveExists(app) {
 			continue
 		}

@@ -123,10 +123,13 @@ const ctx = computed(() => {
 })
 
 // ---- 右侧:思考强度 / 权限模式 ----
+const EFFORT_LABELS: Record<string, string> = {
+  minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max',
+}
 const effortLabel = computed(() => {
   const v = props.effort
   if (!v || v === 'none') return ''
-  return `思考:${{ low: '低', medium: '中', high: '高' }[v] || v}`
+  return `Think: ${EFFORT_LABELS[v] || v}`
 })
 
 const PERM_LABELS: Record<string, { text: string; tone: string }> = {

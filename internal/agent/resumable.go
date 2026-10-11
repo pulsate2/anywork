@@ -15,8 +15,8 @@ import (
 // ---- 可恢复会话列表 ----
 // 创建新会话时不只看 anywork 自己的记录:CLI 在终端里跑过的原生会话
 // (claude 的 ~/.claude/projects/<slug>/*.jsonl、codex 的 ~/.codex/sessions/
-// **/rollout-*.jsonl)也能按目录列出来挑一个续聊 —— 重装/换工具后想接着
-// 之前终端里的进度,不用从头再来。
+// **/rollout-*.jsonl、pi 的 ~/.pi/agent/sessions/--<cwd>--/*.jsonl)也能按目录
+// 列出来挑一个续聊 —— 重装/换工具后想接着之前终端里的进度,不用从头再来。
 
 // resumableLimit 列表上限:按修改时间倒序取最新的这么多,弹窗里翻不完
 // 的旧会话没有意义。
@@ -43,6 +43,8 @@ func (m *Manager) Resumable(app, workspace string) ([]ResumableSession, error) {
 		return listClaudeSessions(cwd)
 	case AppCodex:
 		return listCodexSessions(cwd)
+	case AppPi:
+		return listPiSessions(cwd)
 	default:
 		return nil, fmt.Errorf("未知 agent: %s", app)
 	}
@@ -238,6 +240,161 @@ func codexRolloutTitle(path string) string {
 		if line.Type == "event_msg" && line.Payload.Type == "user_message" && line.Payload.Message != "" {
 			return titleFromText(line.Payload.Message)
 		}
+	}
+	return ""
+}
+
+// listPiSessions pi 的会话转录:~/.pi/agent/sessions/--<cwd 编码>--/*.jsonl。
+// 目录名把 cwd 编进去(去掉开头一个斜杠,再把 /、\、: 都换成 -,首尾包 --),
+// 与 pi 的 getDefaultSessionDirPath 一致。PI_CODING_AGENT_DIR 覆盖 agent 根;
+// PI_CODING_AGENT_SESSION_DIR 则是平铺目录(多 cwd 共用,不再按 cwd 分子目录)。
+// 两种布局都逐文件读首行 header 的 cwd 来过滤,平铺目录下这步才真正起作用。
+// (settings.json 里手配的 sessionDir 不认 —— anywork 不写 pi 的 settings。)
+func listPiSessions(cwd string) ([]ResumableSession, error) {
+	cwd = filepath.Clean(cwd)
+	dir := piSessionsDir(cwd)
+	if dir == "" {
+		return []ResumableSession{}, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []ResumableSession{}, nil
+		}
+		return nil, err
+	}
+	out := []ResumableSession{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		id, scwd, title, ok := readPiSession(path)
+		if !ok || filepath.Clean(scwd) != cwd {
+			continue
+		}
+		st, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, ResumableSession{
+			ID:        id,
+			Title:     title,
+			App:       AppPi,
+			UpdatedAt: st.ModTime().UTC().Format(time.RFC3339),
+		})
+	}
+	return sortResumable(out), nil
+}
+
+// piAgentDir ~/.pi/agent(PI_CODING_AGENT_DIR 覆盖,与 pi getAgentDir 同规则)。
+func piAgentDir() string {
+	if d := os.Getenv("PI_CODING_AGENT_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".pi", "agent")
+}
+
+// piSessionsDir 某 cwd 的会话目录:PI_CODING_AGENT_SESSION_DIR 优先(平铺),
+// 否则 <agentDir>/sessions/--<cwd 编码>--。
+func piSessionsDir(cwd string) string {
+	if env := os.Getenv("PI_CODING_AGENT_SESSION_DIR"); env != "" {
+		return env
+	}
+	base := piAgentDir()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "sessions", piEncodeCwd(cwd))
+}
+
+// piEncodeCwd 把 cwd 编码成 pi 的目录名片段:去掉开头一个 / 或 \,再把每个
+// /、\、: 换成 -,首尾各包 --(对齐 pi getDefaultSessionDirPath)。
+func piEncodeCwd(cwd string) string {
+	s := cwd
+	if len(s) > 0 && (s[0] == '/' || s[0] == '\\') {
+		s = s[1:]
+	}
+	s = strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(s)
+	return "--" + s + "--"
+}
+
+// readPiSession 读 pi 会话文件:首行是 session header(id + cwd),随后扫一截
+// 取标题 —— 优先 session_info 的 name(最新值为准,可被清空),否则第一条
+// user 消息文本(content 是字符串或 text 块数组)。
+func readPiSession(path string) (id, cwd, title string, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", "", false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if !sc.Scan() {
+		return "", "", "", false
+	}
+	var header struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Cwd  string `json:"cwd"`
+	}
+	if json.Unmarshal(sc.Bytes(), &header) != nil || header.Type != "session" || header.ID == "" {
+		return "", "", "", false
+	}
+	name, firstMessage := "", ""
+	for i := 0; i < 400 && sc.Scan(); i++ {
+		var line struct {
+			Type    string `json:"type"`
+			Name    string `json:"name"`
+			Message struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(sc.Bytes(), &line) != nil {
+			continue
+		}
+		switch line.Type {
+		case "session_info":
+			name = strings.TrimSpace(line.Name) // 最新值为准(后一条清空就当没名字)
+		case "message":
+			if firstMessage == "" && line.Message.Role == "user" {
+				firstMessage = piMessageText(line.Message.Content)
+			}
+		}
+	}
+	t := name
+	if t == "" {
+		t = firstMessage
+	}
+	return header.ID, header.Cwd, titleFromText(t), true
+}
+
+// piMessageText pi 消息文本化:content 是字符串就直取,否则取各 text 块拼起来。
+func piMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, " ")
 	}
 	return ""
 }

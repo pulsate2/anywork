@@ -268,7 +268,7 @@ export const api = {
     request<AgentCleanupSettings>('PUT', '/api/agent/cleanup', { days, auto }),
 }
 
-export type AgentApp = 'claude' | 'codex'
+export type AgentApp = 'claude' | 'codex' | 'pi'
 
 // 一条可恢复的 CLI 原生会话:id 是 external id(claude session id /
 // codex thread id),创建时经 resumeExternal 传入;title 从转录提炼。
@@ -323,6 +323,9 @@ export interface AgentToolCall {
   // 非空 = 子 agent 的叙述文本步(非工具调用):tool/args 为空,过程列表里
   // 渲染成消息行,详情按 markdown 渲染正文。
   text?: string
+  // 非空 = 编辑类工具的标准 unified diff(pi 的 edit/replace_match/insert/
+  // copy/move 由后端从结果 details.patch 回填),详情弹窗据此渲染改动。
+  diff?: string
 }
 
 // parentToolUseId 非空 = 子 agent 的审批:driver 反查出的宿主 Task 调用 id,
@@ -655,10 +658,11 @@ export const GIT_ALREADY_REPO = 409
 // 远端管理的操作,与后端 Service.RemoteOp 的 op 一一对应。
 export type RemoteOp = 'add' | 'remove' | 'rename' | 'set-url'
 
-export type AiApp = 'claude' | 'codex'
+export type AiApp = 'claude' | 'codex' | 'pi'
 
 // AiProvider.config 就是要落到真实配置文件里的内容:claude 存 settings.json 本身,
-// codex 存 { auth, config }(config 是 config.toml 全文)。
+// codex 存 { auth, config }(config 是 config.toml 全文),pi 存 { auth, models }
+// (分别写回 ~/.pi/agent/auth.json 与 models.json)。
 export interface AiProvider {
   id: string
   app: AiApp

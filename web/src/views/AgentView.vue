@@ -196,7 +196,7 @@ interface Card {
   // 聚合组:连续 ≥2 张可组工具(混排不限同类)合成的一张卡(hapi 模型)。
   groupCalls?: AgentToolCall[]
   req?: AgentPermissionReq
-  resolved?: { allow: boolean; session?: boolean }
+  resolved?: { allow: boolean; session?: boolean; cancelled?: boolean }
   // 审批聚合:同一 reqId 的多个请求(推送侧可能重复落)合到第一张卡上。
   extraReqs?: AgentPermissionReq[]
   // 工具卡内嵌审批:同工具的审批请求并进这张工具卡(Write 两卡合一)。
@@ -260,7 +260,7 @@ const sessionTasks = computed<{ id: string; subject: string; status: 'pending' |
     // 的真任务 id 是把临时 key 换成数字 id 的唯一来源,跳过它 TaskUpdate
     // 就永远配不上对。非 Task 工具的结果查不到归属,自然落空。
     const isResult = !p.tool && !!p.result && !!p.toolUseId
-    if (!taskSuite(p.tool) && p.tool !== 'TodoWrite' && p.tool !== 'update_plan' && !isResult) continue
+    if (!taskSuite(p.tool) && p.tool !== 'TodoWrite' && p.tool !== 'update_plan' && p.tool !== 'todo' && !isResult) continue
     try {
       const args = p.args ? JSON.parse(p.args) : {}
       // 只记有名有姓的 tool_use;空名结果事件进来会把映射覆盖成 ""
@@ -279,8 +279,9 @@ const sessionTasks = computed<{ id: string; subject: string; status: 'pending' |
           if (status) taskItems.set(key, { id: key, subject, status })
           else if (cur) taskItems.set(key, { ...cur, subject })
         }
-      } else if ((p.tool === 'TodoWrite' || p.tool === 'update_plan') && Array.isArray(args.todos ?? args.plan)) {
+      } else if ((p.tool === 'TodoWrite' || p.tool === 'update_plan' || p.tool === 'todo') && Array.isArray(args.todos ?? args.plan)) {
         // TodoWrite 的 todos 是全量快照(不是增量),直接整表替换。
+        // pi 的 todo 工具后端已把结果 details.tasks 翻成同款 {todos:[…]}。
         const next = new Map<string, TaskItem>()
         for (const t of (args.todos ?? args.plan) as any[]) {
           if (!t || typeof t !== 'object') continue
@@ -459,7 +460,7 @@ const cards = computed<Card[]>(() => {
         if (p.toolUseId && toolIndex.has(p.toolUseId)) {
           const card = out[toolIndex.get(p.toolUseId)!]
           if (card.call) {
-            card.call = { ...card.call, result: p.result, state: p.state, images: p.images }
+            card.call = { ...card.call, result: p.result, state: p.state, images: p.images, diff: p.diff ?? card.call.diff }
           }
           break
         }
@@ -527,9 +528,9 @@ const cards = computed<Card[]>(() => {
         break
       }
       case 'permission_result': {
-        const p = ev.payload as { reqId?: string; allow?: boolean; session?: boolean }
+        const p = ev.payload as { reqId?: string; allow?: boolean; session?: boolean; cancelled?: boolean }
         const i = p.reqId ? apprIndex.get(p.reqId) : undefined
-        if (i !== undefined) out[i].resolved = { allow: !!p.allow, session: !!p.session }
+        if (i !== undefined) out[i].resolved = { allow: !!p.allow, session: !!p.session, cancelled: !!p.cancelled }
         break
       }
       // status 不渲染:回合状态走下面的 turnState。
@@ -579,7 +580,7 @@ const UNGROUPABLE_TOOLS = new Set([
   'Skill', 'spawn_agent', 'send_input', 'send_message', 'resume_agent',
   'followup_task', 'wait_agent', 'close_agent', 'interrupt_agent', 'list_agents',
   // 计划类:进任务面板或单独成卡
-  'TodoWrite', 'update_plan', 'ExitPlanMode', 'exit_plan_mode', 'CodexReasoning',
+  'TodoWrite', 'update_plan', 'todo', 'ExitPlanMode', 'exit_plan_mode', 'CodexReasoning',
   // codex 长期目标:里程碑级,单独成卡
   'CodexGoal',
 ])
@@ -742,7 +743,7 @@ const compacting = computed(() => {
 
 // 任务类工具:时间线不出卡,状态只进顶部 sessionTasks 面板(hapi 同款)。
 const TASK_PANEL_TOOLS = new Set([
-  'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'TodoWrite', 'update_plan',
+  'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'TodoWrite', 'update_plan', 'todo',
 ])
 
 // 最新 token 用量(StatusBar 上下文占用):取最后一条 usage 事件。
@@ -1371,12 +1372,27 @@ async function deleteSelected() {
 }
 
 // ---- 会话设置(模型/思考强度/权限模式) ----
-const effortOptions = [
-  { value: 'none', label: '默认' },
-  { value: 'low', label: '低' },
-  { value: 'medium', label: '中' },
-  { value: 'high', label: '高' },
-]
+// 思考强度按 agent 各自原生档位给,不强行统一:codex 认 OpenAI 四档
+// (minimal/low/medium/high),pi 有全套 7 档(off/minimal/low/medium/high/
+// xhigh/max),claude 折算成思考 token 预算走 low/medium/high。none = 用默认。
+const EFFORT_LABELS: Record<string, string> = {
+  none: 'Default', minimal: 'Minimal', low: 'Low', medium: 'Medium',
+  high: 'High', xhigh: 'XHigh', max: 'Max',
+}
+const EFFORT_LEVELS: Record<string, string[]> = {
+  claude: ['none', 'low', 'medium', 'high'],
+  codex: ['none', 'minimal', 'low', 'medium', 'high'],
+  pi: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+}
+function effortOptionsFor(app: string | undefined) {
+  return (EFFORT_LEVELS[app || 'claude'] || EFFORT_LEVELS.claude).map((v) => ({
+    value: v,
+    label: EFFORT_LABELS[v] || v,
+  }))
+}
+// 新建弹窗照所选 app、设置弹窗照当前会话的 app。
+const createEffortOptions = computed(() => effortOptionsFor(createApp.value))
+const settingsEffortOptions = computed(() => effortOptionsFor(selected.value?.app))
 
 // 权限 4 档,两家的原生模式由后端各自映射(claude: plan/default/acceptEdits/bypass;
 // codex: untrusted+只读 / on-request / on-failure / never+全放行)。
@@ -1444,8 +1460,8 @@ async function onCommand(name: string, arg: string) {
     message.error('缺少参数')
     return
   }
-  if (name === 'think' && !effortOptions.some((o) => o.value === arg)) {
-    message.error('思考强度可选:none / low / medium / high')
+  if (name === 'think' && !settingsEffortOptions.value.some((o) => o.value === arg)) {
+    message.error(`思考强度可选:${settingsEffortOptions.value.map((o) => o.value).join(' / ')}`)
     return
   }
   if (name === 'perm' && !permOptions.some((o) => o.value === arg)) {
@@ -1459,7 +1475,13 @@ async function onCommand(name: string, arg: string) {
 
 // ---- 新建 / 续聊 ----
 const createModal = ref(false)
-const createApp = ref<'claude' | 'codex'>('claude')
+const createApp = ref<'claude' | 'codex' | 'pi'>('claude')
+// agent 展示名(前导空格:拼进"该目录下没有X的会话"的句子里)。
+const appLabels: Record<'claude' | 'codex' | 'pi', string> = {
+  claude: ' Claude Code',
+  codex: ' Codex',
+  pi: ' Pi',
+}
 const createWorkspace = ref<string | null>(null)
 const createPerm = ref('ask')
 const createModel = ref('')
@@ -1494,6 +1516,10 @@ const workspaceOptions = computed(() =>
 // agent 或目录变了重拉列表;弹窗开着才拉。
 watch([createApp, createWorkspace, createModal], async ([app, ws, open]) => {
   createResume.value = null
+  // 换 app 后原选的档位可能不在新 app 的档里(如 pi 的 max 切到 codex),回落默认。
+  if (!createEffortOptions.value.some((o) => o.value === createEffort.value)) {
+    createEffort.value = 'none'
+  }
   if (!open || !ws) return
   resumableLoading.value = true
   try {
@@ -1905,6 +1931,7 @@ onBeforeUnmount(() => {
         :sending="sending"
         :session-id="selected.id"
         :cli-commands="cliCommands"
+        :effort-levels="settingsEffortOptions.map((o) => o.value)"
         @send="send" @interrupt="interrupt" @command="onCommand"
       />
     </div>
@@ -1920,6 +1947,9 @@ onBeforeUnmount(() => {
           <button type="button" class="seg-btn" :class="{ on: createApp === 'codex' }" @click="createApp = 'codex'">
             Codex
           </button>
+          <button type="button" class="seg-btn" :class="{ on: createApp === 'pi' }" @click="createApp = 'pi'">
+            Pi
+          </button>
         </div>
         <label>工作目录</label>
         <n-select v-model:value="createWorkspace" :options="workspaceOptions" placeholder="选择工作区" />
@@ -1930,7 +1960,7 @@ onBeforeUnmount(() => {
           :render-label="renderResumeLabel"
           :loading="resumableLoading"
           :disabled="!resumableLoading && !resumable.length"
-          :placeholder="resumableLoading ? '正在读取该目录的会话…' : resumable.length ? '选择要恢复的会话' : `该目录下没有${createApp === 'claude' ? ' Claude Code' : ' Codex'}的会话`"
+          :placeholder="resumableLoading ? '正在读取该目录的会话…' : resumable.length ? '选择要恢复的会话' : `该目录下没有${appLabels[createApp]}的会话`"
           clearable
         />
         <div class="form-hint">
@@ -1949,11 +1979,11 @@ onBeforeUnmount(() => {
         <label>模型(可选)</label>
         <input
           v-model="createModel" class="model-input"
-          :placeholder="createApp === 'claude' ? '如 sonnet / opus(留空用默认)' : '如 gpt-5.6-luna(留空用默认)'"
+          :placeholder="createApp === 'claude' ? '如 sonnet / opus(留空用默认)' : createApp === 'codex' ? '如 gpt-5.6-luna(留空用默认)' : '如 claude-sonnet-4-5 / gpt-5.6(留空用默认)'"
         >
         <label>思考强度</label>
         <div class="seg">
-          <button v-for="o in effortOptions" :key="o.value" type="button"
+          <button v-for="o in createEffortOptions" :key="o.value" type="button"
                   class="seg-btn" :class="{ on: createEffort === o.value }" @click="createEffort = o.value">
             {{ o.label }}
           </button>
@@ -1975,7 +2005,7 @@ onBeforeUnmount(() => {
         <input v-model="setModel" class="model-input" placeholder="留空用默认">
         <label>思考强度</label>
         <div class="seg">
-          <button v-for="o in effortOptions" :key="o.value" type="button"
+          <button v-for="o in settingsEffortOptions" :key="o.value" type="button"
                   class="seg-btn" :class="{ on: setEffort === o.value }" @click="setEffort = o.value">
             {{ o.label }}
           </button>
@@ -1991,7 +2021,9 @@ onBeforeUnmount(() => {
         <div class="form-hint">
           {{ selected?.app === 'claude'
             ? 'claude 的模型/思考强度在进程启动时固化,运行中改设置会保存、续聊时生效。'
-            : 'codex 原生支持,下一回合立即生效。' }}
+            : selected?.app === 'pi'
+              ? 'pi 原生支持运行中改模型/思考强度,当场下发立即生效(权限模式仅本地记录,pi 一律自动放行)。'
+              : 'codex 原生支持,下一回合立即生效。' }}
         </div>
       </div>
       <template #footer>
@@ -2484,11 +2516,18 @@ onBeforeUnmount(() => {
 }
 .model-input:focus { border-color: var(--lr-accent); }
 .form-hint { font-size: 12px; color: var(--lr-fg-muted); line-height: 1.5; }
-.seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--lr-radius); background: rgba(127, 127, 127, .12); }
+/* 档位多时(pi 的思考强度有 7 档)整条会超出弹窗宽度,钉死 max-width 后让它自己
+   横滑,别把右边几档顶出屏幕。chip 不收缩、不换行,保持原尺寸横向排开。 */
+.seg {
+  display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--lr-radius);
+  background: rgba(127, 127, 127, .12);
+  max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
 .seg-btn {
   appearance: none; border: 0; background: transparent; cursor: pointer;
   font: inherit; font-size: 13px; font-weight: 600; color: var(--lr-fg-muted);
   height: 32px; padding: 0 16px; border-radius: calc(var(--lr-radius) - 4px);
+  flex: none; white-space: nowrap;
 }
 .seg-btn.on { background: var(--lr-bg-elevated); color: var(--lr-accent); box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
 .cleanup-auto { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

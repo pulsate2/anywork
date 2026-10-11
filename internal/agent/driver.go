@@ -8,14 +8,20 @@ import (
 const (
 	AppClaude = "claude"
 	AppCodex  = "codex"
+	AppPi     = "pi"
 )
 
-// 思考强度档位。
+// 思考强度档位。anywork 暴露 pi 的全套 7 档;claude/codex 原生档位少,
+// 由各自 driver 向下映射(codex 的 xhigh/max 收敛到 high,claude 折算成
+// 思考 token 预算)。none = 不下发,用 CLI 默认。
 const (
-	EffortNone   = "none"
-	EffortLow    = "low"
-	EffortMedium = "medium"
-	EffortHigh   = "high"
+	EffortNone    = "none"
+	EffortMinimal = "minimal"
+	EffortLow     = "low"
+	EffortMedium  = "medium"
+	EffortHigh    = "high"
+	EffortXHigh   = "xhigh"
+	EffortMax     = "max"
 )
 
 // StartOpts Driver 启动参数。
@@ -25,7 +31,7 @@ type StartOpts struct {
 	ResumeID       string // claude session_id / codex thread id;空 = 新会话
 	PermissionMode string // PermAsk | PermAccept
 	Model          string // 空 = CLI 默认
-	Effort         string // EffortNone…EffortHigh;空 = 默认
+	Effort         string // EffortNone…EffortMax;空 = 默认
 	// Env 覆盖项(driver 自己注入的之外再追加)。
 	Env []string
 	// FilesDir 会话附件目录(<数据目录>/agent-files/<会话id>):tool_result
@@ -88,6 +94,8 @@ var newDriver = func(app string) (Driver, error) {
 		return newClaudeDriver(), nil
 	case AppCodex:
 		return newCodexDriver(), nil
+	case AppPi:
+		return newPiDriver(), nil
 	default:
 		return nil, fmt.Errorf("未知 agent: %s", app)
 	}
@@ -100,6 +108,8 @@ func resolveAgentBin(app string) (string, error) {
 		return claudeBin()
 	case AppCodex:
 		return codexBin()
+	case AppPi:
+		return piBin()
 	default:
 		return "", fmt.Errorf("未知 agent: %s", app)
 	}

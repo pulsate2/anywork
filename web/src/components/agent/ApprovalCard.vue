@@ -9,7 +9,7 @@ import type { AgentPermissionReq } from '@/api/client'
 
 const props = defineProps<{
   req: AgentPermissionReq
-  resolved?: { allow: boolean; session?: boolean } | null
+  resolved?: { allow: boolean; session?: boolean; cancelled?: boolean } | null
   busy?: boolean
   compact?: boolean
 }>()
@@ -30,9 +30,11 @@ const brief = computed(() => {
   return props.req.args || ''
 })
 
-// 结论文案:区分"允许过一次"和"本会话允许"(同类不再问)。
+// 结论文案:区分"允许过一次"和"本会话允许"(同类不再问);cancelled 是会话
+// 重启时系统替没答复的旧请求补的收尾 —— 用户没拒绝,显示"已失效"而非"已拒绝"。
 const verdict = computed(() => {
   if (!props.resolved) return ''
+  if (props.resolved.cancelled) return '已失效'
   if (!props.resolved.allow) return '已拒绝'
   return props.resolved.session ? '本会话已允许' : '已允许'
 })

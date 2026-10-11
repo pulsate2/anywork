@@ -21,7 +21,7 @@ const props = defineProps<{
   sessionId?: string
   // 内嵌审批:同工具的审批请求并进工具卡(Write/Edit 审批与调用同卡呈现)。
   pendingReq?: AgentPermissionReq
-  pendingResolved?: { allow: boolean; session?: boolean } | null
+  pendingResolved?: { allow: boolean; session?: boolean; cancelled?: boolean } | null
   approveBusy?: boolean
 }>()
 
@@ -229,6 +229,10 @@ function parseUnifiedDiff(text: string): DiffBlock[] {
   for (const line of text.split('\n')) {
     if (line.startsWith('diff --git')) { flush(); continue }
     if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
+      // 裸多文件 patch(pi 的 move、批次合并)无 diff --git 分隔,文件边界只剩
+      // --- / +++ 头对:正收着上一个文件的 hunk 时遇到新 +++ 头,先 flush 切块,
+      // 否则两文件的增删行糊成一块、路径还取了后一个。
+      if (inHunk) flush()
       fileName = line.replace(/^\+\+\+ (b\/)?/, '')
       continue
     }

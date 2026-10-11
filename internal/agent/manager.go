@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -564,8 +565,65 @@ func (m *Manager) register(ls *liveSession) (*liveSession, error) {
 	m.sessions[ls.id] = ls
 	m.mu.Unlock()
 	m.store.SetStatus(ls.id, StatusIdle)
+	m.reconcilePending(ls)
 	go m.pump(ls)
 	return ls, nil
+}
+
+// reconcilePending 新进程接管会话(冷启复活 / 重启换新)后,把旧进程里挂着、
+// 却没来得及答复的审批/提问收尾。旧进程一死,这些请求的 reqID 在新 driver 里
+// 根本不存在,Resolve/Answer 全失败;事件流里它们又只有 request 没有 result,
+// 前端回放便永远停在"等待审批/等待回答",底部状态也一直亮着(用户实测:重启前
+// 没审批的最后一张卡,重启后永远无法审批)。这里扫一遍最近的事件,给每条没有
+// 收尾的 request 补一条取消型 result(审批 Allow=false+Cancelled、提问 Cancelled),
+// 卡与状态当场收掉。只在新进程注册成功、pump 起来前跑一次(此时无并发 append)。
+func (m *Manager) reconcilePending(ls *liveSession) {
+	// 待审批/待回答都是会话转静默前的最后几件事,取尾部足够覆盖 request 与
+	// (若已答复)它的 result。
+	evs, err := m.store.MessagesTail(ls.id, 200)
+	if err != nil {
+		return
+	}
+	openApprove := map[string]bool{} // reqID → 只见 request、还没见到 result
+	openAsk := map[string]bool{}
+	for i := range evs {
+		raw, ok := evs[i].Payload.(json.RawMessage)
+		if !ok {
+			continue
+		}
+		var p struct {
+			ReqID string `json:"reqId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil || p.ReqID == "" {
+			continue
+		}
+		switch evs[i].Kind {
+		case KindPermissionReq:
+			openApprove[p.ReqID] = true
+		case KindPermissionResult:
+			delete(openApprove, p.ReqID)
+		case KindAskUser:
+			openAsk[p.ReqID] = true
+		case KindAskUserResult:
+			delete(openAsk, p.ReqID)
+		}
+	}
+	for reqID := range openApprove {
+		if stored, err := m.append(ls, &Event{
+			Kind:    KindPermissionResult,
+			Payload: &PermissionResultPayload{ReqID: reqID, Allow: false, Cancelled: true},
+		}); err == nil {
+			m.broadcast(ls, stored)
+		}
+	}
+	for reqID := range openAsk {
+		if stored, err := m.append(ls, &Event{
+			Kind:    KindAskUserResult,
+			Payload: &AskUserResultPayload{ReqID: reqID, Cancelled: true},
+		}); err == nil {
+			m.broadcast(ls, stored)
+		}
+	}
 }
 
 // restart 弃旧换新(stale 会话,见 liveSession.stale):杀掉旧进程,按 DB 里
