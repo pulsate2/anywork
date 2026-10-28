@@ -28,10 +28,12 @@ type codexDriver struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	nextID     int
-	pending    map[int]chan json.RawMessage       // RPC 响应
-	approvals  map[string]*codexApproval          // reqID(itemId) → 挂起审批
-	userInputs map[string]chan *userInputDecision // reqID(itemId) → 提问回答(nil = 取消)
+	nextID          int
+	pending         map[int]chan json.RawMessage       // RPC 响应
+	pendingMethods  map[int]string                     // 异步 turn/start 失败也必须收回 running
+	lastTurnRequest int                                // 迟到的 RPC 错误不能结束后来的回合
+	approvals       map[string]*codexApproval          // reqID(itemId) → 挂起审批
+	userInputs      map[string]chan *userInputDecision // reqID(itemId) → 提问回答(nil = 取消)
 
 	threadID   string // codex thread id(续聊凭据)
 	turnID     string // 当前回合 id(task_started 带,turn/interrupt 必须指名)
@@ -54,6 +56,12 @@ type codexDriver struct {
 	// 回合起始时刻(0 = 没在跑):结束时算时长发 turn_duration,与 claude
 	// 的回合统计同款,前端 StatusBar 之外的时间线也看得到每回合耗时。
 	turnStart time.Time
+	// 重试由 Codex 自身负责,这里只记录终态用于新旧通知去重。
+	turnActive                bool
+	lastFinishedTurn          string
+	lastFinishedErrorReported bool
+	lastTurnError             codexTurnError
+	lastErrorReported         bool
 	// 多智能体工具调用的去重与配对:两条通道(v2 的 rawResponseItem/completed
 	// 裸函数调用、v1 的 collabagenttoolcall item)会报同一 call_id,只认先到
 	// 的;names 记进行中的调用(call_id → 工具名),output 来了收卡即忘。
@@ -74,6 +82,7 @@ type codexDriver struct {
 func newCodexDriver() *codexDriver {
 	return &codexDriver{
 		pending:        map[int]chan json.RawMessage{},
+		pendingMethods: map[int]string{},
 		approvals:      map[string]*codexApproval{},
 		userInputs:     map[string]chan *userInputDecision{},
 		agentToolSeen:  map[string]bool{},
@@ -238,7 +247,7 @@ func codexSandboxPolicy(mode string) map[string]any {
 	}
 }
 
-// Send 发一轮:turn/start 是长请求(响应等回合结束才来),不能阻塞在这里 ——
+// Send 发一轮:turn/start 异步确认回合开始,最终结束看 turn/completed ——
 // 发出去后由 readStdout 异步收响应,出错以 error 事件透出。
 func (d *codexDriver) Send(text string) error {
 	d.mu.Lock()
@@ -252,6 +261,12 @@ func (d *codexDriver) Send(text string) error {
 	if t := strings.TrimSpace(text); t == "/compact" || strings.HasPrefix(t, "/compact ") {
 		return d.sendCompactLocked()
 	}
+	previouslyActive := d.turnActive
+	if !previouslyActive {
+		d.lastTurnError = codexTurnError{}
+		d.lastErrorReported = false
+	}
+	d.turnActive = true
 	d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
 	params := map[string]any{
 		"threadId":       d.threadID,
@@ -267,7 +282,16 @@ func (d *codexDriver) Send(text string) error {
 	if lvl := codexEffort(d.effort); lvl != "" {
 		params["effort"] = lvl
 	}
-	return d.asyncCall("turn/start", params)
+	if err := d.asyncCall("turn/start", params); err != nil {
+		d.turnActive = previouslyActive
+		d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: err.Error()}})
+		if !previouslyActive {
+			d.turnEndLocked()
+			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+		}
+		return err
+	}
+	return nil
 }
 
 // codexEffort anywork Effort → codex reasoning effort。codex(OpenAI)只认
@@ -308,6 +332,7 @@ func (d *codexDriver) sendCompactLocked() error {
 		case <-time.After(180 * time.Second):
 			d.mu.Lock()
 			delete(d.pending, id)
+			delete(d.pendingMethods, id)
 			d.mu.Unlock()
 			d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: "压缩超时(180 秒未完成)"}})
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
@@ -321,7 +346,7 @@ func (d *codexDriver) sendCompactLocked() error {
 // 来回 idle,这里补。回合中发生的自动压缩(turnID 非空)不打扰回合状态。
 func (d *codexDriver) emitCompactIdle() {
 	d.mu.Lock()
-	idle := d.turnID == ""
+	idle := d.turnID == "" && !d.turnActive
 	d.mu.Unlock()
 	if idle {
 		d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
@@ -335,17 +360,17 @@ func (d *codexDriver) emitCompactIdle() {
 func (d *codexDriver) turnBegin() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.turnActive = true
 	if !d.turnStart.IsZero() {
 		return
 	}
 	d.turnStart = time.Now()
 }
 
-func (d *codexDriver) turnEnd() {
-	d.mu.Lock()
+// turnEndLocked 在状态收尾的同一临界区发耗时,防止新 Send 被旧 idle 覆盖。
+func (d *codexDriver) turnEndLocked() {
 	start := d.turnStart
 	d.turnStart = time.Time{}
-	d.mu.Unlock()
 	if start.IsZero() {
 		return
 	}
@@ -602,6 +627,8 @@ func (d *codexDriver) waitExit() {
 	d.mu.Lock()
 	d.exitErr = err
 	d.stdin = nil
+	d.pending = map[int]chan json.RawMessage{}
+	d.pendingMethods = map[int]string{}
 	// 进程死了:RPC 全部失败,挂起的审批按拒绝收尾,挂起的提问按取消收尾。
 	for _, ap := range d.approvals {
 		select {
@@ -676,6 +703,7 @@ func (d *codexDriver) call(method string, params any, timeout time.Duration) (js
 	case <-time.After(timeout):
 		d.mu.Lock()
 		delete(d.pending, id)
+		delete(d.pendingMethods, id)
 		d.mu.Unlock()
 		return nil, fmt.Errorf("%s 超时", method)
 	case <-d.done:
@@ -692,20 +720,26 @@ func (d *codexDriver) sendLocked(method string, params any) (int, chan json.RawM
 	id := d.nextID
 	ch := make(chan json.RawMessage, 1)
 	d.pending[id] = ch
+	d.pendingMethods[id] = method
 
 	b, err := json.Marshal(map[string]any{"id": id, "method": method, "params": params})
 	if err != nil {
 		delete(d.pending, id)
+		delete(d.pendingMethods, id)
 		return 0, nil, err
 	}
 	if _, err := d.stdin.Write(append(b, '\n')); err != nil {
 		delete(d.pending, id)
+		delete(d.pendingMethods, id)
 		return 0, nil, err
+	}
+	if method == "turn/start" {
+		d.lastTurnRequest = id
 	}
 	return id, ch, nil
 }
 
-// asyncCall 发了不等响应的长请求(turn/start 的响应等回合结束才来);
+// asyncCall 发了不等响应的请求(turn/start 响应是回合确认,不是终态);
 // 响应/错误由 handleRPCResponse 异步处理。必须在持有 mu 时调用。
 func (d *codexDriver) asyncCall(method string, params any) error {
 	_, _, err := d.sendLocked(method, params)
@@ -765,15 +799,33 @@ func (d *codexDriver) readStdout(r io.Reader) {
 // handleRPCResponse 把响应回填给等待中的 call;错误响应顺手转成 error 事件
 // (asyncCall 的失败没有别的透出渠道)。
 func (d *codexDriver) handleRPCResponse(msg *jsonrpcLine) {
+	if msg.ID == nil {
+		return
+	}
 	d.mu.Lock()
 	ch := d.pending[*msg.ID]
+	method := d.pendingMethods[*msg.ID]
 	delete(d.pending, *msg.ID)
+	delete(d.pendingMethods, *msg.ID)
 	d.mu.Unlock()
 	if ch == nil {
 		return
 	}
 	if msg.Error != nil {
 		d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(msg.Error.Message, 4000)}})
+		// RPC 失败没有 turn/completed;不能让会话永远转圈。确认失败的
+		// 请求不自动重发,避免未知是否已接收的输入被重复执行。
+		if method == "turn/start" {
+			d.mu.Lock()
+			// 已有 turnID 说明另一回合仍在推进(插话被拒绝,或迟到的
+			// 请求错误)。它的终态仍应交给 turn/completed,不能提前回 idle。
+			if *msg.ID == d.lastTurnRequest && d.turnID == "" {
+				d.turnActive = false
+				d.turnEndLocked()
+				d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+			}
+			d.mu.Unlock()
+		}
 		ch <- nil
 		return
 	}
@@ -992,16 +1044,14 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 			return
 		}
 		var m struct {
-			Type      string     `json:"type"`
-			Item      *codexItem `json:"item"`
-			ItemID    string     `json:"item_id"`
-			TurnID    string     `json:"turn_id"`
-			TurnID2   string     `json:"turnId"`
-			Error     string     `json:"error"`
-			WillRetry bool       `json:"will_retry"`
-			Delta     string     `json:"delta"`
-			Text      string     `json:"text"`
-			Message   string     `json:"message"`
+			Type    string     `json:"type"`
+			Item    *codexItem `json:"item"`
+			ItemID  string     `json:"item_id"`
+			TurnID  string     `json:"turn_id"`
+			TurnID2 string     `json:"turnId"`
+			Delta   string     `json:"delta"`
+			Text    string     `json:"text"`
+			Message string     `json:"message"`
 		}
 		if json.Unmarshal(wrapped.Msg, &m) != nil {
 			return
@@ -1035,38 +1085,37 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 			// 记下回合 id:turn/interrupt 要指名打断哪个回合。
 			if turnID != "" {
 				d.mu.Lock()
+				if turnID == d.lastFinishedTurn {
+					d.mu.Unlock()
+					return
+				}
 				d.turnID = turnID
 				d.mu.Unlock()
 			}
 			d.turnBegin()
 			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusRunning}})
 		case "task_complete", "turn_aborted":
-			d.mu.Lock()
-			d.turnID = ""
-			d.mu.Unlock()
-			d.turnEnd()
-			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+			status := "completed"
+			if m.Type == "turn_aborted" {
+				status = "interrupted"
+			}
+			d.finishCodexTurn(turnID, status, codexTurnError{})
 		case "context_compacted":
 			// 上下文压缩完成(新版包装事件):不带 token 细节。
 			d.emit(Event{Kind: KindCompaction, Payload: &CompactionPayload{}})
 			d.emitCompactIdle()
 		case "task_failed":
-			d.mu.Lock()
-			d.turnID = ""
-			d.mu.Unlock()
-			d.turnEnd()
-			if !m.WillRetry {
-				msg := m.Error
-				if msg == "" {
-					msg = "codex 任务失败"
-				}
-				d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(msg, 4000)}})
+			var p codexErrorNotification
+			if json.Unmarshal(wrapped.Msg, &p) != nil {
+				return
 			}
-			d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
-		case "error":
-			if !m.WillRetry && m.Error != "" {
-				d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(m.Error, 4000)}})
+			if p.retrying(false) {
+				d.handleCodexError(wrapped.Msg, false)
+			} else {
+				d.finishCodexTurn(turnID, "failed", p.failure())
 			}
+		case "error", "stream_error":
+			d.handleCodexError(wrapped.Msg, m.Type == "stream_error")
 		}
 		return
 	}
@@ -1176,6 +1225,10 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		json.Unmarshal(params, &p)
 		if tid := firstNonEmpty(p.TurnID, p.TurnID2, p.Turn.ID); tid != "" {
 			d.mu.Lock()
+			if tid == d.lastFinishedTurn {
+				d.mu.Unlock()
+				return
+			}
 			d.turnID = tid
 			d.mu.Unlock()
 		}
@@ -1214,33 +1267,25 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 	case "turn/completed":
 		// 实测:状态在 params.turn.status(顶层 status 不存在),error 在 turn.error。
 		var p struct {
-			Status string `json:"status"`
-			Error  string `json:"error"`
-			Turn   struct {
-				Status string `json:"status"`
-				Error  struct {
-					Message string `json:"message"`
-				} `json:"error"`
+			Status    string         `json:"status"`
+			TurnID    string         `json:"turnId"`
+			OldTurnID string         `json:"turn_id"`
+			Error     codexTurnError `json:"error"`
+			Turn      struct {
+				ID     string         `json:"id"`
+				Status string         `json:"status"`
+				Error  codexTurnError `json:"error"`
 			} `json:"turn"`
 		}
-		json.Unmarshal(params, &p)
-		status := strings.ToLower(firstNonEmpty(p.Status, p.Turn.Status))
-		errMsg := firstNonEmpty(p.Error, p.Turn.Error.Message)
-		d.mu.Lock()
-		d.turnID = "" // 回合结束(含打断):清掉,下次 Interrupt 不至于拿旧 id
-		d.mu.Unlock()
-		d.turnEnd()
-		switch status {
-		case "interrupted", "cancelled", "canceled":
-			// 打断不算失败:安静回到 idle。
-		case "failed", "error":
-			msg := errMsg
-			if msg == "" {
-				msg = "codex 回合失败"
-			}
-			d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(msg, 4000)}})
+		if json.Unmarshal(params, &p) != nil {
+			return
 		}
-		d.emit(Event{Kind: KindStatus, Payload: &StatusPayload{State: StatusIdle}})
+		status := strings.ToLower(firstNonEmpty(p.Status, p.Turn.Status))
+		e := p.Turn.Error
+		if p.Error.Message != "" {
+			e = p.Error
+		}
+		d.finishCodexTurn(firstNonEmpty(p.TurnID, p.OldTurnID, p.Turn.ID), status, e)
 
 	case "thread/compacted":
 		// 上下文压缩完成(老版通知):不带 token 细节,与新版包装事件同一归一。
@@ -1299,14 +1344,7 @@ func (d *codexDriver) handleNotification(method string, params json.RawMessage) 
 		}})
 
 	case "error":
-		var p struct {
-			Message   string `json:"message"`
-			WillRetry bool   `json:"will_retry"`
-		}
-		json.Unmarshal(params, &p)
-		if !p.WillRetry && p.Message != "" {
-			d.emit(Event{Kind: KindError, Payload: &ErrorPayload{Message: truncate(p.Message, 4000)}})
-		}
+		d.handleCodexError(params, false)
 	}
 	// 其余通知(plan 等)Phase 3 再说。
 }

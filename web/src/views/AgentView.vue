@@ -601,7 +601,7 @@ function compactionText(p: AgentCompaction): string {
 // 后台通知 🔔(失败 ⚠️)/ 监视器事件 📡。
 function sysinfoIcon(p: AgentSystemInfo): string {
   switch (p.type) {
-    case 'api_error': return p.retry ? '⏳' : '⚠️'
+    case 'api_error': return p.retry || p.status === 'retrying' ? '⏳' : '⚠️'
     case 'turn_duration': return '⏱️'
     case 'task_notification': {
       if (p.status === 'failed') return '⚠️'
@@ -618,6 +618,7 @@ function sysinfoText(p: AgentSystemInfo): string {
   switch (p.type) {
     case 'api_error': {
       if (p.retry && p.maxRetry) return `API 错误,重试中(${p.retry}/${p.maxRetry})`
+      if (p.status === 'retrying') return `${p.text || 'API 错误,重试中'}${p.error ? `:${p.error}` : ''}`
       if (p.maxRetry) return `API 错误:重试已达上限(${p.maxRetry} 次)${p.error ? `:${p.error}` : ''}`
       return `API 错误${p.error ? `:${p.error}` : ''}`
     }
@@ -1868,7 +1869,7 @@ onBeforeUnmount(() => {
             <div v-if="notifySummary(c.sysinfo)" class="notify-body agent-md-body" v-html="renderMarkdown(notifySummary(c.sysinfo))" />
             <pre v-if="c.sysinfo.event" class="notify-event">{{ c.sysinfo.event }}</pre>
           </div>
-          <div v-else-if="c.kind === 'system' && c.sysinfo" class="sysline" :class="{ 'sysline-failed': c.sysinfo.type === 'api_error' && c.sysinfo.maxRetry && !c.sysinfo.retry }">{{ sysinfoIcon(c.sysinfo) }} {{ sysinfoText(c.sysinfo) }}</div>
+          <div v-else-if="c.kind === 'system' && c.sysinfo" class="sysline" :class="{ 'sysline-failed': c.sysinfo.type === 'api_error' && c.sysinfo.maxRetry && !c.sysinfo.retry && c.sysinfo.status !== 'retrying' }">{{ sysinfoIcon(c.sysinfo) }} {{ sysinfoText(c.sysinfo) }}</div>
         </div>
         <!-- 流式直播区:正在生成的思考与正文(瞬态,完整消息落库后清空换正式卡)。
              思考计时是本地秒表:首个增量起每秒跳,收尾即停(thinkMs 落在正式卡上) -->

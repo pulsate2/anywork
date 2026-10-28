@@ -194,7 +194,7 @@ type CompactionPayload struct {
 }
 
 // SystemInfoPayload KindSystemInfo 的负载。Type 区分四类:api_error(过载/
-// 限流重试,Retry/MaxRetry 是进度)、turn_duration(回合结束统计)、
+// 限流重试,Retry/MaxRetry 是进度,Status=retrying 也支持 CLI 未提供次数)、turn_duration(回合结束统计)、
 // away_summary(离开期间的 recap,Text 是原文)、task_notification(后台任务
 // 完成/Monitor 事件,Text 是摘要,Status 是 completed/failed 等状态词,
 // Event 是 Monitor 事件的具体行)。

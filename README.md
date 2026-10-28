@@ -62,6 +62,12 @@ docker run -d \
 | `--vapid-subject` | `LIGHTREMOTE_VAPID_SUBJECT` | `mailto:admin@localhost` | VAPID subject |
 | `--push-idle` | `LIGHTREMOTE_PUSH_IDLE` | `10` | 终端安静秒数后发"命令完成"推送;`0` 禁用 |
 
+## AI 配置转换
+
+AI 配置卡片的“转换”可生成 Claude Code、Codex 或 Pi 配置草稿,迁移接口地址、API Key 和模型。Pi 可选 Responses、Chat Completions 或 Anthropic Messages。CC 转 Responses 会在末尾补 `/v1`(不重复添加),反向转 CC 去掉末尾 `/v1`。
+
+生成后可编辑再保存为新配置,原配置保持不变;保存不自动生效,需另点“设为当前”。OAuth 登录态和客户端专属参数不跨客户端复制。转换仅改变配置格式,供应商仍需支持目标协议,专用端点与模型名请自行确认。
+
 ## 安全
 
 - 单密码认证,登录限速(5 次/分钟),内存 HMAC 签名 Cookie。

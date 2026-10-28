@@ -9,8 +9,9 @@ import { api, type AiApp, type AiProvider } from '@/api/client'
 import {
   PI_API_CHOICES, categoryLabel, presetsFor, readFields, writeField, type FieldName,
 } from '@/config/aiPresets'
+import { conversionProviders, convertAiConfig, type ConversionApi } from '@/config/aiConvert'
 
-// 两套 CLI 各有各的配置落点,切换条的两个档位就是它们。
+// 三套 CLI 各有各的配置落点。
 const APPS: { value: AiApp; label: string }[] = [
   { value: 'claude', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
@@ -25,6 +26,9 @@ const busy = ref('')
 const importInput = ref<HTMLInputElement | null>(null)
 
 const editModal = ref(false)
+// 转换草稿可以属于另一个客户端,未保存前不切换列表标签。
+const editApp = ref<AiApp>('claude')
+const convertedFrom = ref('')
 const editId = ref('')
 const editName = ref('')
 const editCategory = ref('custom')
@@ -41,19 +45,29 @@ const saving = ref(false)
 // 回填输入框时置位,挡住下面的 watcher 把刚解析出来的值又原样写回正文。
 const syncing = ref(false)
 
+const convertModal = ref(false)
+const convertSource = ref<AiProvider | null>(null)
+const convertTarget = ref<AiApp>('codex')
+const convertPiApi = ref<ConversionApi>('openai-responses')
+const convertProvider = ref('')
+const convertProviderOptions = ref<{ value: string; label: string }[]>([])
+const convertTargetOptions = computed(() => APPS.filter((a) => a.value !== convertSource.value?.app))
+const conversionWarnings = ref<string[]>([])
+
 const keyHint = `供应商的 API Key;留空则不写(用官方登录态 / 环境变量)`
 const baseUrlHint = `供应商给的接口地址,如 https://api.example.com`
 // claude 一个模型名要钉四个字段(含 haiku/sonnet/opus 别名),这个框一填全改到。
 const modelHint = computed(() =>
-  app.value === 'claude'
+  editApp.value === 'claude'
     ? `一次填好 4 个模型字段(含 haiku/sonnet/opus 别名);留空则不钉模型`
     : `钉死模型名;留空则不钉模型,跟 CLI 默认走`,
 )
 
 const activeApp = computed(() => APPS.find((a) => a.value === app.value) ?? APPS[0])
+const editingApp = computed(() => APPS.find((a) => a.value === editApp.value) ?? APPS[0])
 
 const presetOptions = computed(() =>
-  presetsFor(app.value).map((p) => ({
+  presetsFor(editApp.value).map((p) => ({
     label: `${p.name} · ${categoryLabel(p.category)}`,
     value: p.name,
   })),
@@ -67,7 +81,7 @@ const apiOptions = PI_API_CHOICES.map((c) => ({ label: c.label, value: c.value }
 // 期间 syncing 置位,挡住 watcher 反向写回。
 function syncInputsFromText() {
   syncing.value = true
-  const f = readFields(app.value, configText.value, authText.value)
+  const f = readFields(editApp.value, configText.value, authText.value)
   baseUrl.value = f.baseUrl
   apiKey.value = f.key
   modelName.value = f.model
@@ -77,13 +91,14 @@ function syncInputsFromText() {
 
 // 改任一便捷框就把那个字段直接写回正文(正文是唯一真相源)。syncing 期间不写,
 // 避免回填时把刚读出来的值又塞一遍、顺带重排 JSON。
-watch(baseUrl, (v) => applyField('baseUrl', v))
-watch(apiKey, (v) => applyField('key', v))
-watch(modelName, (v) => applyField('model', v))
-watch(piApi, (v) => applyField('api', v))
+// 同步 watch 才能在回填时看见 syncing=true,避免草稿初始化后反写正文。
+watch(baseUrl, (v) => applyField('baseUrl', v), { flush: 'sync' })
+watch(apiKey, (v) => applyField('key', v), { flush: 'sync' })
+watch(modelName, (v) => applyField('model', v), { flush: 'sync' })
+watch(piApi, (v) => applyField('api', v), { flush: 'sync' })
 function applyField(field: FieldName, v: string) {
   if (syncing.value) return
-  const r = writeField(app.value, field, v, configText.value, authText.value)
+  const r = writeField(editApp.value, field, v, configText.value, authText.value)
   configText.value = r.config
   authText.value = r.auth
 }
@@ -104,15 +119,18 @@ const filtered = computed(() => {
       .join('\n').toLowerCase().includes(q),
   )
 })
+let loadGeneration = 0
 async function load() {
+  const generation = ++loadGeneration
+  const requestedApp = app.value
   loading.value = true
   try {
-    const r = await api.aiProviders(app.value)
-    providers.value = r.providers || []
+    const r = await api.aiProviders(requestedApp)
+    if (generation === loadGeneration) providers.value = r.providers || []
   } catch (e: any) {
-    message.error(e?.message || '加载失败')
+    if (generation === loadGeneration) message.error(e?.message || '加载失败')
   } finally {
-    loading.value = false
+    if (generation === loadGeneration) loading.value = false
   }
 }
 
@@ -144,14 +162,17 @@ function piFirstProvider(cfg: any): any {
   return first ?? null
 }
 
-function resetForm() {
+function resetForm(target: AiApp = app.value) {
+  editApp.value = target
+  convertedFrom.value = ''
+  conversionWarnings.value = []
   editId.value = ''
   editName.value = ''
   editCategory.value = 'custom'
   editSite.value = ''
   presetName.value = null
-  configText.value = app.value === 'claude' ? JSON.stringify({ env: {} }, null, 2) : ''
-  authText.value = app.value === 'claude' ? '' : '{}'
+  configText.value = target === 'claude' ? JSON.stringify({ env: {} }, null, 2) : ''
+  authText.value = target === 'claude' ? '' : '{}'
   syncInputsFromText()
 }
 
@@ -175,7 +196,7 @@ function openCreate() {
 }
 
 function openEdit(p: AiProvider) {
-  resetForm()
+  resetForm(p.app)
   editId.value = p.id
   editName.value = p.name
   editCategory.value = p.category
@@ -191,8 +212,43 @@ function openCopy(p: AiProvider) {
   editName.value = `${p.name} 副本`
 }
 
+function openConvert(p: AiProvider) {
+  try {
+    const options = conversionProviders(p)
+    convertSource.value = p
+    convertProviderOptions.value = options
+    convertProvider.value = options[0]?.value || ''
+    convertTarget.value = p.app === 'claude' ? 'codex' : 'claude'
+    convertPiApi.value = 'openai-responses'
+    convertModal.value = true
+  } catch (e: any) {
+    message.error(e?.message || '源配置无法转换')
+  }
+}
+
+function generateConversion() {
+  const source = convertSource.value
+  if (!source) return
+  try {
+    const result = convertAiConfig(source, convertTarget.value, {
+      piApi: convertPiApi.value, providerId: convertProvider.value || undefined,
+    })
+    resetForm(convertTarget.value)
+    editName.value = `${source.name} (${editingApp.value.label})`
+    editCategory.value = source.category
+    editSite.value = source.websiteUrl
+    fillForm({ ...source, app: convertTarget.value, config: result.config })
+    convertedFrom.value = source.name
+    conversionWarnings.value = result.warnings
+    convertModal.value = false
+    editModal.value = true
+  } catch (e: any) {
+    message.error(e?.message || '转换失败')
+  }
+}
+
 function applyPreset(name: string | null) {
-  const p = presetsFor(app.value).find((x) => x.name === name)
+  const p = presetsFor(editApp.value).find((x) => x.name === name)
   if (!p) return
   editName.value = p.name
   editCategory.value = p.category
@@ -206,10 +262,10 @@ function applyPreset(name: string | null) {
 // buildConfig 把编辑框拼成后端要的载荷。正文就是真相源,直接解析,不再替换占位符。
 function buildConfig(): unknown {
   const conf = configText.value
-  if (app.value === 'claude') return JSON.parse(conf.trim() || '{}')
+  if (editApp.value === 'claude') return JSON.parse(conf.trim() || '{}')
   const auth = authText.value.trim()
   // pi 的正文是 models.json(JSON),codex 的是 config.toml(原样字符串)。
-  if (app.value === 'pi') {
+  if (editApp.value === 'pi') {
     return { auth: auth ? JSON.parse(auth) : {}, models: conf.trim() ? JSON.parse(conf) : {} }
   }
   return { auth: auth ? JSON.parse(auth) : {}, config: conf }
@@ -229,7 +285,7 @@ async function save() {
   saving.value = true
   try {
     const body = {
-      app: app.value,
+      app: editApp.value,
       name: editName.value.trim(),
       category: editCategory.value,
       websiteUrl: editSite.value,
@@ -238,8 +294,14 @@ async function save() {
     if (editId.value) await api.aiProviderUpdate({ ...body, id: editId.value })
     else await api.aiProviderCreate(body)
     editModal.value = false
-    message.success('已保存')
-    await load()
+    message.success(convertedFrom.value ? '转换配置已保存,原配置保持不变' : '已保存')
+    if (app.value !== editApp.value) {
+      providers.value = []
+      searchQ.value = ''
+      app.value = editApp.value // watcher 加载目标列表;不自动设为当前
+    } else {
+      await load()
+    }
   } catch (e: any) {
     message.error(e?.message || '保存失败')
   } finally {
@@ -362,6 +424,7 @@ onMounted(load)
             </n-button>
             <n-button class="ai-btn" size="tiny" quaternary @click="openEdit(p)">编辑</n-button>
             <n-button class="ai-btn" size="tiny" quaternary @click="openCopy(p)">复制</n-button>
+            <n-button class="ai-btn ai-convert" size="tiny" quaternary @click="openConvert(p)">转换</n-button>
             <n-button v-if="p.websiteUrl" class="ai-btn" size="tiny" quaternary tag="a"
               :href="p.websiteUrl" target="_blank" rel="noreferrer">
               官网
@@ -376,15 +439,19 @@ onMounted(load)
         </div>
       </div>
     </n-spin>
-    <n-modal v-model:show="editModal" preset="card" :title="editId ? '编辑配置' : '新增配置'"
+    <n-modal v-model:show="editModal" preset="card" :title="convertedFrom ? `转换为 ${editingApp.label}` : editId ? '编辑配置' : '新增配置'"
       class="ai-modal">
+      <div v-if="convertedFrom" class="ai-conversion-note">
+        从 {{ convertedFrom }} 生成新配置,原配置不会修改;保存后仍需点“设为当前”才会生效。
+        <div v-for="warning in conversionWarnings" :key="warning" class="ai-conversion-warning">{{ warning }}</div>
+      </div>
       <div class="form">
         <label>预设</label>
         <n-select v-model:value="presetName" :options="presetOptions" clearable
-          :placeholder="`选一个 ${activeApp.label} 供应商自动填好,也可以全手填`" @update:value="applyPreset" />
+          :placeholder="`选一个 ${editingApp.label} 供应商自动填好,也可以全手填`" @update:value="applyPreset" />
         <label>配置名</label>
         <n-input v-model:value="editName" placeholder="如 Kimi / 公司代理" />
-        <template v-if="app === 'pi'">
+        <template v-if="editApp === 'pi'">
           <label>接口协议</label>
           <n-select v-model:value="piApi" :options="apiOptions" />
           <div class="ai-hint">选 Claude(Anthropic Messages)时,接口地址要填供应商的 /anthropic 端点。</div>
@@ -395,19 +462,19 @@ onMounted(load)
         <n-input v-model:value="apiKey" type="password" show-password-on="click" :placeholder="keyHint" />
         <label>模型</label>
         <n-input v-model:value="modelName" :placeholder="modelHint" />
-        <template v-if="app === 'claude'">
+        <template v-if="editApp === 'claude'">
           <label>settings.json</label>
           <n-input v-model:value="configText" type="textarea" :autosize="{ minRows: 8, maxRows: 20 }"
             class="mono" />
         </template>
         <template v-else>
-          <label>{{ app === 'pi' ? 'models.json' : 'config.toml' }}</label>
+          <label>{{ editApp === 'pi' ? 'models.json' : 'config.toml' }}</label>
           <n-input v-model:value="configText" type="textarea" :autosize="{ minRows: 8, maxRows: 20 }"
             class="mono" />
           <label>auth.json</label>
           <n-input v-model:value="authText" type="textarea" :autosize="{ minRows: 3, maxRows: 8 }" class="mono" />
           <div class="ai-hint">
-            {{ app === 'pi'
+            {{ editApp === 'pi'
               ? '留空或写成空对象就不动 auth.json —— 官方 OAuth 登录态也存在这个文件里。'
               : '留空或写成空对象就不动 auth.json —— 官方 ChatGPT 的登录态也存在这个文件里。' }}
           </div>
@@ -419,6 +486,28 @@ onMounted(load)
         <div class="ai-foot">
           <n-button @click="editModal = false">取消</n-button>
           <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <n-modal v-model:show="convertModal" preset="card" title="转换配置" class="ai-modal">
+      <div class="form">
+        <div class="ai-hint">源配置:{{ convertSource?.name }}</div>
+        <template v-if="convertProviderOptions.length > 1">
+          <label>源供应商</label>
+          <n-select v-model:value="convertProvider" :options="convertProviderOptions" />
+        </template>
+        <label>目标客户端</label>
+        <n-select v-model:value="convertTarget" :options="convertTargetOptions" />
+        <template v-if="convertTarget === 'pi'">
+          <label>Pi 接口协议</label>
+          <n-select v-model:value="convertPiApi" :options="apiOptions" />
+        </template>
+      </div>
+      <template #footer>
+        <div class="ai-foot">
+          <n-button @click="convertModal = false">取消</n-button>
+          <n-button type="primary" @click="generateConversion">生成配置</n-button>
         </div>
       </template>
     </n-modal>
@@ -462,6 +551,8 @@ onMounted(load)
 .ai-btn { min-height: 28px; height: 28px; }
 
 .ai-hint { font-size: 12px; color: var(--lr-fg-muted); line-height: 1.5; }
+.ai-conversion-note { margin-bottom: 12px; font-size: 12px; color: var(--lr-fg-muted); line-height: 1.6; }
+.ai-conversion-warning { color: var(--lr-accent); margin-top: 4px; }
 .form { display: flex; flex-direction: column; gap: 8px; }
 .form label { font-size: 12px; color: var(--lr-fg-muted); }
 .ai-foot { display: flex; justify-content: flex-end; gap: 8px; }

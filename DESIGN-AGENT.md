@@ -95,6 +95,7 @@ claude --output-format stream-json --verbose --input-format stream-json \
 - `codex app-server` 子进程,行分隔 JSON-RPC over stdio。
 - 方法:`initialize` / `thread/start` / `thread/resume` / `turn/start` / `turn/steer`;通知:`agent_message` / `agent_reasoning_delta` / `exec_approval_request` / `patch_apply_*` / `mcp_tool_call_*` / `turn_diff` / `task_complete`。
 - 权限模式映射为 `approvalPolicy` + `sandbox`(参照 hapi `appServerConfig.ts` 的映射表)。
+- **重试归属**:网络请求与流断线重试由 Codex 自身负责,沿用 CLI 配置;agent 不自动追加“继续”消息、不重发 `turn/start`。兼容 `error.message`/旧错误字符串及 `willRetry`/`will_retry`,重试期间展示 `api_error(status=retrying)`、保持 running/turnID/计时,不放行排队消息;只有真正终态才回 idle,最终错误不会吞掉。`turn/start` RPC 被拒绝时也必须收回 running。
 - **风险与降级**:app-server 是 codex 自家 VS Code 插件在用的内部协议,无正式文档,版本间可能变。driver 初始化握手失败即标记该会话"协议不兼容",前端提示降级为 PTY 模式(见 4.4)。
 
 ### 4.3 统一事件模型(两种 flavor 归一后对 WS 只有一种)

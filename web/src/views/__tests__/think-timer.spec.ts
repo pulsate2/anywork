@@ -202,6 +202,44 @@ describe('思考直播卡:思考中 + 实时计时器', () => {
     w.unmount()
   })
 
+  it('Codex 未提供次数的重试也显示等待提示,且不重置思考计时', async () => {
+    const w = mount({
+      components: { NMessageProvider, AgentView },
+      template: '<n-message-provider><agent-view /></n-message-provider>',
+    }, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+    const vm = w.findComponent(AgentView).vm as any
+    await vm.openSession(SID)
+    await flushPromises()
+
+    await fire({ type: 'message', event: { sessionId: SID, kind: 'reasoning_delta', payload: '思考中' } })
+    await vi.advanceTimersByTimeAsync(4000)
+    await fire({ type: 'message', event: {
+      sessionId: SID, kind: 'system_info', seq: 1,
+      payload: { type: 'api_error', status: 'retrying', text: 'Codex 正在自动重试', error: 'stream disconnected' },
+    } })
+    const notice = w.find('.sysline')
+    expect(notice.text()).toContain('⏳')
+    expect(notice.text()).toContain('Codex 正在自动重试')
+    expect(notice.text()).toContain('stream disconnected')
+    expect(notice.classes()).not.toContain('sysline-failed')
+    expect(w.find('.chat-row.reasoning summary').text()).toBe('思考中 · 4 秒')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(w.find('.chat-row.reasoning summary').text()).toBe('思考中 · 6 秒')
+
+    await fire({ type: 'message', event: {
+      sessionId: SID, kind: 'system_info', seq: 2,
+      payload: { type: 'api_error', status: 'retrying', retry: 2, maxRetry: 3 },
+    } })
+    expect(w.text()).toContain('重试中(2/3)')
+    await fire({ type: 'message', event: {
+      sessionId: SID, kind: 'system_info', seq: 3,
+      payload: { type: 'api_error', maxRetry: 3, error: 'upstream failed' },
+    } })
+    expect(w.find('.sysline-failed').text()).toContain('重试已达上限(3 次)')
+    w.unmount()
+  })
+
   // 服务端在思考段收尾时把实测跨度记进 payload.durationMs(见 internal/agent
   // 的 pump):前端直接用,不再按相邻事件的 created_at 推算 —— 那条推算链在
   // 秒精度和穿插的子 agent 通知面前都不可靠。
