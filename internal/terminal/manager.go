@@ -145,12 +145,12 @@ func (m *Manager) watchExit(s *Session) {
 }
 
 // Attach 附加客户端到会话,返回会话与需要回放的缓冲。
-func (m *Manager) Attach(id string, c *Client) (*Session, []byte, error) {
+func (m *Manager) Attach(id string, c *Client, requestID uint32) (*Session, []byte, error) {
 	s := m.get(id)
 	if s == nil {
 		return nil, nil, fmt.Errorf("会话不存在: %s", id)
 	}
-	buf := s.attachClient(c)
+	buf := s.attachClient(c, requestID)
 	return s, buf, nil
 }
 

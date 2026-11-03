@@ -3,7 +3,7 @@
 // ~/.claude/settings.json 或 ~/.codex/config.toml + auth.json,CLI 下次启动自己读到。
 import { computed, onMounted, ref, watch } from 'vue'
 import {
-  NButton, NEmpty, NInput, NModal, NPopconfirm, NSelect, NSpin, NTag, useMessage,
+  NAutoComplete, NButton, NEmpty, NInput, NModal, NPopconfirm, NSelect, NSpin, NTag, useMessage,
 } from 'naive-ui'
 import { api, type AiApp, type AiProvider } from '@/api/client'
 import {
@@ -44,6 +44,50 @@ const piApi = ref('openai-completions')
 const saving = ref(false)
 // 回填输入框时置位,挡住下面的 watcher 把刚解析出来的值又原样写回正文。
 const syncing = ref(false)
+const fetchingModels = ref(false)
+const availableModels = ref<string[]>([])
+const modelQuery = ref('')
+let modelFetchEpoch = 0
+const modelOptions = computed(() => {
+  const query = modelQuery.value.trim().toLowerCase()
+  return availableModels.value
+    .filter((value) => value.toLowerCase().includes(query))
+    .map((value) => ({ label: value, value }))
+})
+
+function clearModels() {
+  modelFetchEpoch++
+  fetchingModels.value = false
+  availableModels.value = []
+  modelQuery.value = ''
+}
+
+async function fetchModelList() {
+  if (fetchingModels.value) return
+  // 从正文读取当前接口与 Key,转换草稿的客户端可能与列表标签不同。
+  const fields = readFields(editApp.value, configText.value, authText.value)
+  const endpoint = fields.baseUrl.trim()
+  const key = fields.key.trim()
+  if (!endpoint || !key) {
+    message.warning('请先填写接口地址和 API Key')
+    return
+  }
+  const epoch = ++modelFetchEpoch
+  availableModels.value = []
+  modelQuery.value = ''
+  fetchingModels.value = true
+  try {
+    const useAnthropic = editApp.value === 'claude' || (editApp.value === 'pi' && fields.api === 'anthropic-messages')
+    const result = await api.aiModels({ app: useAnthropic ? 'claude' : editApp.value, baseUrl: endpoint, apiKey: key })
+    if (epoch !== modelFetchEpoch) return
+    availableModels.value = result.models
+    message.success(`已获取 ${result.models.length} 个模型`)
+  } catch (e: any) {
+    if (epoch === modelFetchEpoch) message.error(e?.message || '获取模型列表失败')
+  } finally {
+    if (epoch === modelFetchEpoch) fetchingModels.value = false
+  }
+}
 
 const convertModal = ref(false)
 const convertSource = ref<AiProvider | null>(null)
@@ -163,6 +207,7 @@ function piFirstProvider(cfg: any): any {
 }
 
 function resetForm(target: AiApp = app.value) {
+  clearModels()
   editApp.value = target
   convertedFrom.value = ''
   conversionWarnings.value = []
@@ -250,6 +295,7 @@ function generateConversion() {
 function applyPreset(name: string | null) {
   const p = presetsFor(editApp.value).find((x) => x.name === name)
   if (!p) return
+  clearModels()
   editName.value = p.name
   editCategory.value = p.category
   editSite.value = p.websiteUrl
@@ -361,6 +407,11 @@ function onImportPick(ev: Event) {
 }
 
 watch(app, load)
+watch(() => {
+  const fields = readFields(editApp.value, configText.value, authText.value)
+  return JSON.stringify([editApp.value, fields.baseUrl, fields.key, fields.api])
+}, clearModels, { flush: 'sync' })
+watch(editModal, (open) => { if (!open) clearModels() })
 onMounted(load)
 </script>
 
@@ -461,7 +512,20 @@ onMounted(load)
         <label>API Key</label>
         <n-input v-model:value="apiKey" type="password" show-password-on="click" :placeholder="keyHint" />
         <label>模型</label>
-        <n-input v-model:value="modelName" :placeholder="modelHint" />
+        <n-auto-complete v-if="availableModels.length" v-model:value="modelName" class="ai-model-input"
+          :options="modelOptions" :get-show="() => true" :placeholder="modelHint"
+          @update:value="modelQuery = $event || ''" @focus="modelQuery = ''" @select="modelQuery = ''">
+          <template #suffix>
+            <n-button size="tiny" quaternary :loading="fetchingModels" @mousedown.prevent
+              @click.stop="fetchModelList">获取模型列表</n-button>
+          </template>
+        </n-auto-complete>
+        <n-input v-else v-model:value="modelName" class="ai-model-input" :placeholder="modelHint">
+          <template #suffix>
+            <n-button size="tiny" quaternary :loading="fetchingModels" @mousedown.prevent
+              @click.stop="fetchModelList">获取模型列表</n-button>
+          </template>
+        </n-input>
         <template v-if="editApp === 'claude'">
           <label>settings.json</label>
           <n-input v-model:value="configText" type="textarea" :autosize="{ minRows: 8, maxRows: 20 }"

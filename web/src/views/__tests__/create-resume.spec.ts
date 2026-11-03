@@ -2,7 +2,7 @@
 // 选中后创建时带 resumeExternal + title(后端列表逻辑见 resumable_test.go)。
 // 下拉的弹层(VFollower)在 happy-dom 里不渲染,选中动作直接对 NSelect 实例
 // 发 update:value —— 验证的是 v-model 接线与创建参数,弹层交互浏览器自测。
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia } from 'pinia'
 import { NMessageProvider, NSelect } from 'naive-ui'
@@ -79,9 +79,11 @@ function pickResume(w: { findAllComponents: (c: unknown) => any[] }, id: string)
 }
 
 describe('新建会话:下拉框恢复当前目录的已有会话', () => {
+  beforeEach(() => { localStorage.removeItem('agent.createPreferences') })
   // n-modal teleport 到 body:每个用例收尾清掉 body,避免上一个用例的
   // 弹窗 DOM 混进后续断言。
   afterEach(() => {
+    localStorage.removeItem('agent.createPreferences')
     document.body.innerHTML = ''
   })
 
@@ -128,5 +130,51 @@ describe('新建会话:下拉框恢复当前目录的已有会话', () => {
     await flushPromises()
     expect(vm.createResume).toBeNull()
     expect(mocks.resumable).toHaveBeenLastCalledWith('claude', '/w/two')
+  })
+
+  it('成功创建后记住 Pi、权限和 max 强度,重新挂载仍会恢复', async () => {
+    mocks.resumable.mockResolvedValue([])
+    mocks.create.mockResolvedValue({ id: 's-new', app: 'pi' })
+    const { w, vm } = await openModal()
+    vm.createApp = 'pi'
+    vm.createPerm = 'accept'
+    vm.createEffort = 'max'
+    await flushPromises()
+    await vm.createSession()
+    expect(JSON.parse(localStorage.getItem('agent.createPreferences')!)).toEqual({
+      app: 'pi', permissionMode: 'accept', effort: 'max',
+    })
+    w.unmount()
+    const restored = await openModal()
+    restored.vm.openCreate()
+    await flushPromises()
+    expect(restored.vm.createApp).toBe('pi')
+    expect(restored.vm.createPerm).toBe('accept')
+    expect(restored.vm.createEffort).toBe('max')
+    restored.w.unmount()
+  })
+
+  it('失败的创建和取消弹窗不覆盖上一次偏好', async () => {
+    const previous = { app: 'codex', permissionMode: 'edits', effort: 'minimal' }
+    localStorage.setItem('agent.createPreferences', JSON.stringify(previous))
+    mocks.resumable.mockResolvedValue([])
+    mocks.create.mockRejectedValue(new Error('创建失败'))
+    const { w, vm } = await openModal()
+    vm.openCreate()
+    await flushPromises()
+    expect(vm.createEffort).toBe('minimal')
+    vm.createApp = 'claude'
+    vm.createPerm = 'ask'
+    vm.createEffort = 'low'
+    await flushPromises()
+    await vm.createSession()
+    vm.createModal = false
+    vm.openCreate()
+    await flushPromises()
+    expect(vm.createApp).toBe('codex')
+    expect(vm.createPerm).toBe('edits')
+    expect(vm.createEffort).toBe('minimal')
+    expect(JSON.parse(localStorage.getItem('agent.createPreferences')!)).toEqual(previous)
+    w.unmount()
   })
 })

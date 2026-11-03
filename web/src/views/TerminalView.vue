@@ -278,6 +278,7 @@ let settleTimer: number | undefined
 let settleTimer2: number | undefined
 // 附加会话后,回放输出还在异步解析中,要等解析完再贴底。
 let pendingAttachSettle = false
+let terminalEpoch = 0
 // 已同步给 PTY 的尺寸,避免 settle 反复发同样的 resize 引起 SIGWINCH 风暴。
 let sentCols = 0
 let sentRows = 0
@@ -311,7 +312,12 @@ function handleEvent(e: any) {
       if (!term) break
       // write 是异步解析的。attach 的回放会先于 session 帧到达,若在这里之前就贴底,
       // 贴的是还没写进缓冲区的旧状态。用 write 的解析回调,等这批真的进了缓冲区再稳定化。
-      if (pendingAttachSettle) term.write(e.data, () => scheduleSettle())
+      if (pendingAttachSettle) {
+        const epoch = terminalEpoch
+        term.write(e.data, () => {
+          if (!disposed && epoch === terminalEpoch) scheduleSettle()
+        })
+      }
       else term.write(e.data)
       break
     case 'session':
@@ -319,7 +325,9 @@ function handleEvent(e: any) {
       // 回放帧到这里已经全部发出(服务端先推回放再发本帧),后续输出不用再排稳定化。
       pendingAttachSettle = false
       activeId.value = e.session.id
+      const epoch = terminalEpoch
       nextTick(() => {
+        if (disposed || epoch !== terminalEpoch) return
         attemptFit()
         syncPtySize(true)
         term?.focus()
@@ -699,6 +707,16 @@ function pickWorkspaceAndCreate() {
   ensureLimitSupport()
 }
 
+// reset() 不清除 xterm 的异步写队列。在队列中再放一道重置,保证旧输出解析完后
+// 清空缓冲,随后才解析新会话的输出。
+function resetTerm() {
+  terminalEpoch++
+  clearSettle()
+  const t = term
+  t?.reset()
+  t?.write('', () => { if (!disposed) t.reset() })
+}
+
 function createSession() {
   // 断线时 create 帧会被静默丢掉,弹窗一关什么也没发生 —— 先把连接找回来。
   if (!client.connected) {
@@ -713,7 +731,8 @@ function createSession() {
   // 新建了就不再接回原会话。
   resumeTarget = null
   // 切换前整屏重置:新会话从空回放开始,避免上个会话的残留输出盖在新终端上。
-  term?.reset()
+  resetTerm()
+  activeId.value = null
   sentCols = 0
   sentRows = 0
   resetTypedMark()
@@ -745,7 +764,7 @@ function attachById(id: string) {
   // 用户自己选了会话,重连那份"接回原会话"的意图就作废了,否则列表一到会把他拽回去。
   resumeTarget = null
   // 切换前整屏重置,避免上一个会话的内容残留(clear() 会留下当前提示行)。
-  term?.reset()
+  resetTerm()
   activeId.value = id
   sentCols = 0
   sentRows = 0
@@ -776,7 +795,7 @@ function releaseActive() {
   sentRows = 0
   resetTypedMark()
   clearSettle()
-  term?.reset()
+  resetTerm()
 }
 
 // 会话列表渲染。

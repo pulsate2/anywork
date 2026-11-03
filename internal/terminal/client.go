@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"time"
 
@@ -39,9 +40,10 @@ type inFrame struct {
 
 // outFrame 服务端 → 客户端。
 type outFrame struct {
-	text bool   // true = JSON 文本帧;false = 二进制输出帧
-	data []byte // 二进制帧:终端输出
-	msg  string // 文本帧:JSON 负载
+	text      bool   // true = JSON 文本帧;false = 二进制输出帧
+	data      []byte // 二进制帧:终端输出
+	msg       string // 文本帧:JSON 负载
+	requestID uint32 // 所属附加请求,隔离切换前仍在排队的输出
 }
 
 // Summary 会话摘要(列表 / 创建响应)。
@@ -113,10 +115,18 @@ func (c *Client) writeLoop(ctx context.Context) {
 			if f.text {
 				err = c.conn.Write(ctx, websocket.MessageText, []byte(f.msg))
 			} else {
-				// 二进制输出帧:首字节为类型 'o',其余为终端字节流。
-				buf := make([]byte, 1+len(f.data))
+				// 新客户端输出帧:'o' + 4 字节大端附加请求号 + 终端字节流。
+				// 未传请求号的旧客户端仍使用原来的单字节帧头。
+				headerLen := 1
+				if f.requestID != 0 {
+					headerLen = 5
+				}
+				buf := make([]byte, headerLen+len(f.data))
 				buf[0] = frameTypeOutput
-				copy(buf[1:], f.data)
+				if f.requestID != 0 {
+					binary.BigEndian.PutUint32(buf[1:5], f.requestID)
+				}
+				copy(buf[headerLen:], f.data)
 				err = c.conn.Write(ctx, websocket.MessageBinary, buf)
 			}
 			if err != nil {

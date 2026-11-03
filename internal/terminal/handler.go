@@ -12,13 +12,14 @@ import (
 
 // 客户端命令帧。
 type inMsg struct {
-	Type  string `json:"type"`
-	SID   string `json:"sid,omitempty"`
-	Data  string `json:"data,omitempty"`
-	Cols  int    `json:"cols,omitempty"`
-	Rows  int    `json:"rows,omitempty"`
-	Dir   string `json:"dir,omitempty"`
-	Shell string `json:"shell,omitempty"`
+	RequestID uint32 `json:"requestId,omitempty"`
+	Type      string `json:"type"`
+	SID       string `json:"sid,omitempty"`
+	Data      string `json:"data,omitempty"`
+	Cols      int    `json:"cols,omitempty"`
+	Rows      int    `json:"rows,omitempty"`
+	Dir       string `json:"dir,omitempty"`
+	Shell     string `json:"shell,omitempty"`
 	// 新建会话时申请的资源上限,0/缺省 = 不限。
 	MemoryMB   int `json:"memoryMB,omitempty"`
 	CPUPercent int `json:"cpuPercent,omitempty"`
@@ -30,7 +31,8 @@ type inMsg struct {
 // 会话状态帧。Summary 内联展开,所以字段与会话列表里的每一项完全一致 ——
 // 前端一套渲染逻辑吃两种帧。
 type sessMsg struct {
-	Type string `json:"type"` // session | sessionList
+	RequestID uint32 `json:"requestId,omitempty"`
+	Type      string `json:"type"` // session | sessionList
 	Summary
 	// List 不能用 omitempty:结束最后一个会话后列表为空,整个字段会被省略,
 	// 前端收到的 list 就是 undefined,渲染时直接崩。空列表必须序列化成 []。
@@ -112,38 +114,41 @@ func readLoop(ctx context.Context, m *Manager, c *Client, curID *string, mu *syn
 			mu.Lock()
 			if *curID != "" {
 				m.Detach(*curID, c)
+				*curID = ""
 			}
 			mu.Unlock()
-			if _, _, err := m.Attach(sum.ID, c); err != nil {
+			if _, _, err := m.Attach(sum.ID, c, in.RequestID); err != nil {
 				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
 				continue
 			}
 			mu.Lock()
 			*curID = sum.ID
 			mu.Unlock()
-			c.sendText(frameTypeSession, sessMsg{Type: "session", Summary: *sum})
+			c.sendText(frameTypeSession, sessMsg{Type: "session", Summary: *sum, RequestID: in.RequestID})
 			// 广播创建事件给其它客户端,使会话列表实时更新。
 			m.broadcastSessionList()
 
 		case "attach":
-			s, replay, err := m.Attach(in.SID, c)
+			// 先验证目标再解绑,失败的切换保留旧订阅;成功后只订阅一个会话。
+			if m.Get(in.SID) == nil {
+				c.sendText(frameTypeText, map[string]any{"type": "error", "message": "会话不存在: " + in.SID})
+				continue
+			}
+			mu.Lock()
+			if *curID != "" {
+				m.Detach(*curID, c)
+				*curID = ""
+			}
+			mu.Unlock()
+			s, _, err := m.Attach(in.SID, c, in.RequestID)
 			if err != nil {
 				c.sendText(frameTypeText, map[string]any{"type": "error", "message": err.Error()})
 				continue
 			}
-			// 回放历史缓冲。
-			for len(replay) > 0 {
-				n := len(replay)
-				if n > 32*1024 {
-					n = 32 * 1024
-				}
-				c.push(outFrame{data: replay[:n]})
-				replay = replay[n:]
-			}
 			mu.Lock()
 			*curID = in.SID
 			mu.Unlock()
-			c.sendText(frameTypeSession, sessMsg{Type: "session", Summary: s.Summary()})
+			c.sendText(frameTypeSession, sessMsg{Type: "session", Summary: s.Summary(), RequestID: in.RequestID})
 			// 若已死则不再等待输入,立即发 exit。
 			if s.isDead() {
 				c.sendText(frameTypeExit, exitMsg{Type: "exit", ID: in.SID, ExitCode: s.ExitCode()})

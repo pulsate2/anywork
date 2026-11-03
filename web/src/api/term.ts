@@ -1,7 +1,7 @@
 // 终端长连接客户端。封装 /api/term 的帧协议。
 // 帧格式:
 //   客户端→服务端:纯 JSON 文本帧,无类型前缀({ type: 'create'|'attach'|'input'|'resize'|'kill'|'list'|'detach', ... })
-//   服务端→客户端:二进制帧首字节 'o' 输出;文本帧首字节 't'error / 's'session / 'e'exit
+//   服务端→客户端:二进制帧 'o' + 4 字节大端附加请求号 + 输出;文本帧首字节 't'error / 's'session / 'e'exit
 
 export interface TermSummary {
   id: string
@@ -39,6 +39,7 @@ export class TermClient {
   private ws: WebSocket | null = null
   private onEvent: (e: TermEvent) => void
   private current: string | null = null
+  private requestId = 0
   // 等着"随便来一帧"的探针回调,见 probe()。
   private probeWaiters = new Set<(ok: boolean) => void>()
 
@@ -64,12 +65,27 @@ export class TermClient {
       // 二进制输出帧以 ArrayBuffer 接收(xterm 需要 Uint8Array)。
       ws.binaryType = 'arraybuffer'
       this.ws = ws
+      let settled = false
+      const finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (error) reject(error)
+        else resolve()
+      }
+      const timer = setTimeout(() => {
+        finish(new Error('终端连接超时'))
+        if (this.ws === ws) this.close()
+      }, 10000)
 
       ws.onopen = () => {
+        if (this.ws !== ws) return
+        finish()
         this.onEvent({ type: 'open' })
-        resolve()
       }
       ws.onclose = () => {
+        // 建连期间就关闭也必须结束 Promise,否则页面会一直停在 connecting。
+        finish(new Error('终端连接已关闭'))
         // 只有还是"当前"那条连接才算数:上一条被替换掉的 socket 关闭与外界无关。
         if (this.ws !== ws) return
         this.ws = null
@@ -78,11 +94,12 @@ export class TermClient {
         this.onEvent({ type: 'close' })
       }
       ws.onerror = () => {
-        reject(new Error('终端连接失败'))
+        finish(new Error('终端连接失败'))
         if (this.ws !== ws) return
         this.onEvent({ type: 'error', message: '终端连接失败' })
       }
       ws.onmessage = (ev) => {
+        if (this.ws !== ws) return
         this.flushProbes(true)
         this.handleMessage(ev.data)
       }
@@ -93,6 +110,7 @@ export class TermClient {
     const ws = this.ws
     this.ws = null
     this.current = null
+    this.nextRequestId()
     this.flushProbes(false)
     ws?.close()
   }
@@ -131,10 +149,11 @@ export class TermClient {
     // 区分二进制帧(输出)与文本帧(JSON 事件)。
     if (data instanceof ArrayBuffer) {
       const buf = new Uint8Array(data)
-      if (buf.length === 0) return
+      if (buf.length < 5) return
       const type = String.fromCharCode(buf[0])
       if (type === 'o') {
-        this.onEvent({ type: 'output', data: buf.slice(1) })
+        if (new DataView(data).getUint32(1) !== this.requestId) return
+        this.onEvent({ type: 'output', data: buf.slice(5) })
       }
       return
     }
@@ -159,6 +178,7 @@ export class TermClient {
             // 兜底成数组:list 缺失时下游 sessions.length / .find 会整页崩掉。
             this.onEvent({ type: 'sessionList', list: payload.list ?? [] })
           } else if (payload.type === 'session') {
+            if (payload.requestId !== this.requestId) return
             // create 也会回这一帧;服务端已把连接附加到该会话,这里同步 current,
             // 否则 input/resize 因 current 为空而被静默丢弃。
             this.current = payload.id
@@ -170,8 +190,10 @@ export class TermClient {
   }
 
   createSession(dir: string, shell: string, cols: number, rows: number, limits?: TermLimits, autoCloseMin = 0) {
+    this.current = null
     this.send({
       type: 'create',
+      requestId: this.nextRequestId(),
       dir,
       shell,
       cols,
@@ -183,11 +205,16 @@ export class TermClient {
   }
   attach(id: string) {
     this.current = id
-    this.send({ type: 'attach', sid: id })
+    this.send({ type: 'attach', sid: id, requestId: this.nextRequestId() })
   }
   detach() {
-    if (this.current) this.send({ type: 'detach' })
+    this.send({ type: 'detach' })
     this.current = null
+    this.nextRequestId()
+  }
+  private nextRequestId(): number {
+    this.requestId = (this.requestId + 1) >>> 0 || 1
+    return this.requestId
   }
   input(data: string) {
     if (!this.current) return

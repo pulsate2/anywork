@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
-import { NMessageProvider } from 'naive-ui'
+import { NAutoComplete, NInput, NMessageProvider } from 'naive-ui'
 import AIView from '@/views/AIView.vue'
 import type { AiProvider } from '@/api/client'
 
-const mocks = vi.hoisted(() => ({ list: vi.fn(), create: vi.fn(), update: vi.fn(), switch: vi.fn() }))
+const mocks = vi.hoisted(() => ({ list: vi.fn(), create: vi.fn(), update: vi.fn(), switch: vi.fn(), models: vi.fn() }))
 vi.mock('@/api/client', () => ({ api: {
   aiProviders: mocks.list,
   aiProviderCreate: mocks.create,
   aiProviderUpdate: mocks.update,
   aiSwitch: mocks.switch,
+  aiModels: mocks.models,
   aiExportUrl: () => '/api/ai/export',
 } }))
 
@@ -38,6 +39,77 @@ describe('AI 配置转换入口', () => {
   afterEach(() => {
     wrapper?.unmount()
     document.body.innerHTML = ''
+  })
+
+  it('模型查询使用转换草稿的接口和 Key,选中模型写回对应配置', async () => {
+    mocks.models.mockResolvedValue({ models: ['model-new'] })
+    const { w, vm } = await mountView()
+    vm.openConvert(source)
+    vm.generateConversion()
+    await flushPromises()
+    const input = w.findAllComponents(NInput).find((c) => c.classes().includes('ai-model-input'))!
+    expect(w.findComponent(NAutoComplete).exists()).toBe(false)
+    await input.find('button').trigger('click')
+    await flushPromises()
+    expect(mocks.models).toHaveBeenCalledWith({ app: 'codex', baseUrl: 'https://proxy.test/api/v1', apiKey: 'test-key' })
+    expect(vm.availableModels).toEqual(['model-new'])
+    const dropdown = w.findComponent(NAutoComplete)
+    expect(dropdown.exists()).toBe(true)
+    expect(dropdown.find('button').text()).toBe('获取模型列表')
+    expect(dropdown.props('options')).toEqual([{ label: 'model-new', value: 'model-new' }])
+    dropdown.vm.$emit('update:value', 'model-new')
+    expect(vm.configText).toContain('model = "model-new"')
+    expect(vm.app).toBe('claude')
+    expect(source.config).toMatchObject({ env: { ANTHROPIC_MODEL: 'model' } })
+    await dropdown.find('input').setValue('custom-model')
+    expect(vm.configText).toContain('model = "custom-model"')
+    expect(vm.availableModels).toEqual(['model-new'])
+  })
+
+  it('Pi 的 Anthropic 协议查询和选择模型保留 auth 扩展字段', async () => {
+    mocks.models.mockResolvedValue({ models: ['model-new'] })
+    const { w, vm } = await mountView()
+    vm.openEdit({ ...source, app: 'pi', config: {
+      models: { providers: { p: { baseUrl: 'https://proxy.test/api', api: 'anthropic-messages', models: [{ id: 'one' }, { id: 'two' }] } } },
+      auth: { p: { type: 'api_key', key: 'test-key', custom: 'preserve' } },
+    } })
+    await flushPromises()
+    await vm.fetchModelList()
+    expect(mocks.models).toHaveBeenCalledWith({ app: 'claude', baseUrl: 'https://proxy.test/api', apiKey: 'test-key' })
+    await flushPromises()
+    w.findComponent(NAutoComplete).vm.$emit('update:value', 'model-new')
+    expect(JSON.parse(vm.configText).providers.p.models[0].id).toBe('model-new')
+    expect(JSON.parse(vm.authText).p.custom).toBe('preserve')
+  })
+
+  it('更换配置后丢弃上一个配置迟到的模型列表', async () => {
+    let finish!: (result: { models: string[] }) => void
+    mocks.models.mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+    const { vm } = await mountView()
+    vm.openEdit(source)
+    await flushPromises()
+    const pending = vm.fetchModelList()
+    vm.openCreate()
+    finish({ models: ['stale-model'] })
+    await pending
+    expect(vm.availableModels).toEqual([])
+    expect(vm.fetchingModels).toBe(false)
+  })
+
+  it('直接编辑正文中的接口后丢弃旧请求,无需等输入框失焦', async () => {
+    let finish!: (result: { models: string[] }) => void
+    mocks.models.mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+    const { vm } = await mountView()
+    vm.openEdit(source)
+    await flushPromises()
+    const pending = vm.fetchModelList()
+    const config = JSON.parse(vm.configText)
+    config.env.ANTHROPIC_BASE_URL = 'https://other.test'
+    vm.configText = JSON.stringify(config)
+    finish({ models: ['old-endpoint-model'] })
+    await pending
+    expect(vm.availableModels).toEqual([])
+    expect(vm.fetchingModels).toBe(false)
   })
 
   it('卡片转换 → 草稿 → 保存为目标客户端;不改原记录、不切换当前配置', async () => {

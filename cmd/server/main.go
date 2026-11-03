@@ -291,6 +291,7 @@ func (a *App) routes() http.Handler {
 		pr.Put("/api/ai/provider", a.ai.Update)
 		pr.Delete("/api/ai/provider", a.ai.Delete)
 		pr.Post("/api/ai/switch", a.ai.Switch)
+		pr.Post("/api/ai/models", a.ai.Models)
 		pr.Get("/api/ai/export", a.ai.Export)
 		pr.Post("/api/ai/import", a.ai.Import)
 

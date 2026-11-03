@@ -66,7 +66,7 @@ type Session struct {
 
 	mu       sync.Mutex
 	buf      *RingBuffer
-	clients  map[*Client]struct{}
+	clients  map[*Client]uint32
 	dead     bool
 	exitCode int
 
@@ -105,7 +105,7 @@ func NewSession(id, dir, shell string, env []string, cols, rows int) *Session {
 		shell:     shell,
 		env:       env,
 		buf:       newRingBuffer(maxBufferBytes),
-		clients:   map[*Client]struct{}{},
+		clients:   map[*Client]uint32{},
 		exitCh:    make(chan struct{}),
 		createdAt: time.Now(),
 		cols:      cols,
@@ -179,12 +179,7 @@ func (s *Session) readLoop(ptmx pty.Pty) {
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
-			s.buf.Write(chunk)
-			s.broadcast(outFrame{text: false, data: chunk})
-			s.mu.Lock()
-			s.lastOutputAt = time.Now()
-			s.idleFuel = true
-			s.mu.Unlock()
+			s.publishOutput(chunk)
 		}
 		if err != nil {
 			return
@@ -310,12 +305,17 @@ func (s *Session) kill(reason string) {
 	}()
 }
 
-// attachClient 注册一个客户端并返回需要回放的缓冲。
-func (s *Session) attachClient(c *Client) []byte {
+// attachClient 将回放入队后再注册客户端,与实时输出共用锁,避免回放重复或乱序。
+func (s *Session) attachClient(c *Client, requestID uint32) []byte {
 	s.mu.Lock()
-	s.clients[c] = struct{}{}
+	defer s.mu.Unlock()
 	buf := s.buf.Bytes()
-	s.mu.Unlock()
+	for replay := buf; len(replay) > 0; {
+		n := min(len(replay), 32*1024)
+		c.push(outFrame{data: replay[:n], requestID: requestID})
+		replay = replay[n:]
+	}
+	s.clients[c] = requestID
 	return buf
 }
 
@@ -326,16 +326,15 @@ func (s *Session) detachClient(c *Client) {
 	s.mu.Unlock()
 }
 
-// broadcast 向所有已附加客户端推送一帧。
-func (s *Session) broadcast(f outFrame) {
+// publishOutput 原子地保存并广播输出,每个订阅带上其附加请求号。
+func (s *Session) publishOutput(data []byte) {
 	s.mu.Lock()
-	clients := make([]*Client, 0, len(s.clients))
-	for c := range s.clients {
-		clients = append(clients, c)
-	}
-	s.mu.Unlock()
-	for _, c := range clients {
-		c.push(f)
+	defer s.mu.Unlock()
+	s.buf.Write(data)
+	s.lastOutputAt = time.Now()
+	s.idleFuel = true
+	for c, requestID := range s.clients {
+		c.push(outFrame{data: data, requestID: requestID})
 	}
 }
 

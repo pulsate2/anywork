@@ -1488,6 +1488,14 @@ const createPerm = ref('ask')
 const createModel = ref('')
 const createEffort = ref('none')
 const creating = ref(false)
+const CREATE_PREFS_KEY = 'agent.createPreferences'
+let createPreferences = { app: 'claude' as 'claude' | 'codex' | 'pi', permissionMode: 'ask', effort: 'none' }
+try {
+  const saved = JSON.parse(localStorage.getItem(CREATE_PREFS_KEY) || '{}')
+  if (saved?.app === 'claude' || saved?.app === 'codex' || saved?.app === 'pi') createPreferences.app = saved.app
+  if (permOptions.some((o) => o.value === saved?.permissionMode)) createPreferences.permissionMode = saved.permissionMode
+  if (effortOptionsFor(createPreferences.app).some((o) => o.value === saved?.effort)) createPreferences.effort = saved.effort
+} catch { /* 无可用记录时沿用默认值 */ }
 // 恢复已有会话:下拉框选中项的 external id(空 = 新会话)。列表是该目录下
 // CLI 的原生会话(终端里跑过的也算),按修改时间倒序。
 const createResume = ref<string | null>(null)
@@ -1533,30 +1541,41 @@ watch([createApp, createWorkspace, createModal], async ([app, ws, open]) => {
 })
 
 function openCreate() {
-  createApp.value = 'claude'
+  createApp.value = createPreferences.app
   createWorkspace.value = wsStore.currentPath || wsStore.root
-  createPerm.value = 'ask'
+  createPerm.value = createPreferences.permissionMode
   createModel.value = ''
-  createEffort.value = 'none'
+  createEffort.value = createPreferences.effort
   createResume.value = null
   createModal.value = true
 }
 
 async function createSession() {
+  if (creating.value) return
   creating.value = true
+  const preferences = {
+    app: createApp.value,
+    permissionMode: createPerm.value,
+    effort: createEffort.value,
+  }
   try {
     const resume = resumable.value.find((r) => r.id === createResume.value)
     const sess = await api.agentSessionCreate({
-      app: createApp.value,
+      app: preferences.app,
       workspace: createWorkspace.value || wsStore.root,
-      permissionMode: createPerm.value,
+      permissionMode: preferences.permissionMode,
       model: createModel.value.trim() || undefined,
-      effort: createEffort.value === 'none' ? undefined : createEffort.value,
+      effort: preferences.effort === 'none' ? undefined : preferences.effort,
       // 恢复原生会话:external id 直传,标题用列表里提炼的(否则要等
       // 第一条消息才有标题,而续聊的第一条消息往往不是会话主题)。
       resumeExternal: resume?.id,
       title: resume?.title,
     })
+    // 只记成功创建时使用的选项,取消弹窗或创建失败不改变下次的默认选择。
+    createPreferences = preferences
+    try {
+      localStorage.setItem(CREATE_PREFS_KEY, JSON.stringify(preferences))
+    } catch { /* 存储不可用时,本次页面中仍保留偏好 */ }
     createModal.value = false
     await loadSessions()
     await openSession(sess.id)

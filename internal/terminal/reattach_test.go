@@ -19,7 +19,7 @@ func TestReattachReplaysBuffer(t *testing.T) {
 
 	// A 是"断线前"的那条连接。conn 传 nil 没问题:push 只往 channel 里放,不碰 WS。
 	a := newClient(nil)
-	s, _, err := m.Attach(sum.ID, a)
+	s, _, err := m.Attach(sum.ID, a, 1)
 	if err != nil {
 		t.Fatalf("A attach: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestReattachReplaysBuffer(t *testing.T) {
 
 	// B 是重连后的新连接:回放里必须有断线前的输出。
 	b := newClient(nil)
-	_, replay, err := m.Attach(sum.ID, b)
+	_, replay, err := m.Attach(sum.ID, b, 2)
 	if err != nil {
 		t.Fatalf("B attach: %v", err)
 	}

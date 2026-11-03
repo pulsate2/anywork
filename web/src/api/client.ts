@@ -173,6 +173,8 @@ export const api = {
   aiProviderDelete: (app: AiApp, id: string) =>
     request<{ ok: boolean }>('DELETE', `/api/ai/provider?app=${app}&id=${encodeURIComponent(id)}`),
   aiSwitch: (app: AiApp, id: string) => request<{ ok: boolean }>('POST', '/api/ai/switch', { app, id }),
+  aiModels: (b: { app: AiApp; baseUrl: string; apiKey: string }) =>
+    request<{ models: string[] }>('POST', '/api/ai/models', b),
   aiExportUrl: () => '/api/ai/export',
   aiImport: (file: File) => {
     const fd = new FormData()
