@@ -8,6 +8,8 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { NButton, NIcon } from 'naive-ui'
 import { AttachOutline, SendOutline, StopOutline } from '@vicons/ionicons5'
 import { api } from '@/api/client'
+import AttachmentTag from './AttachmentTag.vue'
+import { composeAgentMessage, parseAgentMessage, type AgentAttachment } from '@/utils/agentAttachments'
 
 const props = defineProps<{
   running: boolean
@@ -30,6 +32,7 @@ const emit = defineEmits<{
 }>()
 
 const text = ref('')
+const attachments = ref<AgentAttachment[]>([])
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const fileEl = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
@@ -40,27 +43,39 @@ const uploading = ref(false)
 // 注意 draftOwner 跟着"当前 text 属于哪个会话"走,sessionId 切换时先把
 // 旧文本归档到旧会话再载入新会话的草稿。
 const draftOwner = ref<string | undefined>(props.sessionId)
+let draftActive = true
 function persistDraft(id?: string) {
   if (!id) return
-  if (text.value.trim()) localStorage.setItem(`agent.draft.${id}`, text.value)
+  const draft = composedText()
+  if (draft.trim()) localStorage.setItem(`agent.draft.${id}`, draft)
   else localStorage.removeItem(`agent.draft.${id}`)
+}
+function composedText(): string {
+  return composeAgentMessage(text.value, attachments.value)
+}
+function restoreDraft(id?: string) {
+  const draft = (id && localStorage.getItem(`agent.draft.${id}`)) || ''
+  const content = parseAgentMessage(draft, id)
+  text.value = content.body.trimEnd()
+  attachments.value = content.attachments
 }
 // 挂载时载入当前会话的草稿(Composer 随聊天视图 v-if 挂载,sessionId 已就绪)。
 if (props.sessionId) {
-  text.value = localStorage.getItem(`agent.draft.${props.sessionId}`) || ''
+  restoreDraft(props.sessionId)
 }
 watch(() => props.sessionId, (id) => {
   persistDraft(draftOwner.value)
   draftOwner.value = id
-  text.value = (id && localStorage.getItem(`agent.draft.${id}`)) || ''
+  restoreDraft(id)
 })
-watch(text, () => persistDraft(draftOwner.value))
-onBeforeUnmount(() => persistDraft(draftOwner.value))
+watch([text, attachments], () => persistDraft(draftOwner.value), { deep: true })
+onBeforeUnmount(() => { persistDraft(draftOwner.value); draftActive = false })
 
 // 提问未答 = 输入整体锁死(与 disabled 同效但提示语不同)。
 const locked = computed(() => !!props.askPending)
 
-const canSend = computed(() => !props.disabled && !locked.value && !props.sending && text.value.trim() !== '')
+const canSend = computed(() => !props.disabled && !locked.value && !props.sending && !uploading.value
+  && (text.value.trim() !== '' || attachments.value.length > 0))
 
 // ---- "/" 指令 ----
 // 本地指令(管理会话自身):CLI 不认识这些,是我们自己的控制通道。
@@ -101,9 +116,9 @@ function autosize() {
 watch(text, () => nextTick(autosize))
 
 function submit() {
-  const t = text.value.trim()
-  if (!t || props.disabled || locked.value) return
-  if (t.startsWith('/')) {
+  const t = composedText().trim()
+  if (!canSend.value) return
+  if (!attachments.value.length && t.startsWith('/')) {
     const [word, ...rest] = t.split(/\s+/)
     const c = commands.value.find((x) => x.name === word!.toLowerCase())
     // 本地管理指令走指令通道(缺参数则继续等输入);CLI 指令与不认识的
@@ -117,6 +132,7 @@ function submit() {
   }
   emit('send', t)
   text.value = ''
+  attachments.value = []
 }
 
 function onKeydown(ev: KeyboardEvent) {
@@ -131,22 +147,32 @@ function onKeydown(ev: KeyboardEvent) {
 // ---- 附件:传到会话专属的独立目录(不进工作区),再以 @绝对路径 提及
 // (agent 自己会去读;读工作区外的路径不受沙箱限制) ----
 async function onFiles(files: FileList | null) {
-  if (!files?.length || !props.sessionId) return
+  const id = props.sessionId
+  if (!files?.length || !id || uploading.value) return
   uploading.value = true
-  const mention: string[] = []
   for (const f of Array.from(files)) {
     try {
-      const res = await api.agentUpload(props.sessionId, f)
-      mention.push(`@${res.path}`)
+      const res = await api.agentUpload(id, f)
+      if (draftActive && props.sessionId === id) {
+        attachments.value.push({ path: res.path, name: res.path.split(/[\\/]/).pop() || f.name })
+      } else {
+        // 上传期间换会话:附件归档到原会话草稿,避免混进当前会话。
+        const key = `agent.draft.${id}`
+        const draft = parseAgentMessage(localStorage.getItem(key) || '', id)
+        const attachment = { path: res.path, name: res.path.split(/[\\/]/).pop() || f.name }
+        localStorage.setItem(key, composeAgentMessage(draft.body, [...draft.attachments, attachment]))
+      }
     } catch {
       // 单个失败不拦其余,留一行痕迹在输入框里。
-      mention.push(`(上传失败: ${f.name})`)
+      const failure = `(上传失败: ${f.name})`
+      if (draftActive && props.sessionId === id) text.value = [text.value, failure].filter(Boolean).join('\n')
+      else {
+        const key = `agent.draft.${id}`
+        localStorage.setItem(key, [localStorage.getItem(key), failure].filter(Boolean).join('\n'))
+      }
     }
   }
-  if (mention.length) {
-    text.value = (text.value ? text.value + '\n' : '') + mention.join(' ')
-    nextTick(() => inputEl.value?.focus())
-  }
+  if (draftActive && props.sessionId === id) nextTick(() => inputEl.value?.focus())
   uploading.value = false
   if (fileEl.value) fileEl.value.value = '' // 同名文件可重复选
 }
@@ -167,6 +193,11 @@ async function onFiles(files: FileList | null) {
     </div>
     <!-- 自绘 textarea 而不用 n-input:输入区要贴着软键盘自动增高,naive 的 autosize
        在 fixed 布局里重算时机不稳。样式对齐 n-input 的观感。 -->
+    <div v-if="attachments.length" class="composer-attachments">
+      <AttachmentTag v-for="(attachment, index) in attachments" :key="`${attachment.path}-${index}`"
+        :name="attachment.name" :session-id="sessionId" closable :disabled="disabled || locked || sending"
+        @close="attachments.splice(index, 1)" />
+    </div>
     <textarea
       ref="inputEl" v-model="text" rows="2" :disabled="disabled || locked"
       class="composer-input"
@@ -205,6 +236,7 @@ async function onFiles(files: FileList | null) {
 
 <style scoped>
 .composer { position: relative; display: flex; flex-direction: column; gap: 6px; padding: 8px 0 2px; }
+.composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
 .composer-input {
   width: 100%;
   min-height: 58px; max-height: 132px;

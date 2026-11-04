@@ -19,6 +19,7 @@ import ApprovalCard from '@/components/agent/ApprovalCard.vue'
 import AskUserCard from '@/components/agent/AskUserCard.vue'
 import Composer from '@/components/agent/Composer.vue'
 import StatusBar from '@/components/agent/StatusBar.vue'
+import UserMessage from '@/components/agent/UserMessage.vue'
 
 const message = useMessage()
 const wsStore = useWorkspaceStore()
@@ -704,15 +705,9 @@ const lastTurnMs = computed<number | undefined>(() => {
   return undefined
 })
 
-// 回合状态:会话存活时看最后一条 status 事件,死了就是 dead。
-const turnState = computed<'running' | 'idle' | 'dead'>(() => {
-  if (!selected.value || selected.value.status === 'dead') return 'dead'
-  for (let i = messages.value.length - 1; i >= 0; i--) {
-    const ev = messages.value[i]
-    if (ev.kind === 'status') return (ev.payload as { state?: string })?.state === 'running' ? 'running' : 'idle'
-  }
-  return 'idle'
-})
+// 列表和详情共用会话当前状态。历史只有最新一页,长回合的 running 事件
+// 可能早已不在这一页里,不能因为没有状态事件就误判为空闲。
+const turnState = computed(() => selected.value?.status ?? 'dead')
 
 // 当前回合的起始时刻:running 那条 status 事件落库的 createdAt。计时锚定在
 // 服务端时间上,页面刷新/退出重进后不从头重跳;没有(老会话缺事件)才回落
@@ -885,6 +880,10 @@ const ws = new AgentWS((e) => {
     // seq 去重:REST 响应已本地追加过,推送与补差重合的也在这里丢掉。
     if (ev.seq <= maxSeq.value) return
     messages.value.push(ev)
+    if (ev.kind === 'status' && selected.value) {
+      const state = (ev.payload as { state?: string } | null)?.state
+      if (state === 'running' || state === 'idle') selected.value.status = state
+    }
   } else if (e.type === 'exit') {
     // exit 只发给会话订阅者:正在看这个会话才收得到。排队消息不动 ——
     // 队列在服务端,进程死了也还在,复活后的回合结束会接着放行。
@@ -944,6 +943,8 @@ async function catchUp() {
     }
     // 排队事件不落库,seq 补差找不回:断线期间的入队/放行/撤回重拉一遍。
     queued.value = await api.agentQueue(id)
+    // 重连期间 watch 的状态推送可能丢失,从当前会话快照恢复状态。
+    await loadSessions(true)
   } catch { /* 下次重连再补 */ }
 }
 
@@ -1074,8 +1075,8 @@ function scrollBottom(force = false) {
 watch(() => cards.value.length, () => scrollBottom())
 
 // ---- 不在底部时的"新消息"浮标 ----
-// 视口距底 >120px 视为"在翻历史":此时新事件到达不跟底,改为计数 + 底部
-// 浮一条"有 x 条新消息 ↓";点它(或自己滚回底部)清零。手机上信息流
+// 视口距底 >120px 视为"在翻历史":此时新事件到达不跟底,改为计数并
+// 在标题栏下浮一条"有 x 条新消息 ↓";点它(或自己滚回底部)清零。手机上信息流
 // 从顶部看起,agent 跑着时不断有新事件,没有这条浮标就永远不知道底下
 // 已经堆了多少。
 const newMsgCount = ref(0)
@@ -1809,6 +1810,10 @@ onBeforeUnmount(() => {
           <div class="chat-sub"><span>{{ selected.workspace }}</span></div>
         </div>
         <button type="button" class="chat-settings" title="会话设置" @click="openSettings">⚙</button>
+        <!-- 浮标脱离时间线文档流,始终悬在标题栏下方,不随历史消息滚动。 -->
+        <button v-if="newMsgCount" type="button" class="new-msg-pill" @click="jumpToBottom">
+          有 {{ newMsgCount }} 条新消息 ↓
+        </button>
       </div>
 
       <!-- 任务清单(hapi SessionStatusPanel 同款):会话级状态,钉在 header 下,
@@ -1831,10 +1836,6 @@ onBeforeUnmount(() => {
       </details>
 
       <div ref="timelineEl" class="chat-timeline" @scroll.passive="onTimelineScroll">
-        <!-- 不在底部时的新消息浮标:贴在时间线底缘(输入区上方),点击跳底 -->
-        <button v-if="newMsgCount" type="button" class="new-msg-pill" @click="jumpToBottom">
-          有 {{ newMsgCount }} 条新消息 ↓
-        </button>
         <div v-if="hasOlder" class="load-older">
           <n-button size="tiny" quaternary :loading="loadingOlder" @click="loadOlder">加载更早的消息</n-button>
         </div>
@@ -1845,7 +1846,7 @@ onBeforeUnmount(() => {
         <div v-for="c in cards" :key="c.key" class="chat-row" :class="c.kind">
           <!-- 用户气泡:点击在下方浮现复制键(再点收起);✓ 一闪即回 -->
           <div v-if="c.kind === 'user'" class="user-bubble-wrap">
-            <div class="bubble user" @click="toggleCopy(c.key)">{{ c.text }}</div>
+            <div class="bubble user" @click="toggleCopy(c.key)"><UserMessage :text="c.text || ''" :session-id="selected.id" /></div>
             <button
               v-if="revealedKey === c.key"
               type="button" class="copy-btn" :class="{ copied: copiedKey === c.key }"
@@ -1904,7 +1905,7 @@ onBeforeUnmount(() => {
         <!-- 乐观气泡:发送中转圈,失败标 ⚠ 可重发/丢弃 -->
         <div v-for="pb in pendingBubbles" :key="pb.key" class="chat-row user">
           <div class="bubble user pending-bubble" :class="pb.state">
-            <div class="pending-text">{{ pb.text }}</div>
+            <div class="pending-text"><UserMessage :text="pb.text" :session-id="selected.id" /></div>
             <div class="pending-ops">
               <span v-if="pb.state === 'sending'" class="pending-tag"><span class="pending-spinner" />发送中</span>
               <template v-else>
@@ -1918,7 +1919,7 @@ onBeforeUnmount(() => {
         <!-- 排队中的消息:服务端队列,回合结束自动逐条放行,发出前可撤回 -->
         <div v-for="q in queued" :key="`q${q.id}`" class="chat-row user">
           <div class="bubble user queued-bubble">
-            <div class="queued-text">{{ q.text }}</div>
+            <div class="queued-text"><UserMessage :text="q.text" :session-id="selected.id" /></div>
             <div class="queued-ops">
               <span class="queued-tag">排队中</span>
               <button type="button" class="queued-cancel" @click="cancelQueued(q)">撤回</button>
@@ -2275,6 +2276,7 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 .chat-head {
+  position: relative;
   display: flex; align-items: center; gap: 10px;
   padding-bottom: 10px; border-bottom: 1px solid rgba(127, 127, 127, .18);
 }
@@ -2307,12 +2309,11 @@ onBeforeUnmount(() => {
   padding: 12px 2px;
   display: flex; flex-direction: column; gap: 10px;
 }
-/* 新消息浮标:sticky 钉在时间线滚动容器底缘(随内容滚但一直贴底),
-   与跟底逻辑/输入区互不遮挡;主题主色底 + 白字,一眼可见 */
+/* 新消息浮标:以标题栏为锚点绝对定位,不占消息高度,滚动时始终可见。 */
 .new-msg-pill {
-  position: sticky; bottom: 4px; z-index: 5;
-  align-self: center;
-  margin: 4px auto 0;
+  position: absolute; top: calc(100% + 8px); left: 50%; z-index: 5;
+  transform: translateX(-50%); max-width: calc(100% - 16px);
+  margin: 0;
   appearance: none; border: 0; border-radius: 16px;
   padding: 5px 14px; min-height: 30px;
   background: var(--lr-accent); color: #fff;
