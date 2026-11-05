@@ -162,7 +162,8 @@ type ReasoningPayload struct {
 
 // StatusPayload KindStatus 的负载。
 type StatusPayload struct {
-	State string `json:"state"` // running | idle
+	State         string `json:"state"`                   // running | idle
+	TurnStartedAt int64  `json:"turnStartedAt,omitempty"` // 当前回合起点(epoch ms)
 }
 
 // UsagePayload KindUsage 的负载。Context 是"当前上下文占用"(claude =
@@ -403,7 +404,7 @@ func (s *Store) GetSession(id string) (*Session, error) {
 
 // ListSessions 全部会话,新的在前。dead 但未清理的历史会话也在里面(可续聊)。
 func (s *Store) ListSessions() ([]Session, error) {
-	rows, err := s.db.Query(listSessionsSQL+` ORDER BY created_at DESC`)
+	rows, err := s.db.Query(listSessionsSQL + ` ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}

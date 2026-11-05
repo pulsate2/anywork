@@ -7,7 +7,7 @@ import {
   NButton, NEmpty, NIcon, NInputNumber, NModal, NPopconfirm, NSelect, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
 import { AddOutline, CheckboxOutline, CopyOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
-import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentReasoning, type AgentResumableSession, type AgentSession, type AgentStreamSnapshot, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
+import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentReasoning, type AgentResumableSession, type AgentSession, type AgentStatusPayload, type AgentStreamSnapshot, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
 import { useImmersive } from '@/utils/immersive'
@@ -709,21 +709,22 @@ const lastTurnMs = computed<number | undefined>(() => {
 // 可能早已不在这一页里,不能因为没有状态事件就误判为空闲。
 const turnState = computed(() => selected.value?.status ?? 'dead')
 
-// 当前回合的起始时刻:running 那条 status 事件落库的 createdAt。计时锚定在
-// 服务端时间上,页面刷新/退出重进后不从头重跳;没有(老会话缺事件)才回落
-// 到 StatusBar 本地起表。
-const turnStartedAt = computed<number | undefined>(() => {
-  if (turnState.value !== 'running') return undefined
-  for (let i = messages.value.length - 1; i >= 0; i--) {
-    const ev = messages.value[i]
-    if (ev.kind === 'status') {
-      if ((ev.payload as { state?: string })?.state !== 'running') return undefined
-      const t = Date.parse(ev.createdAt)
-      return Number.isFinite(t) ? t : undefined
-    }
+// 回合起点来自服务端的状态推送/订阅快照,不从分页历史中查找。
+const turnStartedAt = ref<number | undefined>()
+watch(selectedId, () => { turnStartedAt.value = undefined }, { flush: 'sync' })
+
+function applyTurnStatus(ev: AgentEvent) {
+  const p = ev.payload as AgentStatusPayload | null
+  if (p?.state !== 'running' && p?.state !== 'idle') return
+  if (selected.value) selected.value.status = p.state
+  if (p.state === 'idle') {
+    turnStartedAt.value = undefined
+    return
   }
-  return undefined
-})
+  // 旧服务端的实时状态没有起点字段时用事件时间兜底;重复 running 不重新起表。
+  const t = p.turnStartedAt ?? turnStartedAt.value ?? Date.parse(ev.createdAt)
+  if (Number.isFinite(t) && t > 0) turnStartedAt.value = t
+}
 
 // 压缩进行中(claude code 底部 Compacting… 同款):从后往前找,先碰到
 // 压缩事件就看它是不是 start;先碰到回合状态/正文/用量就说明压缩已经
@@ -830,6 +831,15 @@ const ws = new AgentWS((e) => {
   if (e.type === 'message') {
     const ev = e.event
     if (ev.sessionId !== selectedId.value) return
+    // 订阅状态快照无 seq,直接恢复状态与计时,不进历史也不参与消息去重。
+    if (ev.kind === 'status' && !ev.seq) {
+      applyTurnStatus(ev)
+      if ((ev.payload as AgentStatusPayload | null)?.state === 'idle') {
+        streamText.value = ''
+        streamThink.value = ''
+      }
+      return
+    }
     // 流式增量:无 seq(不落库),不走去重,直接进缓冲区。
     if (ev.kind === 'assistant_delta' || ev.kind === 'reasoning_delta') {
       const t = typeof ev.payload === 'string' ? ev.payload : ''
@@ -880,10 +890,7 @@ const ws = new AgentWS((e) => {
     // seq 去重:REST 响应已本地追加过,推送与补差重合的也在这里丢掉。
     if (ev.seq <= maxSeq.value) return
     messages.value.push(ev)
-    if (ev.kind === 'status' && selected.value) {
-      const state = (ev.payload as { state?: string } | null)?.state
-      if (state === 'running' || state === 'idle') selected.value.status = state
-    }
+    if (ev.kind === 'status') applyTurnStatus(ev)
   } else if (e.type === 'exit') {
     // exit 只发给会话订阅者:正在看这个会话才收得到。排队消息不动 ——
     // 队列在服务端,进程死了也还在,复活后的回合结束会接着放行。
@@ -899,6 +906,7 @@ const ws = new AgentWS((e) => {
       s.status = e.status
       if (e.title && !s.title) s.title = e.title
     }
+    if (e.sessionId === selectedId.value && e.status !== 'running') turnStartedAt.value = undefined
   } else if (e.type === 'close') {
     // 断了:ws 自己按退避重连,这里只负责把标识挂上。
     wsDown()
@@ -912,6 +920,7 @@ const ws = new AgentWS((e) => {
 function markDead(id: string) {
   const s = sessions.value.find((x) => x.id === id)
   if (s) s.status = 'dead'
+  if (id === selectedId.value) turnStartedAt.value = undefined
   // 排队消息不清:队列在服务端持久化,会话复活后回合结束会接着放行。
 }
 

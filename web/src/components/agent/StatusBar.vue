@@ -10,7 +10,7 @@ const props = defineProps<{
   state: 'running' | 'idle' | 'dead'
   // 打断已发出、等回合收尾:状态文案换成「正在停止…」(见 AgentView.interrupt)。
   stopping?: boolean
-  // 回合起始时刻(父组件从落库的 status 事件取的 epoch ms):计时锚定在它
+  // 回合起始时刻(服务端状态推送/订阅快照给的 epoch ms):计时锚定在它
   // 上面,刷新/退出重进后接着跳而不是从 0 重来。缺省(老会话)才本地起表。
   turnStartedAt?: number
   // 最近一回合的执行时长(idle 时展示:完成后底部仍报本次耗时,claude code 同款)。
@@ -41,7 +41,7 @@ watch(() => props.state, (s) => {
 // 思考中计时(claude code 同款动词旁的秒数):优先锚定父组件给的服务端
 // 起始时刻(刷新/重进后接着跳),没有才本地从 0 起表。等待审批/回答也算
 // 在时长里(回合没结束)。离开 running 停表不清零,最后一次时长留在文本
-// 里,下回合重新计。锚点晚到(历史加载完才有 createdAt)时换锚不重跳。
+// 里,下回合重新计。锚点晚到(订阅快照补到)时换锚不重跳。
 const elapsed = ref(0)
 let startedAt = 0
 let timer: ReturnType<typeof setInterval> | null = null

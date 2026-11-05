@@ -334,7 +334,8 @@ export interface AgentToolCall {
 // 前端据此把审批嵌进宿主卡,不再单开一张占主线。
 export interface AgentPermissionReq { reqId: string; tool: string; args: string; parentToolUseId?: string }
 export interface AgentPermissionResult { reqId: string; allow: boolean }
-export interface AgentStatusPayload { state: 'running' | 'idle' }
+// 状态变化与订阅快照共用负载;快照没有 seq,turnStartedAt 是服务端保留的回合起点。
+export interface AgentStatusPayload { state: 'running' | 'idle'; turnStartedAt?: number }
 // KindReasoning 负载。durationMs 是服务端在思考段收尾时记下的实测跨度
 // (首个 reasoning_delta → 完整思考块落库),前端直接用,不再按相邻事件的
 // created_at 推算。老数据是裸字符串 payload,没有这个字段。

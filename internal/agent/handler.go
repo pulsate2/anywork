@@ -600,9 +600,11 @@ func (h *Handlers) ServeWS(w http.ResponseWriter, r *http.Request) {
 			if in.SessionID == "" {
 				continue
 			}
-			// 会话可能刚好退出:订阅失败不算错误,前端靠 REST/exit 事件收尾。
+			// 会话可能在断线期间退出,订阅失败也立即告知前端当前已离线。
 			if h.mgr.Subscribe(in.SessionID, c) == nil {
 				c.addSub(in.SessionID)
+			} else {
+				c.SendEvent(&Event{Kind: "exit", SessionID: in.SessionID})
 			}
 		case "unsubscribe":
 			if in.SessionID == "" {

@@ -44,6 +44,9 @@ type liveSession struct {
 	// Enqueue 的"空闲直发"与 releaseQueued 的"回合结束放行"都靠它判断,
 	// 抢占式置 running 关闭两边的竞争窗口(见 releaseQueued)。
 	state string
+	// turnStartedAt 当前回合的起点,由首条 running 状态记下,idle 时清空。
+	// 与 state 一起由 mu 保护,订阅时直接发给客户端,不依赖历史消息分页。
+	turnStartedAt time.Time
 	// stale 设置已改但进程还没换(claude 的模型/强度/权限都是 spawn 级参数,
 	// 运行中改不了):下一条消息进来时弃旧进程按新设置重启(见 restart)。
 	stale bool
@@ -247,6 +250,23 @@ func (m *Manager) pump(ls *liveSession) {
 			ls.model = cur
 			m.store.SetModel(ls.id, cur)
 		}
+		if ev.Kind == KindStatus {
+			if sp, ok := ev.Payload.(*StatusPayload); ok {
+				ls.mu.Lock()
+				ls.state = sp.State
+				p := &StatusPayload{State: sp.State}
+				if sp.State == StatusRunning {
+					if ls.turnStartedAt.IsZero() {
+						ls.turnStartedAt = time.Now()
+					}
+					p.TurnStartedAt = ls.turnStartedAt.UnixMilli()
+				} else {
+					ls.turnStartedAt = time.Time{}
+				}
+				ev.Payload = p
+				ls.mu.Unlock()
+			}
+		}
 		stored, err := m.append(ls, &ev)
 		if err != nil {
 			continue
@@ -271,9 +291,6 @@ func (m *Manager) pump(ls *liveSession) {
 			}
 		case KindStatus:
 			if sp, ok := ev.Payload.(*StatusPayload); ok {
-				ls.mu.Lock()
-				ls.state = sp.State
-				ls.mu.Unlock()
 				// 列表观察者同步状态(running ⇄ idle)。
 				m.notifyWatchers(ls.id, sp.State)
 				if sp.State == StatusIdle {
@@ -821,6 +838,15 @@ func (m *Manager) Subscribe(sessionID string, sub Subscriber) error {
 	}
 	ls.mu.Lock()
 	ls.subscribers[sub] = struct{}{}
+	// 当前状态独立于消息历史:长回合的开始事件可能早已超出最新一页。
+	// 快照不落库、无 seq,前端直接恢复状态与计时,不能按消息序号丢弃。
+	// state 还用于排队槽位的临时抢占,实际回合是否运行以起点是否存在为准。
+	status := &StatusPayload{State: StatusIdle}
+	if !ls.turnStartedAt.IsZero() {
+		status.State = StatusRunning
+		status.TurnStartedAt = ls.turnStartedAt.UnixMilli()
+	}
+	sub.SendEvent(&Event{Kind: KindStatus, SessionID: sessionID, Payload: status})
 	// 直播快照:这个会话正生成到一半的话,把已经流过的增量一并补给新订阅者。
 	// 增量是瞬态的(不落库,历史里没有),少了这一步,退出立刻重进就只能看到
 	// 半截正文/思考,而且秒表会假装思考刚起步。ThinkMs 让秒表接着走。
