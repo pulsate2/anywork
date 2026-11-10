@@ -35,7 +35,12 @@ const themeOverrides: GlobalThemeOverrides = {
     <n-dialog-provider>
       <n-message-provider placement="top">
         <div class="app-root">
-          <router-view />
+          <!-- 预览期间缓存文件列表,返回时保留搜索、排序和选择等状态。 -->
+          <router-view v-slot="{ Component, route }">
+            <keep-alive :include="route.name === 'files' || route.name === 'files-file' ? ['FilesView'] : []">
+              <component :is="Component" />
+            </keep-alive>
+          </router-view>
           <BottomNav />
         </div>
       </n-message-provider>

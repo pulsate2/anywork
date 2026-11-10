@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 文件浏览:列表/读写/上传下载/搜索/压缩解压。桌面+移动自适应。
-import { ref, onMounted, computed, watch, nextTick, h, type Component } from "vue"
+import { ref, onMounted, onActivated, computed, watch, nextTick, h, type Component } from "vue"
 import { useRouter } from "vue-router"
 import {
 	NButton, NIcon, NEmpty, NSpin,
@@ -67,18 +67,19 @@ function joinPath(dir: string, name: string) {
 	return (d === "/" ? "" : d) + "/" + name
 }
 
-// 恢复上次访问的目录:必须仍在当前工作区边界之内,否则丢弃记录。
+// 恢复上次访问的目录:文件浏览可以离开工作区,只需仍在服务端 root 内。
+// 工作区切换时 store.select 已经清除记录,不应在预览返回时丢弃项目外的目录。
 function initialDir(): string {
 	const last = store.lastDir()
 	if (!last) return store.currentPath
-	const base = trimSlash(store.currentPath)
+	const base = rootPath.value
 	const t = trimSlash(last)
 	if (t === base || t.startsWith(base === "/" ? "/" : base + "/")) return last
 	store.clearLastDir()
 	return store.currentPath
 }
 
-async function load(dir: string) {
+async function load(dir: string, preserveSelection = false) {
 	const fallback = store.currentPath
 	let target = dir || fallback
 	loading.value = true
@@ -92,9 +93,16 @@ async function load(dir: string) {
 			target = fallback
 			entries.value = await api.fsList(target)
 		}
+		const sameDir = trimSlash(target) === trimSlash(cwd.value)
 		cwd.value = target
-		// 勾选存的是绝对 path,换目录(或刷新当前目录)后旧的全部失效,留着会删错东西。
-		selected.value.clear()
+		if (!sameDir) clearSearch()
+		// 从预览返回时只移除已不存在的勾选项;换目录或文件操作后清空旧勾选。
+		if (preserveSelection && sameDir) {
+			const existing = new Set(entries.value.map((e) => e.path))
+			for (const path of selected.value) {
+				if (!existing.has(path)) selected.value.delete(path)
+			}
+		} else selected.value.clear()
 		store.setLastDir(target)
 	} catch (e: any) {
 		message.error(e?.message || "加载失败")
@@ -765,12 +773,22 @@ function doReplace() {
 		},
 	})
 }
+let initialized = false
 onMounted(async () => {
 	await store.ensure()
+	initialized = true
 	load(initialDir())
 })
-// 在别处切换工作区后回到本页,目录跟着走。
-watch(() => store.currentPath, (p) => load(p))
+// 缓存的列表从预览返回时更新文件信息,保留搜索、排序和仍有效的选择。
+// 首次激活交给 onMounted 加载,避免重复请求和覆盖记住的目录。
+onActivated(() => {
+	if (initialized) load(cwd.value, true)
+})
+// 首次加载工作区信息也会改变 currentPath,交给 initialDir 恢复,避免提前覆盖记录。
+// 初始化完成后切换工作区,目录再跟着走。
+watch(() => store.currentPath, (p) => {
+	if (initialized) load(p)
+})
 
 function sizeHuman(n: number) {
 	if (n < 1024) return n + " B"
