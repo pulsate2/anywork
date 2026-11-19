@@ -61,6 +61,7 @@ jobs:
           pack darwin amd64
           pack darwin arm64
           pack windows amd64 .exe
+          pack windows arm64 .exe
           cd out && sha256sum lightremote-* > SHA256SUMS.txt && ls -lh
 
       # 用 runner 自带的 gh,免引第三方 action。--target 让 gh 顺手把不存在的 tag
