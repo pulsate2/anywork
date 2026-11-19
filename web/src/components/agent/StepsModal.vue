@@ -111,9 +111,7 @@ function stepBrief(c: AgentToolCall): string {
   padding: 16px 8px; text-align: center;
   font-size: 12px; color: var(--lr-fg-muted);
 }
-/* 单条:状态图标 + 分类图标 + 摘要。摘要【不省略】:文件路径/命令换行铺开 ——
-   省略号一吃,左栏就认不出这步看的是哪个文件(详情虽在右栏,但左栏是选哪一条
-   的依据)。行高随内容长,所以图标改跟首行对齐。 */
+/* 单条:状态图标 + 分类图标 + 单行省略摘要;点条目在详情栏看完整命令 */
 .steps-md-item {
   display: flex; align-items: flex-start; gap: 6px;
   width: 100%; min-height: 34px; padding: 5px 8px;
@@ -125,7 +123,7 @@ function stepBrief(c: AgentToolCall): string {
 .steps-md-item + .steps-md-item { border-top: 1px solid rgba(127, 127, 127, .08); }
 .steps-md-item:hover { background: rgba(127, 127, 127, .06); }
 .steps-md-item.active { background: rgba(37, 99, 235, .1); }
-/* 图标槽跟摘要首行对齐(摘要可能换行成多行,居中的话图标会飘到中间) */
+/* 图标槽跟摘要文字对齐 */
 .steps-md-state { flex: none; width: 12px; height: 12px; margin-top: 2px; color: var(--lr-ok); }
 .steps-md-state.error { color: var(--lr-danger); }
 .steps-md-state.running { color: var(--lr-fg-muted); }
@@ -134,7 +132,7 @@ function stepBrief(c: AgentToolCall): string {
 .steps-md-name { flex: none; font-family: ui-monospace, monospace; font-size: 11px; }
 .steps-md-brief {
   min-width: 0; flex: 1;
-  overflow-wrap: anywhere; line-height: 1.45;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.45;
   font-family: ui-monospace, monospace; font-size: 11px; color: var(--lr-fg-muted);
 }
 .steps-md-item.active .steps-md-brief { color: var(--lr-fg); }

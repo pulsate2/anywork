@@ -63,15 +63,14 @@ function argString(args: Record<string, unknown> | null, keys: string[]): string
   return null
 }
 
-// 标签只做空白归一 —— 不过滤、不截断、不省略。自用工具,折叠卡里的目标是认出
-// 「这一步干了什么」的唯一线索,藏了等于没有;值长就靠行横向滚动看全。
+// 标签只做空白归一,不截断原始值。组摘要和条目仍可横向滚动查看完整内容。
 function label(v: string | null): string | null {
   if (!v) return null
   return v.replace(/\s+/g, ' ').trim() || null
 }
 
-// 能当一行摘要的字符串:第一个非空字符串值。不做长度/换行过滤 —— 值就是值,
-// 行本身是横向可滚的单行,长就滚着看,不藏。
+// 能当一行摘要的字符串:第一个非空字符串值。不做长度/换行过滤,
+// 超长内容由单行横向滚动呈现,不改调用参数。
 function summarizing(v: unknown): string | null {
   return typeof v === 'string' && v.trim() ? v : null
 }
@@ -186,8 +185,7 @@ const title = computed(() => {
   return KIND_LABEL[primaryKind.value]
 })
 
-// 摘要行:单一类型时列全部目标(不去基名、不"等 N 项"—— 折叠状态下这行是
-// 唯一能看出组里干了什么的地方,排不下就横向滚),混排时列各类型计数。
+// 摘要行:单一类型时列全部目标,超长可横向滚动;混排时列各类型计数。
 const brief = computed(() => {
   const kinds = new Set(props.calls.map((c) => actionKind(c.tool)))
   if (kinds.size > 1) {
@@ -231,7 +229,8 @@ function rowTarget(c: AgentToolCall): string {
     <button type="button" class="group-head" @click="open = !open">
       <!-- 折叠开关用箭头:收起 ›,展开旋转 90° 朝下;状态用图标(勾/叉/spinner) -->
       <span class="group-caret" :class="{ open }" />
-      <span class="group-title">{{ title }} · {{ calls.length }} 项</span>
+      <span class="group-title">{{ title }}</span>
+      <span class="group-count">· {{ calls.length }} 项</span>
       <span v-if="brief" class="group-brief">{{ brief }}</span>
       <span class="group-state" :class="state"><ToolStatusIcon :state="state" /></span>
     </button>
@@ -278,8 +277,14 @@ function rowTarget(c: AgentToolCall): string {
 .group-state svg, .item-state svg, .item-icon svg { width: 100%; height: 100%; display: block; }
 .group-state.ok { color: var(--lr-ok); }
 .group-state.error { color: var(--lr-danger); }
-/* 标题是组里第一条工具的 description 原文,不截断:长了就换行,别撑破卡头 */
-.group-title { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; font-weight: 600; font-size: 12px; }
+/* 标题和摘要固定单行且可横向滚动,不省略;数量独立保留 */
+.group-title {
+  flex: 0 1 auto; min-width: 0;
+  white-space: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+  font-weight: 600; font-size: 12px;
+}
+.group-title::-webkit-scrollbar { display: none; }
+.group-count { flex: none; font-size: 12px; }
 .group-brief {
   min-width: 0; flex: 1;
   white-space: nowrap;

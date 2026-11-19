@@ -401,14 +401,12 @@ const inlineDiff = computed(() =>
 .tool-name { flex: none; font-weight: 600; font-size: 12px; font-family: ui-monospace, monospace; }
 .tool-brief {
   min-width: 0; flex: 1;
-  /* 单行可左右滑动,不省略:滑动看命令尾,点行开弹窗看全量 */
+  /* 摘要固定单行,超长显示省略号;点卡头在详情弹窗看完整命令 */
   white-space: nowrap;
-  overflow-x: auto; overflow-y: hidden;
-  scrollbar-width: none;
+  overflow: hidden; text-overflow: ellipsis;
   font-size: 12px; color: var(--lr-fg-muted);
   font-family: ui-monospace, monospace;
 }
-.tool-brief::-webkit-scrollbar { display: none; }
 
 /* ---- 子 agent 过程(一行触发,点开 StepsModal) ---- */
 .steps { border-top: 1px solid rgba(127, 127, 127, .14); }
@@ -427,13 +425,12 @@ const inlineDiff = computed(() =>
   border-radius: 8px; text-align: center;
   background: rgba(127, 127, 127, .14); font-size: 11px; line-height: 16px;
 }
-/* 实时进展:正在跑/最近一条的摘要。不省略 —— 单行横向可滚,滑着看全 */
+/* 实时进展只留单行省略摘要,点「过程」看步骤的完整命令 */
 .steps-live {
   min-width: 0; flex: 1;
-  white-space: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   font-family: ui-monospace, monospace; font-size: 11px;
 }
-.steps-live::-webkit-scrollbar { display: none; }
 /* 内铺 diff:多块之间只留 1px 分隔;正文高度收紧(时间线上只是扫一眼,
    完整内容仍在详情弹窗),超出内部滚动,不把手机时间线滚穿 */
 .tool-inline-diff { border-top: 1px solid rgba(127, 127, 127, .14); }

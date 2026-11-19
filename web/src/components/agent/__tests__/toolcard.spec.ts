@@ -5,6 +5,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import ToolCallCard from '@/components/agent/ToolCallCard.vue'
 import ToolGroupCard from '@/components/agent/ToolGroupCard.vue'
+import groupSource from '@/components/agent/ToolGroupCard.vue?raw'
 import StepsModal from '@/components/agent/StepsModal.vue'
 
 vi.mock('@/api/client', () => ({
@@ -78,6 +79,27 @@ describe('ToolCallCard 点击', () => {
 })
 
 describe('ToolGroupCard 行点击', () => {
+  it('组标题、摘要和行目标保留单行横向滚动,不使用省略号', async () => {
+    // Vitest 默认不注入 SFC 样式,加载实际规则检查滚动行为。
+    const style = document.createElement('style')
+    style.textContent = groupSource.match(/<style scoped>([\s\S]*?)<\/style>/)?.[1] || ''
+    document.head.appendChild(style)
+    const w = mount(ToolGroupCard, { props: { calls: [bashMerged] }, attachTo: document.body })
+    try {
+      await w.find('.group-head').trigger('click')
+      for (const selector of ['.group-title', '.group-brief', '.item-target']) {
+        const css = getComputedStyle(w.get(selector).element)
+        expect(css.whiteSpace).toBe('nowrap')
+        expect(css.overflowX).toBe('auto')
+        expect(css.overflowY).toBe('hidden')
+        expect(css.textOverflow).not.toBe('ellipsis')
+      }
+    } finally {
+      w.unmount()
+      style.remove()
+    }
+  })
+
   it('展开组 → 点行 → emit detail(该行的调用对象)', async () => {
     const readCall = {
       tool: 'Read',
