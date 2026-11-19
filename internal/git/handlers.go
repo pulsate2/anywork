@@ -78,7 +78,11 @@ func (h *Handlers) Diff(w http.ResponseWriter, r *http.Request) {
 	if scope == "" {
 		scope = "worktree"
 	}
-	txt, err := h.svc.Diff(q.Get("path"), scope, q.Get("file"), q.Get("ref"))
+	diff := h.svc.Diff
+	if q.Get("full") == "1" {
+		diff = h.svc.FullDiff
+	}
+	txt, err := diff(q.Get("path"), scope, q.Get("file"), q.Get("ref"))
 	if err != nil {
 		h.httpErr(w, err)
 		return
@@ -105,12 +109,33 @@ func (h *Handlers) Log(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	n, _ := strconv.Atoi(q.Get("n"))
 	skip, _ := strconv.Atoi(q.Get("skip"))
-	nodes, err := h.svc.Log(q.Get("path"), n, skip)
+	nodes, err := h.svc.LogFiltered(q.Get("path"), n, skip, LogOptions{
+		Ref: q.Get("ref"), Search: q.Get("search"), Author: q.Get("author"),
+	})
 	if err != nil {
 		h.httpErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, nodes)
+}
+
+func (h *Handlers) CommitDetail(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	detail, err := h.svc.Detail(q.Get("path"), q.Get("ref"))
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+func (h *Handlers) Authors(w http.ResponseWriter, r *http.Request) {
+	authors, err := h.svc.Authors(r.URL.Query().Get("path"))
+	if err != nil {
+		h.httpErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, authors)
 }
 
 // Branches 返回结构化的本地/远端分支列表。

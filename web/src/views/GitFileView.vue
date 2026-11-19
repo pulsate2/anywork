@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// 二级页面:查看单个文件的 差异 / 全文 视图。
+// 二级页面:查看单个文件的 差异 / 全文 视图,差异卡头可切换全文件对比。
 // 一级(GitView 文件列表)点某文件 → 路由到本页,查询参数带 path/scope/file/ref/root。
-// 差异 = git diff 该文件的有色行;文件 = fsRead 全文。未跟踪文件无 diff,默认文件视图。
+// 差异 = git diff 的变更片段;全文件对比 = 展开所有上下文;文件 = 版本全文。
+// 未跟踪文件无 diff,默认文件视图。
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -23,14 +24,20 @@ const repoPath = (route.query.path as string) || '/'
 
 const title = computed(() => file)
 
-// 视图切换:差异 / 文件。untracked 无 diff,只能看文件。
+// 视图切换:差异 / 文件。全文件对比由差异卡头的图标开关控制。
+// untracked 无 diff,只能看文件。
 // 看提交时"文件"取的是该提交里的版本(gitShow),不是工作区版本 —— 后者可能早被改过。
 type ViewMode = 'diff' | 'file'
 const mode = ref<ViewMode>(scope === 'untracked' ? 'file' : 'diff')
+const fullFile = ref(false)
+watch(fullFile, () => {
+  if (mode.value === 'diff') loadDiff()
+})
 
 const diffBlock = ref<DiffBlock | null>(null)
 const diffLoading = ref(false)
 const diffError = ref('')
+let diffRequest = 0
 const fileContent = ref('')
 const fileLoading = ref(false)
 const fileError = ref('')
@@ -43,19 +50,24 @@ watch(() => wrapping.value, (v) => {
 })
 
 async function loadDiff() {
+  const request = ++diffRequest
   diffLoading.value = true
   diffError.value = ''
   try {
-    const blocks = parseDiff(await api.gitDiff(repoPath, scope, file, commitHash || undefined))
+    const text = await api.gitDiff(repoPath, scope, file, commitHash || undefined, fullFile.value)
+    // 快速切换时,旧的全文件请求不能覆盖后来选中的差异视图。
+    if (request !== diffRequest) return
+    const blocks = parseDiff(text)
     // 筛出目标文件的那一块;多文件 diff 中若对不上就兜底空块。
     diffBlock.value = blocks.find((b) => b && b.path === file) ?? {
       path: file, adds: 0, dels: 0, lines: [], open: true,
     }
   } catch (e: any) {
+    if (request !== diffRequest) return
     diffError.value = e?.message || '读取差异失败'
     diffBlock.value = null
   } finally {
-    diffLoading.value = false
+    if (request === diffRequest) diffLoading.value = false
   }
 }
 
@@ -82,12 +94,13 @@ const highlighted = computed(() =>
   fileContent.value === '' ? '' : highlightCode(fileContent.value, file))
 
 // 差异行拆成三列:行号 / 符号 / 正文。符号单独占一列,颜色之外再给一道形状线索,
-// 正文里那个 +/- 就要去掉,否则每行都多出一个字符、缩进跟着错一位。
+// unified diff 的 +/- 或上下文空格前缀都不是正文,去掉后文件缩进才能对齐。
 const diffRows = computed(() => (diffBlock.value?.lines ?? []).map((l) => ({
   kind: l.kind,
   no: l.no,
   sign: l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : '',
-  body: l.kind === 'add' || l.kind === 'del' ? l.text.slice(1) : l.text,
+  body: l.kind === 'add' || l.kind === 'del' || (l.kind === 'ctx' && l.text.startsWith(' '))
+    ? l.text.slice(1) : l.text,
 })))
 
 // 行号槽的宽度按本文件最大行号的位数算,不按"万行文件"的最坏情况留死宽 ——
@@ -105,10 +118,13 @@ const noWidth = computed(() => {
 })
 
 function switchMode(next: ViewMode) {
-  if (mode.value === next) return
+  if (mode.value === next || (scope === 'untracked' && next !== 'file')) return
   mode.value = next
-  if (next === 'diff') loadDiff()
-  else loadFile()
+  if (next === 'file') {
+    ++diffRequest
+    diffLoading.value = false
+    loadFile()
+  } else loadDiff()
 }
 
 onMounted(async () => {
@@ -169,19 +185,34 @@ function goBack() {
       </div>
     </div>
 
-    <!-- 差异视图 -->
+    <!-- 差异与全文件对比共用原有行号、增删颜色与换行样式。 -->
     <div v-if="mode === 'diff'" class="fv-diff">
-      <n-spin :show="diffLoading">
-        <n-alert v-if="diffError" type="error" :bordered="false" :title="diffError" style="margin: 8px 0" />
-        <n-empty v-else-if="!diffBlock || !diffBlock.lines.length" description="该文件没有内容差异" style="padding: 24px" />
-        <div v-else class="diff-card">
-          <!-- 卡头(参考稿的 .diff-header):文件名在左,增删计数跟在右边。 -->
-          <div class="diff-head">
-            <span class="dh-file" :title="title">{{ title }}</span>
-            <span class="dh-add">+{{ diffBlock.adds }}</span>
-            <span class="dh-del">-{{ diffBlock.dels }}</span>
-          </div>
-          <div class="diff-scroll" :class="{ wrap: wrapping }" :style="{ '--dl-no-w': noWidth }">
+      <div class="diff-card">
+        <!-- 开关留在卡头,读取失败或加载中也能切回仅差异。 -->
+        <div class="diff-head">
+          <span class="dh-file" :title="title">{{ title }}</span>
+          <span v-if="diffBlock" class="dh-add">+{{ diffBlock.adds }}</span>
+          <span v-if="diffBlock" class="dh-del">-{{ diffBlock.dels }}</span>
+          <n-button class="dh-full" quaternary size="small" :type="fullFile ? 'primary' : 'default'"
+            :title="fullFile ? '全文件对比：开' : '全文件对比：关'" aria-label="全文件对比"
+            :aria-pressed="fullFile" @click="fullFile = !fullFile">
+            <template #icon>
+              <n-icon :color="fullFile ? 'var(--lr-accent)' : 'var(--lr-diff-code)'">
+                <svg viewBox="0 0 512 512" aria-hidden="true" stroke="currentColor" stroke-width="32"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M304 96h112v112" fill="none" />
+                  <!-- 两段独立箭杆,中间留空隙。 -->
+                  <path d="M405.77 106.2L304 208 M208 304L111.98 400.02" fill="none" />
+                  <path d="M208 416H96V304" fill="none" />
+                </svg>
+              </n-icon>
+            </template>
+          </n-button>
+        </div>
+        <n-spin :show="diffLoading">
+          <n-alert v-if="diffError" type="error" :bordered="false" :title="diffError" style="margin: 8px 0" />
+          <n-empty v-else-if="!diffBlock || !diffBlock.lines.length" description="该文件没有内容差异" style="padding: 24px" />
+          <div v-else class="diff-scroll" :class="{ wrap: wrapping }" :style="{ '--dl-no-w': noWidth }">
             <div class="diff-inner">
               <div v-for="(l, i) in diffRows" :key="i" class="dl" :class="l.kind">
                 <span class="dl-no">{{ l.kind === 'hunk' ? '@@' : (l.no ?? '') }}</span>
@@ -190,8 +221,8 @@ function goBack() {
               </div>
             </div>
           </div>
-        </div>
-      </n-spin>
+        </n-spin>
+      </div>
     </div>
 
     <!-- 文件视图 -->
@@ -277,6 +308,10 @@ function goBack() {
 }
 .dh-add { flex: none; color: #1a7f37; }
 .dh-del { flex: none; color: var(--lr-diff-del-fg); }
+.dh-full {
+  flex: none; width: 44px; height: 44px; min-height: 44px;
+  margin: -10px 0;
+}
 .diff-scroll {
   overflow-x: auto;
   color: var(--lr-diff-code);

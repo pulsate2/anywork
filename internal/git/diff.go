@@ -8,6 +8,18 @@ import (
 // Diff 返回 unified 文本。scope: "worktree"|"staged"|"head"|"commit";
 // file 可选限定单个文件;commit 时 ref 指定提交哈希(取该提交相对父的改动)。
 func (s *Service) Diff(p, scope, file, ref string) (string, error) {
+	return s.diff(p, scope, file, ref, false)
+}
+
+// FullDiff 展开单个文件的全部上下文,仍使用同一 scope 的两侧版本与增删标记。
+func (s *Service) FullDiff(p, scope, file, ref string) (string, error) {
+	if strings.TrimSpace(file) == "" || cleanRelPath(file) == "." {
+		return "", errNoPaths
+	}
+	return s.diff(p, scope, file, ref, true)
+}
+
+func (s *Service) diff(p, scope, file, ref string, fullFile bool) (string, error) {
 	info, err := s.ResolveToRepo(p)
 	if err != nil {
 		return "", err
@@ -25,9 +37,12 @@ func (s *Service) Diff(p, scope, file, ref string) (string, error) {
 		if ref == "" {
 			return "", errBadRefArg
 		}
-		// git show 输出提交元信息 + unified diff,前端 parseDiff 吃 diff --git 头,
-		// 元信息行会被当成 meta 展示,正好能看到提交说明。
-		args = []string{"show", ref}
+		hash, err := normCommitArg(ref)
+		if err != nil {
+			return "", err
+		}
+		// 与提交详情的统计一致:合并提交也展示相对第一父提交的普通 unified diff。
+		args = []string{"show", "--format=", "--diff-merges=first-parent", hash}
 	default: // worktree
 		args = []string{"diff"}
 	}
@@ -41,9 +56,15 @@ func (s *Service) Diff(p, scope, file, ref string) (string, error) {
 		}
 		args = []string{"diff", et}
 	}
+	if fullFile {
+		// Git 支持的最大上下文行数,而不是仅展示变更前后的三行。
+		args = append(args, "--unified=2147483647")
+	}
 	if file != "" {
 		args = append(args, "--", cleanRelPath(file))
 	}
+	// 提交详情的 numstat -z 使用真实中文路径,diff 文件头也保持可读,方便前端匹配文件。
+	args = append([]string{"-c", "core.quotePath=false"}, args...)
 	return s.run(info.Root, nil, args...)
 }
 

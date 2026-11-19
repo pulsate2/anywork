@@ -121,17 +121,24 @@ export const api = {
   // 把远端仓库原地克隆进这个目录(git clone <url> .),同上返回克隆后的仓库信息。
   gitClone: (path: string, url: string) => request<GitRepo>('POST', '/api/git/clone', { path, url }),
   gitStatus: (path: string) => request<GitStatus>('GET', `/api/git/status?path=${encodeURIComponent(path)}`),
-  gitDiff: (path: string, scope: string, file?: string, ref?: string) =>
-    requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}`),
+  // full 只用于单文件对比:展开未修改的上下文,不改变两侧版本。
+  gitDiff: (path: string, scope: string, file?: string, ref?: string, full = false) =>
+    requestText(`/api/git/diff?path=${encodeURIComponent(path)}&scope=${scope}${file ? `&file=${encodeURIComponent(file)}` : ''}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}${full ? '&full=1' : ''}`),
   // 某个提交里某个文件的全文。fsRead 读的是工作区版本,看历史提交时不能用它。
   gitShow: (path: string, ref: string, file: string) =>
     requestText(`/api/git/show?path=${encodeURIComponent(path)}&ref=${encodeURIComponent(ref)}&file=${encodeURIComponent(file)}`),
-  gitLog: (path: string, n?: number, skip?: number) => {
+  gitLog: (path: string, n?: number, skip?: number, options: GitLogOptions = {}) => {
     const qs = new URLSearchParams({ path })
     if (n) qs.set('n', String(n))
     if (skip) qs.set('skip', String(skip))
+    if (options.ref) qs.set('ref', options.ref)
+    if (options.search) qs.set('search', options.search)
+    if (options.author) qs.set('author', options.author)
     return request<GitCommit[]>('GET', `/api/git/log?${qs.toString()}`)
   },
+  gitCommitDetail: (path: string, ref: string) =>
+    request<GitCommitDetail>('GET', `/api/git/commit?${new URLSearchParams({ path, ref }).toString()}`),
+  gitAuthors: (path: string) => request<GitCommitAuthor[]>('GET', `/api/git/authors?path=${encodeURIComponent(path)}`),
   gitBranches: (path: string) => request<GitBranchList>('GET', `/api/git/branches?path=${encodeURIComponent(path)}`),
   gitRemotes: (path: string) => request<GitRemote[]>('GET', `/api/git/remotes?path=${encodeURIComponent(path)}`),
   // 提交身份。GET 读(含"git 现在能不能提交"的 ok);POST 只写这一个仓库的 .git/config。
@@ -618,6 +625,32 @@ export interface GitCommit {
   refs: string[]
   subject: string
   date: string
+  author: string
+  email: string
+}
+
+export interface GitLogOptions {
+  ref?: string
+  search?: string
+  author?: string
+}
+
+export interface GitCommitAuthor {
+  name: string
+  email: string
+}
+
+export interface GitCommitFile {
+  path: string
+  orig?: string
+  add: number
+  del: number
+  binary: boolean
+}
+
+export interface GitCommitDetail extends GitCommit {
+  body: string
+  files: GitCommitFile[]
 }
 
 export interface GitBranch {

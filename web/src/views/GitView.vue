@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// Git 视图:状态/暂存/分文件 diff/提交/分支切换/选远端推送/提交历史翻页。
+// Git 视图:状态/暂存/分文件 diff/提交/分支切换/选远端推送/图形提交历史。
 // 仓库路径 = 当前工作区。
 import { ref, computed, onMounted, onUnmounted, watch, h } from 'vue'
 import {
-  NButton, NIcon, NInput, NList, NListItem, NEmpty, NSpin, NModal,
+  NButton, NIcon, NInput, NEmpty, NSpin, NModal,
   NSelect, NCheckbox, NForm, NFormItem, NTag, NTabs, NTabPane,
   useMessage, useDialog,
 } from 'naive-ui'
@@ -19,10 +19,9 @@ import {
 import { GitAuthClient } from '@/api/gitAuth'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { parseDiff, type DiffBlock } from '@/utils/diff'
+import GitHistoryPanel from '@/components/GitHistoryPanel.vue'
+import { GIT_LOG_PAGE, type GitHistoryState } from '@/utils/gitHistory'
 import { useRoute, useRouter } from 'vue-router'
-
-// 每页提交数;翻页靠 skip 累加已加载条数。
-const LOG_PAGE = 30
 
 const message = useMessage()
 const dialog = useDialog()
@@ -31,18 +30,16 @@ const route = useRoute()
 const store = useWorkspaceStore()
 const repo = ref<GitRepo | null>(null)
 const status = ref<GitStatus | null>(null)
-const commits = ref<GitCommit[]>([])
 const loading = ref(false)
 const repoPath = ref('/')
-const logMore = ref(false)
-const logLoading = ref(false)
+const historyRevision = ref(0)
+const historyInitialState = ref<GitHistoryState>()
+let repoRequest = 0
 
-// 一级列表:一次展示某 scope(worktree/staged/commit)的全部文件;点行进二级页。
+// 一级列表:一次展示工作区/暂存区的全部文件;点行进二级页。
 const showDiff = ref(false)
 const diffScope = ref('worktree')
 const diffFiles = ref<DiffBlock[]>([])
-// 当前在 diff 弹窗里展示的提交(非空 = 在查某个提交的改动,scope 走 commit)。
-const diffCommit = ref<GitCommit | null>(null)
 // 改动 / 提交历史。受控是为了从二级页返回时能连同弹窗一起切回原来那一栏。
 const activeTab = ref('changes')
 
@@ -200,44 +197,41 @@ function cancelIdentity() {
 }
 
 async function load() {
+  const request = ++repoRequest
+  const path = repoPath.value
   loading.value = true
   try {
-    // 仍然一次并发发三个请求(开屏只花一个往返),但用 allSettled 而不是 all:目录不是
-    // 仓库时 status/log 一律 400,用 all 的话这两条失败会盖掉 repo 那条的正常结果,
-    // 只能一起归到"加载失败"。而"还不是仓库"是个正常状态 —— 空状态里那个初始化按钮
-    // 正是为它准备的,得先把这一种和"路径本身有问题"分开,才敢把按钮显出来。
-    const [r, st, log] = await Promise.allSettled([
-      api.gitRepo(repoPath.value),
-      api.gitStatus(repoPath.value),
-      api.gitLog(repoPath.value, LOG_PAGE),
+    // 非仓库时 status 会 400,但 repo 的正常结果不能被盖掉。历史由图形面板独立加载。
+    const [r, st] = await Promise.allSettled([
+      api.gitRepo(path),
+      api.gitStatus(path),
     ])
+    if (request !== repoRequest) return
     if (r.status === 'rejected') throw r.reason
     repo.value = r.value
     if (!r.value.repo) {
       status.value = null
-      commits.value = []
-      logMore.value = false
       return
     }
     if (st.status === 'rejected') throw st.reason
-    if (log.status === 'rejected') throw log.reason
     status.value = st.value
-    commits.value = log.value
-    logMore.value = log.value.length >= LOG_PAGE
+    historyRevision.value++
   } catch (e: any) {
+    if (request !== repoRequest) return
     repo.value = null
     message.error(e?.message || 'Git 加载失败')
   } finally {
-    loading.value = false
+    if (request === repoRequest) loading.value = false
   }
 }
 
-// 刷新状态与第一页提交(仓库信息不会变,不重取)。
+// 刷新状态并通知历史面板更新,保留它的筛选、选中项和已加载页数。
 async function reload() {
-  status.value = await api.gitStatus(repoPath.value)
-  const log = await api.gitLog(repoPath.value, LOG_PAGE)
-  commits.value = log
-  logMore.value = log.length >= LOG_PAGE
+  const path = repoPath.value
+  const next = await api.gitStatus(path)
+  if (path !== repoPath.value) return
+  status.value = next
+  historyRevision.value++
 }
 
 // ---- 初始化仓库(git init)----
@@ -329,19 +323,6 @@ async function doClone() {
     message.error(e?.message || '克隆失败')
   } finally {
     cloning.value = false
-  }
-}
-
-async function loadMoreLog() {
-  logLoading.value = true
-  try {
-    const more = await api.gitLog(repoPath.value, LOG_PAGE, commits.value.length)
-    commits.value = commits.value.concat(more)
-    logMore.value = more.length >= LOG_PAGE
-  } catch (e: any) {
-    message.error(e?.message || '加载失败')
-  } finally {
-    logLoading.value = false
   }
 }
 
@@ -455,7 +436,6 @@ function abortRevert() {
   })
 }
 const diffTitle = computed(() => {
-  if (diffCommit.value) return `${diffCommit.value.short} · ${diffCommit.value.subject}`
   return diffScope.value === 'staged' ? '已暂存改动' : '工作区改动'
 })
 
@@ -471,22 +451,21 @@ function numstatOf(e: GitEntry): string {
 
 // 跳二级页看某个文件的差异/全文。scope: worktree|staged|commit|untracked。
 // 路由没有 keep-alive,返回时本页会整体重建,弹窗状态会丢。所以离开前把"当前开着哪个列表"
-// 写回 /git 这条历史记录的 query,返回时按它把列表重新打开;不是从列表点进来的就把旧记录清掉,
-// 否则返回时会弹出一个跟这次操作无关的列表。
-async function goFile(scope: string, file: string, ref?: string) {
+// 写回 /git 这条历史记录的 query,返回时恢复文件列表或历史面板。
+async function goFile(scope: string, file: string, ref?: string, history?: GitHistoryState) {
   const back: Record<string, string> = {}
-  if (showDiff.value) {
+  if (history) {
+    back.history = history.selectedHash
+    back.n = String(history.limit)
+    back.scroll = String(history.scrollTop)
+    if (history.search) back.search = history.search
+    if (history.branch) back.branch = history.branch
+    if (history.author) back.author = history.author
+  } else if (showDiff.value) {
     back.diff = diffScope.value
-    if (diffCommit.value) {
-      back.ref = diffCommit.value.hash
-      back.sub = diffCommit.value.subject
-    }
-    // 翻过页的话把条数也记下来:返回时只补第一页,列表会比离开时短,
-    // 滚动位置就没地方还原了。
-    if (commits.value.length > LOG_PAGE) back.n = String(commits.value.length)
   }
   showDiff.value = false
-  if (Object.keys(back).length || route.query.diff) {
+  if (Object.keys(back).length || route.query.diff || route.query.history) {
     await router.replace({ path: '/git', query: back })
   }
   router.push({
@@ -501,10 +480,13 @@ async function goFile(scope: string, file: string, ref?: string) {
   })
 }
 
+function openHistoryFile(file: string, commit: GitCommit, state: GitHistoryState) {
+  goFile('commit', file, commit.hash, state)
+}
+
 // 一级:打开某 scope 的文件列表(仅列表,点某行再进二级页)。
 async function viewDiff(scope: string) {
   diffScope.value = scope
-  diffCommit.value = null
   activeTab.value = 'changes'
   try {
     diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, scope))
@@ -514,19 +496,6 @@ async function viewDiff(scope: string) {
   }
 }
 
-// 查看某个提交做了什么改动:复用同一个列表弹窗,scope 传 commit + 提交哈希。
-async function viewCommit(c: GitCommit) {
-  diffCommit.value = c
-  diffScope.value = 'commit'
-  activeTab.value = 'log'
-  try {
-    diffFiles.value = parseDiff(await api.gitDiff(repoPath.value, 'commit', undefined, c.hash))
-    showDiff.value = true
-  } catch (e: any) {
-    diffCommit.value = null
-    message.error(e?.message || '读取提交改动失败')
-  }
-}
 async function doCommit() {
   if (!commitMsg.value.trim()) return
   try {
@@ -767,32 +736,25 @@ function deleteBranch(b: GitBranch) {
   })
 }
 
-// 从二级页返回:按 query 里记下的 scope 重新打开一级列表。
-// 提交可能来自"加载更多"的后续页,重建后不一定还在 commits 里,所以拿不到就用 query 拼一个
-// 够弹窗标题用的最小对象。
-// 用完立刻把 query 抹掉:标记只对"这一次返回"有效,留着的话刷新页面、PWA 重新打开、
-// 或者以后再从历史记录回到这条 /git,都会莫名其妙又弹一次已经关掉的列表。
+// 从文件页返回:历史面板恢复筛选/选中/分页/滚动,工作区仍恢复原来的文件弹窗。
 async function restoreList() {
   const scope = route.query.diff
-  const hash = typeof route.query.ref === 'string' ? route.query.ref : ''
-  const sub = typeof route.query.sub === 'string' ? route.query.sub : ''
-  const n = Number(route.query.n)
-  if (typeof scope !== 'string' || !scope) return
-  await router.replace({ path: '/git' })
-  // 先把离开时已经翻出来的提交补齐,不然列表比原来短,滚动位置无处可还。
-  if (n > commits.value.length) {
-    try {
-      commits.value = await api.gitLog(repoPath.value, n)
-      logMore.value = commits.value.length >= n
-    } catch { /* 补不上就按第一页显示 */ }
-  }
-  if (scope !== 'commit') {
-    await viewDiff(scope)
+  const queryText = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : ''
+  // 同时兼容改版前写入的 diff=commit 返回记录。
+  const hash = queryText('history') || (scope === 'commit' ? queryText('ref') : '')
+  if (hash) {
+    historyInitialState.value = {
+      search: queryText('search'), branch: queryText('branch'), author: queryText('author'), selectedHash: hash,
+      limit: Math.max(GIT_LOG_PAGE, Number(queryText('n')) || GIT_LOG_PAGE),
+      scrollTop: Math.max(0, Number(queryText('scroll')) || 0),
+    }
+    activeTab.value = 'log'
+    await router.replace({ path: '/git' })
     return
   }
-  if (!hash) return
-  const found = commits.value.find(c => c.hash === hash)
-  await viewCommit(found || { hash, short: hash.slice(0, 7), parents: [], refs: [], subject: sub, date: '' })
+  if (typeof scope !== 'string' || !scope) return
+  await router.replace({ path: '/git' })
+  if (scope !== 'commit') await viewDiff(scope)
 }
 
 onMounted(async () => {
@@ -803,12 +765,14 @@ onMounted(async () => {
   // git 认证长连接:远端要求账号密码时在此收到 ask 事件并弹窗。
   askClient.connect()
 })
-onUnmounted(() => askClient.close())
+onUnmounted(() => { repoRequest++; askClient.close() })
 // 跟随工作区切换。
 watch(() => store.currentPath, (p) => {
   repoPath.value = p
   // 身份是跟着仓库走的,换了仓库先清掉,别把上一个仓库的署名显示在这一个上。
   commitIdent.value = null
+  historyInitialState.value = undefined
+  showDiff.value = false
   load()
 })
 </script>
@@ -974,33 +938,9 @@ watch(() => store.currentPath, (p) => {
 
             </template>
           </n-tab-pane>
-          <n-tab-pane name="log" tab="提交历史">
-            <n-list v-if="commits.length" hoverable>
-              <n-list-item v-for="c in commits" :key="c.hash">
-                <div class="log-line">
-                  <div class="log-row" role="button" tabindex="0" title="查看该提交的改动"
-                    @click="viewCommit(c)" @keydown.enter="viewCommit(c)">
-                    <span class="log-hash">{{ c.short }}</span>
-                    <span class="log-subject" :title="c.subject">{{ c.subject }}</span>
-                  </div>
-                  <n-button class="git-btn" size="tiny" quaternary title="回滚此提交" aria-label="回滚此提交"
-                    @click="revertCommit(c)">
-                    <n-icon :component="ArrowUndoOutline" />
-                  </n-button>
-                </div>
-                <div class="log-meta">
-                  <span>{{ c.date }}</span>
-                  <n-tag v-for="rf in c.refs" :key="rf" size="tiny" :bordered="false">{{ rf }}</n-tag>
-                </div>
-              </n-list-item>
-            </n-list>
-            <n-empty v-else description="没有提交" style="padding: 24px" />
-            <div class="log-more">
-              <n-button v-if="logMore" size="small" secondary block :loading="logLoading" @click="loadMoreLog">
-                加载更多
-              </n-button>
-              <span v-else-if="commits.length" class="log-end">没有更多了({{ commits.length }} 条)</span>
-            </div>
+          <n-tab-pane name="log" tab="提交历史" display-directive="show:lazy">
+            <GitHistoryPanel :repo-path="repoPath" :current-branch="status?.branch" :revision="historyRevision"
+              :initial-state="historyInitialState" @open-file="openHistoryFile" @revert="revertCommit" />
           </n-tab-pane>
         </n-tabs>
 
@@ -1012,7 +952,7 @@ watch(() => store.currentPath, (p) => {
       <n-empty v-if="!diffFiles.length" description="没有差异" style="padding: 24px" />
       <div v-else class="diff-list">
         <div v-for="f in diffFiles" :key="f.path" class="diff-file list-row" role="button" tabindex="0"
-          @click="goFile(diffScope, f.path, diffCommit?.hash)" @keydown.enter="goFile(diffScope, f.path, diffCommit?.hash)">
+          @click="goFile(diffScope, f.path)" @keydown.enter="goFile(diffScope, f.path)">
           <span class="diff-path" :title="f.path">{{ f.path }}</span>
           <span v-if="f.adds" class="diff-add">+{{ f.adds }}</span>
           <span v-if="f.dels" class="diff-del">-{{ f.dels }}</span>
@@ -1289,16 +1229,6 @@ watch(() => store.currentPath, (p) => {
 .commit-ident .git-hint { flex: 1; min-width: 0; margin-top: 0; word-break: break-all; }
 /* 身份缺失是个待办而不是错误,用强调色把这行从灰色的提示里提出来就够了。 */
 .commit-ident .ident-missing { color: var(--lr-danger); }
-.log-line { display: flex; align-items: center; gap: 8px; }
-.log-row { display: flex; align-items: baseline; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
-.log-hash { flex: none; font-family: ui-monospace, monospace; font-size: 12px; color: var(--lr-accent); }
-.log-subject { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log-meta {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
-  margin-top: 2px; color: var(--lr-fg-muted); font-size: 11px;
-}
-.log-more { padding: 12px 0; text-align: center; }
-.log-end { color: var(--lr-fg-muted); font-size: 12px; }
 .diff-list { display: flex; flex-direction: column; gap: 8px; max-height: 70vh; overflow-y: auto; }
 /* flex 列容器里每个文件块必须保持自然高度,不能 flex-shrink:
    不然展开的文件一多,各块会被容器(70vh)按比例压缩挤扁,内容被 overflow:hidden
