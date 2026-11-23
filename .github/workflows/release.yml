@@ -44,6 +44,9 @@ jobs:
       # 显式安装并把 sdkmanager 加入 PATH,不依赖 runner 预装 SDK 的路径。
       - name: 初始化 Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 覆盖 Action 默认的 tools platform-tools,旧 tools 包已下架。
+          packages: 'platform-tools'
 
       - name: 准备 Android NDK
         run: |
