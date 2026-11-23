@@ -2,6 +2,7 @@
 /lightremote
 /lightremote.exe
 /server
+/out/
 *.exe
 *.test
 *.out

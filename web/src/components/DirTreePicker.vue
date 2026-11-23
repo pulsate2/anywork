@@ -3,7 +3,7 @@
 // 选中态由值反推,点选写回值,所以手输的路径不会被树覆盖,点完也还能接着手改。
 import { ref, computed, onMounted } from 'vue'
 import { NInput, NButton, NTree, NIcon, useMessage, type TreeOption } from 'naive-ui'
-import { FolderOpenOutline } from '@vicons/ionicons5'
+import { FolderOpenOutline, HomeOutline } from '@vicons/ionicons5'
 import { api } from '@/api/client'
 import { useWorkspaceStore } from '@/stores/workspace'
 
@@ -16,6 +16,7 @@ const treeOpen = ref(false)
 const treeData = ref<TreeOption[]>([])
 const treeLoading = ref(false)
 const expanded = ref<string[]>([])
+const browseRoot = ref<string | null>(null)
 
 const selectedKeys = computed(() => (path.value ? [trimSlash(path.value)] : []))
 
@@ -23,9 +24,9 @@ function trimSlash(p: string) {
   return p.length > 1 ? p.replace(/\/+$/, '') : p
 }
 
-// 树根只能是 root:后端 Resolve 不放行边界之外的路径,再往上列也是白列。
+// 默认从 root 浏览;Home 入口可跳过无权读取的上级目录,但仍不能越过 root 边界。
 function rootKey() {
-  return trimSlash(store.root || '/')
+  return trimSlash(browseRoot.value || store.root || '/')
 }
 
 // 只要目录。fsList 返回的 path 已经是 root 内的绝对路径(正斜杠),直接当节点 key,
@@ -40,6 +41,16 @@ async function toggleTree() {
     treeOpen.value = false
     return
   }
+  browseRoot.value = null
+  treeData.value = []
+  await openTree()
+}
+
+async function browseHome() {
+  if (!store.homeAvailable) return
+  path.value = store.home
+  browseRoot.value = store.home
+  treeData.value = []
   await openTree()
 }
 
@@ -108,6 +119,10 @@ onMounted(() => {
   <div class="dir-field">
     <div class="dir-row">
       <n-input v-model:value="path" :placeholder="placeholder || '目录路径'" />
+      <n-button class="dir-browse" :disabled="!store.homeAvailable" title="从 Home 浏览目录"
+        aria-label="从 Home 浏览目录" @click="browseHome">
+        <template #icon><n-icon :component="HomeOutline" /></template>
+      </n-button>
       <n-button class="dir-browse" :type="treeOpen ? 'primary' : 'default'" :loading="treeLoading"
         title="浏览目录" aria-label="浏览目录" @click="toggleTree">
         <template #icon><n-icon :component="FolderOpenOutline" /></template>

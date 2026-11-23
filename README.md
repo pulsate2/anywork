@@ -48,6 +48,10 @@ SHELL="$PREFIX/bin/bash" LIGHTREMOTE_PASSWORD='请换成强密码' \
 
 二进制已内嵌前端,运行时不需要 Go 或 Node。请在 Termux 私有目录(如 `$HOME`)运行,不要直接从共享存储(`/sdcard`)执行。目前仅提供 ARM64 版本;非 root Android 的系统监控和终端资源限制受系统权限约束。
 
+Android 10+ 部分 Termux 版本会限制直接执行应用目录内的程序。Android 构建统一为终端、Agent(Claude/Codex/Pi)和 Git 准备启动命令:动态 ELF 经 `/system/bin/linker64` 加载;npm 脚本的 `#!/usr/bin/env node` 会解析为 Termux 的 Node 解释器。兼容准备先于 Agent 的 stdio 管道创建,不依赖失败后重试已经关闭的管道。不会修改可执行文件权限,也不会把 Linux/glibc 的 Agent 二进制当作 Android 程序启动。
+
+Termux 版启用 CGO 并链接 Android bionic,使用系统 DNS(含系统 Private DNS/VPN 配置),不要设置 `GODEBUG=netdns=go` 强制退回纯 Go DNS。HTTPS 保持证书校验,自动读取 Termux CA 包和 Android 系统证书(含 Android 14+ 的 Conscrypt APEX);用户已设置的 `SSL_CERT_FILE`、`SSL_CERT_DIR`、`NODE_EXTRA_CA_CERTS` 不会被覆盖。请保留 Termux 的 `PREFIX`、`PATH`、`LD_PRELOAD` 和所需的代理环境变量。需要代理时,在启动服务前设置 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`;各 Agent 是否支持代理及哪些变量仍由 Agent 自身决定。
+
 ### Docker
 
 ```bash
@@ -66,6 +70,10 @@ docker run -d \
 
 ## 配置
 
+工作区页提供固定的 **Home** 文件浏览入口;新建终端的目录选项始终保留 **Home**,与自定义工作区无关。Home 指服务端用户的主目录,受 `--root` 边界约束,越界时显示但不可选。
+
+Git 的“克隆远程仓库”直接克隆到**当前选中的工作区根目录**(`git clone <url> .`),不跟随文件页浏览的子目录,也不额外新建仓库名子目录。克隆窗口显示完整目标路径;打开后切换工作区必须重新确认。目标目录必须为空,非空时拒绝操作,不会覆盖已有文件或自动改用子目录。“初始化 Git 仓库”则是在工作区根目录创建空仓库的 `.git` 元数据,不是克隆远程仓库。
+
 全部支持 CLI flag 或环境变量(flag 优先):
 
 | Flag | 环境变量 | 默认 | 说明 |
@@ -81,6 +89,10 @@ docker run -d \
 | `--vapid-private` | `LIGHTREMOTE_VAPID_PRIVATE` | — | Web Push VAPID 私钥;空则用 `data-dir/vapid.key` |
 | `--vapid-subject` | `LIGHTREMOTE_VAPID_SUBJECT` | `mailto:admin@localhost` | VAPID subject |
 | `--push-idle` | `LIGHTREMOTE_PUSH_IDLE` | `10` | 终端安静秒数后发"命令完成"推送;`0` 禁用 |
+
+## Agent 图片与文件
+
+Agent 的 `view_image`/`viewimage` 调用显示图片缩略图,点击可放大,工具详情和子代理过程也能预览。Codex 正文中的 `sandbox:`、`file:` 和本地文件链接会转为登录后可访问的下载地址,相对路径以该会话工作区为基准;Markdown 中的本地图片也可预览。文件必须真实存在,读取受 `--root` 或当前会话附件目录限制,不允许路径/符号链接越界,HTML 等非图片文件只下载,不在应用同源中执行。
 
 ## AI 配置转换
 

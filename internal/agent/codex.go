@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"lightremote/internal/executil"
 )
 
 // codexDriver:spawn `codex app-server`,行分隔 JSON-RPC over stdio。
@@ -116,7 +118,11 @@ func (d *codexDriver) Start(opts StartOpts) error {
 	cmd := exec.Command(bin, "app-server")
 	cmd.Dir = opts.Cwd
 	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, opts.Env...)
 	setProcessGroup(cmd)
+	if err := executil.Prepare(cmd); err != nil {
+		return fmt.Errorf("准备 codex app-server 失败: %w", err)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1459,22 +1465,24 @@ func (d *codexDriver) handleItem(verb, itemID string, item *codexItem) {
 		}
 
 	case "imageview":
-		// view_image 工具(实测 0.144.5):item 只有 path,图本身不回传,
-		// 模型看完会在正文里描述。发一张卡让人知道它看了哪张图。
-		if verb == "started" {
-			args, _ := json.Marshal(map[string]string{"path": item.Path})
-			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
-				Tool:      "view_image",
-				ToolUseID: itemID,
-				Args:      string(args),
-				State:     "running",
-			}})
-		} else {
-			d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
-				ToolUseID: itemID,
-				State:     "ok",
-			}})
+		// Codex returns the local path, not image bytes. Keep it on completed
+		// events too so history pages without the started event can preview it.
+		args := ""
+		if item.Path != "" {
+			raw, _ := json.Marshal(map[string]string{"path": item.Path})
+			args = string(raw)
 		}
+		state := "running"
+		if verb != "started" {
+			state = "ok"
+			if item.Error != "" || (item.Success != nil && !*item.Success) || item.Status == "failed" {
+				state = "error"
+			}
+		}
+		d.emit(Event{Kind: KindToolCall, Payload: &ToolCallPayload{
+			Tool: "view_image", ToolUseID: itemID, Args: args,
+			State: state, Result: item.Error,
+		}})
 
 	case "collabagenttoolcall":
 		// 多智能体 v1 item(hapi 同款):started 开卡、completed 收卡。

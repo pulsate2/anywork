@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 文件浏览:列表/读写/上传下载/搜索/压缩解压。桌面+移动自适应。
 import { ref, onMounted, onActivated, computed, watch, nextTick, h, type Component } from "vue"
-import { useRouter } from "vue-router"
+import { useRouter, useRoute } from "vue-router"
 import {
 	NButton, NIcon, NEmpty, NSpin,
 	NInput, NModal, useMessage, useDialog,
@@ -24,6 +24,7 @@ const message = useMessage()
 const dialog = useDialog()
 const store = useWorkspaceStore()
 const router = useRouter()
+const route = useRoute()
 const cwd = ref("/")
 const entries = ref<FsEntry[]>([])
 const loading = ref(false)
@@ -70,6 +71,8 @@ function joinPath(dir: string, name: string) {
 // 恢复上次访问的目录:文件浏览可以离开工作区,只需仍在服务端 root 内。
 // 工作区切换时 store.select 已经清除记录,不应在预览返回时丢弃项目外的目录。
 function initialDir(): string {
+	const requested = requestedDir()
+	if (requested) return requested
 	const last = store.lastDir()
 	if (!last) return store.currentPath
 	const base = rootPath.value
@@ -79,20 +82,37 @@ function initialDir(): string {
 	return store.currentPath
 }
 
+// 工作区上的“浏览文件”明确从该工作区根目录开始,即使之前浏览过子目录。
+// dir 是一次性跳转参数,消费后删除,保证文件预览返回不会又跳回根目录。
+function requestedDir(): string | null {
+	if (route.name !== 'files' || typeof route.query.dir !== 'string') return null
+	const dir = route.query.dir
+	const query = { ...route.query }
+	delete query.dir
+	void router.replace({ name: 'files', query })
+	return store.isWithinRoot(dir) ? dir : null
+}
+
+let loadRequest = 0
 async function load(dir: string, preserveSelection = false) {
+	const request = ++loadRequest
 	const fallback = store.currentPath
 	let target = dir || fallback
 	loading.value = true
 	try {
+		let nextEntries: FsEntry[]
 		try {
-			entries.value = await api.fsList(target)
+			nextEntries = await api.fsList(target)
 		} catch (e) {
+			if (request !== loadRequest) return
 			// 记住的目录可能已经被删掉了:静默回落到工作区根,别把用户留在错误页上。
 			if (target === fallback) throw e
 			store.clearLastDir()
 			target = fallback
-			entries.value = await api.fsList(target)
+			nextEntries = await api.fsList(target)
 		}
+		if (request !== loadRequest) return
+		entries.value = nextEntries
 		const sameDir = trimSlash(target) === trimSlash(cwd.value)
 		cwd.value = target
 		if (!sameDir) clearSearch()
@@ -105,9 +125,10 @@ async function load(dir: string, preserveSelection = false) {
 		} else selected.value.clear()
 		store.setLastDir(target)
 	} catch (e: any) {
+		if (request !== loadRequest) return
 		message.error(e?.message || "加载失败")
 	} finally {
-		loading.value = false
+		if (request === loadRequest) loading.value = false
 	}
 }
 
@@ -788,6 +809,11 @@ onActivated(() => {
 // 初始化完成后切换工作区,目录再跟着走。
 watch(() => store.currentPath, (p) => {
 	if (initialized) load(p)
+})
+watch(() => route.query.dir, () => {
+	if (!initialized) return
+	const dir = requestedDir()
+	if (dir) load(dir)
 })
 
 function sizeHuman(n: number) {

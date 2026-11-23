@@ -144,7 +144,7 @@ func (s *Session) start() error {
 	cmd := ptmx.Command(name, args...)
 	cmd.Dir = s.dir
 	cmd.Env = s.env
-	if err := cmd.Start(); err != nil {
+	if err := startPTYCommand(cmd); err != nil {
 		ptmx.Close()
 		return err
 	}

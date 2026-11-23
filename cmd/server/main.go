@@ -36,6 +36,7 @@ import (
 	"lightremote/internal/db"
 	fsvc "lightremote/internal/fs"
 	gitsvc "lightremote/internal/git"
+	"lightremote/internal/platform"
 	pushsvc "lightremote/internal/push"
 	"lightremote/internal/sysmon"
 	"lightremote/internal/terminal"
@@ -46,6 +47,7 @@ import (
 var webFS embed.FS
 
 func main() {
+	platform.Init()
 	// git 需要凭据时,会用 GIT_ASKPASS 拉起本二进制进入"凭据代理"模式:
 	// 连回主进程拿用户经弹窗输入的答案,打印给 git。此时不做任何服务启动。
 	if gitsvc.InAskPassMode() {
@@ -334,6 +336,7 @@ func (a *App) routes() http.Handler {
 		pr.Delete("/api/agent/sessions/{id}", a.agent.Kill)
 		pr.Post("/api/agent/sessions/{id}/delete", a.agent.DeleteSession)
 		pr.Get("/api/agent/sessions/{id}/files/{name}", a.agent.File)
+		pr.Get("/api/agent/sessions/{id}/artifact", a.agent.Artifact)
 		pr.Get("/api/agent/cleanup", a.agent.CleanupStatus)
 		pr.Post("/api/agent/cleanup", a.agent.Cleanup)
 		pr.Put("/api/agent/cleanup", a.agent.SaveCleanupSettings)
@@ -380,10 +383,30 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleMe(w http.ResponseWriter, r *http.Request) {
+	home, available := a.homeDirectory()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"readonly": a.cfg.ReadOnly,
-		"root":     filepath.ToSlash(a.cfg.Root),
+		"readonly":      a.cfg.ReadOnly,
+		"root":          filepath.ToSlash(a.cfg.Root),
+		"home":          home,
+		"homeAvailable": available,
 	})
+}
+
+// Report the real server home without reinterpreting an out-of-root absolute
+// path as root-relative. Home shortcuts must not bypass --root restrictions.
+func (a *App) homeDirectory() (string, bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+	home, err = filepath.Abs(home)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(filepath.Clean(a.cfg.Root), home)
+	allowed := err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	info, statErr := os.Stat(home)
+	return filepath.ToSlash(home), allowed && statErr == nil && info.IsDir()
 }
 
 // ---- workspaces ----

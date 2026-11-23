@@ -9,7 +9,7 @@
 import { computed, ref, watch } from 'vue'
 import { NModal } from 'naive-ui'
 import type { AgentToolCall } from '@/api/client'
-import { renderMarkdown } from '@/utils/markdown'
+import { renderAgentMarkdown } from '@/utils/markdown'
 import ToolDetailBody from './ToolDetailBody.vue'
 import { ToolStatusIcon, hasToolCategory, toolCategoryIcon, MessageIcon } from './toolIcons'
 
@@ -88,7 +88,7 @@ function stepBrief(c: AgentToolCall): string {
       </div>
       <!-- 右栏:选中步骤的详情 —— 文本步按 markdown 渲染,工具步参数与结果 -->
       <div class="steps-md-detail">
-        <div v-if="selected?.text" class="steps-md-text agent-md-body" v-html="renderMarkdown(selected.text)" />
+        <div v-if="selected?.text" class="steps-md-text agent-md-body" v-html="renderAgentMarkdown(selected.text, sessionId)" />
         <ToolDetailBody v-else-if="selected" :call="selected" :session-id="sessionId" />
         <div v-else class="steps-md-empty">点左侧步骤查看详情</div>
       </div>

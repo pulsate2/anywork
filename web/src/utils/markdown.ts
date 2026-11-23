@@ -3,25 +3,68 @@
 // (拦掉 javascript:/vbscript:/file:/data: 链接),不需要再引 sanitizer。
 import MarkdownIt from 'markdown-it'
 import { highlightLang } from './highlight'
+import { api } from '@/api/client'
+import { agentLocalPath } from './agentResources'
 
-const md = new MarkdownIt({
-  html: false,
-  linkify: true,
-  typographer: false,
-  // 返回值以 <pre 开头时 markdown-it 不再套自己的外壳。
-  highlight: (code, lang) => `<pre class="md-pre"><code>${highlightLang(code, lang)}</code></pre>`,
-})
+function createMarkdown() {
+  const md = new MarkdownIt({
+    html: false,
+    linkify: true,
+    typographer: false,
+    // 返回值以 <pre 开头时 markdown-it 不再套自己的外壳。
+    highlight: (code, lang) => `<pre class="md-pre"><code>${highlightLang(code, lang)}</code></pre>`,
+  })
 
-// 外链开新标签:预览里点链接不该把整个 SPA 导航走。
-const linkOpen = md.renderer.rules.link_open
-md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
-  tokens[idx].attrSet('target', '_blank')
-  tokens[idx].attrSet('rel', 'noopener noreferrer')
-  return linkOpen ? linkOpen(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options)
+  // 外链开新标签:预览里点链接不该把整个 SPA 导航走。
+  const linkOpen = md.renderer.rules.link_open
+  md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+    tokens[idx].attrSet('target', '_blank')
+    tokens[idx].attrSet('rel', 'noopener noreferrer')
+    return linkOpen ? linkOpen(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options)
+  }
+  return md
+}
+
+const md = createMarkdown()
+// Agent-only renderer: sandbox:/file:/workspace links become authenticated
+// resource URLs. Normal file previews retain markdown-it's file: prohibition.
+const agentMd = createMarkdown()
+const validateAgentLink = agentMd.validateLink.bind(agentMd)
+agentMd.validateLink = (href) => agentLocalPath(href) !== null || validateAgentLink(href)
+// Also make bare sandbox:/... and file:/... addresses clickable (outside code
+// spans/blocks), as some Codex replies omit Markdown link syntax.
+for (const scheme of ['sandbox:', 'file:']) {
+  agentMd.linkify.add(scheme, {
+    validate: (text, position) => {
+      const match = text.slice(position).match(/^\/[^\s<>"'\]\)]+/)
+      return match ? match[0].replace(/[.,;!?，。；！]+$/, '').length : 0
+    },
+    normalize: (match) => { match.url = match.raw },
+  })
+}
+const agentLinkOpen = agentMd.renderer.rules.link_open
+agentMd.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  const path = agentLocalPath(String(tokens[idx].attrGet('href') || ''))
+  const sessionId = typeof env?.sessionId === 'string' ? env.sessionId : ''
+  if (path && sessionId) tokens[idx].attrSet('href', api.agentArtifactUrl(sessionId, path))
+  return agentLinkOpen ? agentLinkOpen(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options)
+}
+const agentImage = agentMd.renderer.rules.image
+agentMd.renderer.rules.image = (tokens, idx, options, env, self) => {
+  const path = agentLocalPath(String(tokens[idx].attrGet('src') || ''))
+  const sessionId = typeof env?.sessionId === 'string' ? env.sessionId : ''
+  if (path && sessionId) tokens[idx].attrSet('src', api.agentArtifactUrl(sessionId, path, true))
+  tokens[idx].attrSet('loading', 'lazy')
+  tokens[idx].attrSet('referrerpolicy', 'no-referrer')
+  return agentImage ? agentImage(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options)
 }
 
 export function renderMarkdown(src: string): string {
   return md.render(src)
+}
+
+export function renderAgentMarkdown(src: string, sessionId?: string): string {
+  return sessionId ? agentMd.render(src, { sessionId }) : md.render(src)
 }
 
 // 框线字符(含双线制):ASCII 示意图的特征。

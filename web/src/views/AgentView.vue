@@ -9,7 +9,8 @@ import {
 import { AddOutline, CheckboxOutline, CopyOutline, HourglassOutline, StopOutline, TrashOutline } from '@vicons/ionicons5'
 import { api, type AgentAskUser, type AgentAskUserResult, type AgentCompaction, type AgentEvent, type AgentPermissionReq, type AgentQueuedMsg, type AgentReasoning, type AgentResumableSession, type AgentSession, type AgentStatusPayload, type AgentStreamSnapshot, type AgentSystemInfo, type AgentToolCall, type AgentUsage } from '@/api/client'
 import { AgentWS } from '@/api/agent'
-import { renderMarkdown } from '@/utils/markdown'
+import { renderAgentMarkdown } from '@/utils/markdown'
+import { isViewImageTool } from '@/utils/agentResources'
 import { useImmersive } from '@/utils/immersive'
 import { useWorkspaceStore } from '@/stores/workspace'
 import ToolCallCard from '@/components/agent/ToolCallCard.vue'
@@ -442,7 +443,9 @@ const cards = computed<Card[]>(() => {
             const steps = out[host].steps!
             const i = p.toolUseId ? steps.findIndex((s) => s.toolUseId === p.toolUseId) : -1
             if (i >= 0) {
-              steps[i] = { ...steps[i]!, result: p.result, state: p.state }
+              steps[i] = { ...steps[i]!, tool: p.tool || steps[i]!.tool,
+                args: p.args || steps[i]!.args, result: p.result ?? steps[i]!.result,
+                state: p.state, images: p.images ?? steps[i]!.images, diff: p.diff ?? steps[i]!.diff }
             } else {
               steps.push(p)
             }
@@ -461,7 +464,9 @@ const cards = computed<Card[]>(() => {
         if (p.toolUseId && toolIndex.has(p.toolUseId)) {
           const card = out[toolIndex.get(p.toolUseId)!]
           if (card.call) {
-            card.call = { ...card.call, result: p.result, state: p.state, images: p.images, diff: p.diff ?? card.call.diff }
+            card.call = { ...card.call, tool: p.tool || card.call.tool,
+              args: p.args || card.call.args, result: p.result ?? card.call.result,
+              state: p.state, images: p.images ?? card.call.images, diff: p.diff ?? card.call.diff }
           }
           break
         }
@@ -655,6 +660,7 @@ function notifySummary(p: AgentSystemInfo): string {
 // (已答复的审批照常进组,审批内嵌的展示由详情弹窗兜底)。
 function groupableToolCard(c: Card): boolean {
   return c.kind === 'tool' && !!c.call && !UNGROUPABLE_TOOLS.has(c.call.tool)
+    && !isViewImageTool(c.call.tool) && !c.call.images?.length
     && !(c.pendingReq && !c.resolved)
 }
 
@@ -1529,7 +1535,8 @@ function renderResumeLabel(option: { label?: string; time?: string }) {
 }
 
 const workspaceOptions = computed(() =>
-  wsStore.list.map((w) => ({ label: w.name, value: w.path })),
+  wsStore.directoryOptions.map((w) => ({ label: w.label, value: w.path || w.value, disabled: w.disabled }))
+    .filter((w, i, list) => list.findIndex(other => other.value === w.value) === i),
 )
 
 // agent 或目录变了重拉列表;弹窗开着才拉。
@@ -1866,10 +1873,10 @@ onBeforeUnmount(() => {
               <span>{{ copiedKey === c.key ? '已复制' : '复制' }}</span>
             </button>
           </div>
-          <div v-else-if="c.kind === 'assistant'" class="agent-plain agent-md-body" v-html="renderMarkdown(c.text || '')" />
+          <div v-else-if="c.kind === 'assistant'" class="agent-plain agent-md-body" v-html="renderAgentMarkdown(c.text || '', selectedId || undefined)" />
           <details v-else-if="c.kind === 'reasoning'" class="reasoning">
             <summary>思考过程{{ c.thinkMs != null ? ` · ${fmtThink(c.thinkMs)}` : '' }}</summary>
-            <div class="reasoning-body agent-md-body" v-html="renderMarkdown(c.text || '')" />
+            <div class="reasoning-body agent-md-body" v-html="renderAgentMarkdown(c.text || '', selectedId || undefined)" />
           </details>
           <ToolGroupCard v-else-if="c.kind === 'toolgroup' && c.groupCalls" :calls="c.groupCalls" @detail="detailCall = $event" />
           <ToolCallCard
@@ -1895,7 +1902,7 @@ onBeforeUnmount(() => {
           <!-- 后台通知卡:头部图标+标签,正文 markdown 渲染,Monitor 的 event 是原始日志行走等宽 pre -->
           <div v-else-if="c.kind === 'system' && c.sysinfo?.type === 'task_notification'" class="notify-card" :class="{ 'notify-failed': c.sysinfo.status === 'failed' }">
             <div class="notify-head">{{ sysinfoIcon(c.sysinfo) }} {{ notifyLabel(c.sysinfo) }}</div>
-            <div v-if="notifySummary(c.sysinfo)" class="notify-body agent-md-body" v-html="renderMarkdown(notifySummary(c.sysinfo))" />
+            <div v-if="notifySummary(c.sysinfo)" class="notify-body agent-md-body" v-html="renderAgentMarkdown(notifySummary(c.sysinfo), selectedId || undefined)" />
             <pre v-if="c.sysinfo.event" class="notify-event">{{ c.sysinfo.event }}</pre>
           </div>
           <div v-else-if="c.kind === 'system' && c.sysinfo" class="sysline" :class="{ 'sysline-failed': c.sysinfo.type === 'api_error' && c.sysinfo.maxRetry && !c.sysinfo.retry && c.sysinfo.status !== 'retrying' }">{{ sysinfoIcon(c.sysinfo) }} {{ sysinfoText(c.sysinfo) }}</div>
@@ -1905,11 +1912,11 @@ onBeforeUnmount(() => {
         <div v-if="streamThink" class="chat-row reasoning">
           <details class="reasoning" open>
             <summary>思考中 · {{ fmtThink(thinkElapsedMs) }}</summary>
-            <div class="reasoning-body agent-md-body" v-html="renderMarkdown(streamThink)" />
+            <div class="reasoning-body agent-md-body" v-html="renderAgentMarkdown(streamThink, selectedId || undefined)" />
           </details>
         </div>
         <div v-if="streamText" class="chat-row assistant">
-          <div class="agent-plain agent-md-body" v-html="renderMarkdown(streamText)" />
+          <div class="agent-plain agent-md-body" v-html="renderAgentMarkdown(streamText, selectedId || undefined)" />
         </div>
         <!-- 乐观气泡:发送中转圈,失败标 ⚠ 可重发/丢弃 -->
         <div v-for="pb in pendingBubbles" :key="pb.key" class="chat-row user">

@@ -2,12 +2,16 @@ package aiprofile
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -90,7 +94,7 @@ func fetchModels(ctx context.Context, client *http.Client, endpoint, key, app st
 	res, err := client.Do(req)
 	if err != nil {
 		// 不回传供应商正文或请求信息,避免把 Key 带进错误提示。
-		return nil, fmt.Errorf("连接失败或超时")
+		return nil, errors.New(networkErrorHint(err))
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
@@ -117,4 +121,32 @@ func fetchModels(ctx context.Context, client *http.Client, endpoint, key, app st
 		return nil, fmt.Errorf("未返回可用模型")
 	}
 	return models, nil
+}
+
+// Classify transport failures without echoing URLs, proxy credentials, headers,
+// or provider responses. Users can distinguish DNS/CA/proxy errors safely.
+func networkErrorHint(err error) string {
+	var dns *net.DNSError
+	var authority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var certificate x509.CertificateInvalidError
+	var netErr net.Error
+	switch {
+	case errors.As(err, &dns):
+		return "域名解析失败（请检查系统 DNS、Private DNS 或 VPN）"
+	case errors.As(err, &authority):
+		return "HTTPS 证书不受信任（请检查 CA 证书配置）"
+	case errors.As(err, &hostname):
+		return "HTTPS 证书与接口域名不匹配"
+	case errors.As(err, &certificate):
+		return "HTTPS 证书无效（请检查证书和设备时间）"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "连接超时（请检查接口地址、网络或代理）"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "连接被拒绝（请检查接口或代理是否正在监听）"
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "网络不可达（请检查网络、VPN 或代理）"
+	default:
+		return "连接失败（请检查接口地址、网络或代理）"
+	}
 }

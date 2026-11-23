@@ -39,6 +39,14 @@ jobs:
         working-directory: web
         run: npm ci && npm run build
 
+      # Android 必须启用 CGO,让 net 使用 bionic/getaddrinfo 的系统 DNS。
+      # 普通 Linux 的 resolv.conf/localhost DNS 不适用于 Termux。
+      - name: 准备 Android NDK
+        run: |
+          set -euo pipefail
+          sdkmanager 'ndk;27.2.12479018'
+          echo "TERMUX_CC=${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
       - name: 交叉编译并打包
         run: |
           set -euo pipefail
@@ -46,9 +54,15 @@ jobs:
           pack() {
             local goos=$1 goarch=$2 ext=${3:-}
             local platform=${4:-$goos}
+            local cgo=0 cc=gcc cgo_ldflags=''
+            if [ "$goos" = android ]; then
+              cgo=1
+              cc=$TERMUX_CC
+              cgo_ldflags='-Wl,-z,max-page-size=16384'
+            fi
             local name="lightremote-${TAG}-${platform}-${goarch}"
             mkdir -p "stage/${name}"
-            GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 \
+            GOOS=$goos GOARCH=$goarch CGO_ENABLED=$cgo CC="$cc" CGO_LDFLAGS="$cgo_ldflags" \
               go build -trimpath -ldflags='-s -w' -o "stage/${name}/lightremote${ext}" ./cmd/server
             cp README.md "stage/${name}/"
             if [ "$goos" = windows ]; then
@@ -59,7 +73,7 @@ jobs:
           }
           pack linux amd64
           pack linux arm64
-          # Termux 使用 Android 目标(不是普通 Linux);arm64 支持无 CGO 的 PIE 二进制。
+          # Termux 使用 Android PIE + bionic,支持系统 DNS/Private DNS/VPN。
           pack android arm64 '' termux
           pack darwin amd64
           pack darwin arm64

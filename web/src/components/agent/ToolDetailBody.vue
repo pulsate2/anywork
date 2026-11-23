@@ -4,8 +4,9 @@
 // 全局详情弹窗(ToolDetailModal)与子 agent 过程弹窗(StepsModal)的右栏。
 import { computed, ref } from 'vue'
 import { NModal } from 'naive-ui'
-import { api, type AgentToolCall } from '@/api/client'
+import type { AgentToolCall } from '@/api/client'
 import DiffView from './DiffView.vue'
+import { agentToolImageUrls, isViewImageTool } from '@/utils/agentResources'
 
 const props = defineProps<{
   // null = 没有选中(过程弹窗右栏的空态)。
@@ -71,9 +72,9 @@ const command = computed(() => brief.value || props.call?.args || '')
 const PATH_TOOLS = ['Read', 'NotebookRead', 'LS', 'view_image']
 const readPath = computed(() => {
   const c = props.call
-  if (!c || !PATH_TOOLS.includes(c.tool)) return ''
+  if (!c || (!PATH_TOOLS.includes(c.tool) && !isViewImageTool(c.tool))) return ''
   const args = parseArgsLenient(c)
-  for (const k of ['file_path', 'notebook_path', 'path', 'target']) {
+  for (const k of ['file_path', 'notebook_path', 'path', 'target', 'image_path', 'imagePath', 'local_image_path', 'localImagePath']) {
     const v = args?.[k]
     if (typeof v === 'string' && v) return v
   }
@@ -212,11 +213,7 @@ const diffBlocks = computed<DiffBlock[] | null>(() => {
 })
 
 // 该次结果里的图片(有会话 id 且带图才有)。
-const imageUrls = computed<string[]>(() =>
-  props.sessionId && props.call?.images?.length
-    ? props.call.images.map((n) => api.agentFileUrl(props.sessionId!, n))
-    : [],
-)
+const imageUrls = computed(() => agentToolImageUrls(props.call, props.sessionId))
 const lightbox = ref<string | null>(null)
 // n-modal 要 v-model:show;lightbox 值本身只是 url。
 const lightboxOpen = computed({

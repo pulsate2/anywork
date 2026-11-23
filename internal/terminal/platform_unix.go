@@ -4,6 +4,8 @@ package terminal
 
 import (
 	"os"
+	"os/exec"
+	"runtime"
 	"syscall"
 )
 
@@ -24,6 +26,13 @@ func terminateProcess(p *os.Process, force bool) {
 func defaultShell() string {
 	if s := os.Getenv("SHELL"); s != "" {
 		return s
+	}
+	if runtime.GOOS == "android" {
+		// Termux 的 sh 在 $PREFIX/bin,不是 /bin/sh。
+		if p, err := exec.LookPath("sh"); err == nil {
+			return p
+		}
+		return "/system/bin/sh"
 	}
 	return "/bin/sh"
 }

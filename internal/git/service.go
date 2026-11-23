@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"lightremote/internal/executil"
 )
 
 // Service 持有文件根边界,提供 git 操作。
@@ -143,7 +145,7 @@ func (s *Service) run(dir string, env []string, args ...string) (string, error) 
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	if err := executil.Run(cmd); err != nil {
 		msg := strings.TrimSpace(errb.String())
 		if msg == "" {
 			msg = err.Error()
@@ -188,7 +190,7 @@ func (s *Service) runWithCreds(dir string, broker *CredentialBroker, args ...str
 		}
 	}()
 
-	if err := cmd.Run(); err != nil {
+	if err := executil.Run(cmd); err != nil {
 		msg := strings.TrimSpace(errb.String())
 		if msg == "" {
 			msg = err.Error()
@@ -230,12 +232,12 @@ func (s *Service) emptyTree(root string) (string, error) {
 }
 
 func currentBranch(root string) string {
-	b, err := exec.Command("git", "-C", root, "symbolic-ref", "--short", "HEAD").Output()
+	b, err := executil.Output(exec.Command("git", "-C", root, "symbolic-ref", "--short", "HEAD"))
 	if err == nil && len(b) > 0 {
 		return strings.TrimSpace(string(b))
 	}
 	// detached HEAD
-	if b, err := exec.Command("git", "-C", root, "rev-parse", "--short", "HEAD").Output(); err == nil {
+	if b, err := executil.Output(exec.Command("git", "-C", root, "rev-parse", "--short", "HEAD")); err == nil {
 		return "detached@" + strings.TrimSpace(string(b))
 	}
 	return ""

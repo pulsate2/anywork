@@ -238,35 +238,40 @@ async function reload() {
 // 当前工作区还不是仓库时,空状态里给一个按钮:否则想开始用版本控制就得先去终端敲一遍
 // git init,而这个页面存在的意义本来就是不用开终端。
 //
-// 动手前先确认一句。两个原因:一是这个按钮作用在哪个目录并不写在按钮上(它是当前工作区的
-// 路径,不是文件页里正在浏览的位置),弹窗里点名说清楚;二是 init 之后这个目录下的一切
-// 都归这个仓库管,不是随手点错也无所谓的操作。
+// 固定使用当前选中的工作区根目录,不受文件页浏览到的子目录影响。
+// 确认时锁定目标,避免弹窗打开后切换工作区导致初始化另一个未确认的目录。
 const initing = ref(false)
 
 function askInit() {
+  const path = repoPath.value
   dialog.warning({
     title: '初始化 Git 仓库',
-    content: `将在「${repo.value?.short || repoPath.value}」执行 git init,`
-      + '此后该目录下的文件都由这个仓库管理(初始分支名跟随服务器的 init.defaultBranch)。',
+    content: `将在当前工作区根目录「${path}」执行 git init,`
+      + '只创建 .git 元数据,不额外新建项目子目录(初始分支名跟随服务器的 init.defaultBranch)。',
     positiveText: '初始化',
     negativeText: '取消',
-    onPositiveClick: doInit,
+    onPositiveClick: () => doInit(path),
   })
 }
 
-async function doInit() {
+async function doInit(path = repoPath.value) {
+  if (initing.value || cloning.value) return
+  if (path !== store.currentPath) {
+    message.warning('工作区已切换,请重新确认初始化目录')
+    return
+  }
   initing.value = true
   try {
-    const r = await api.gitInit(repoPath.value)
+    const r = await api.gitInit(path)
     message.success(`已初始化,当前分支 ${r.branch || '未知'}`)
     // 重新走一遍 load:空仓库的 status/log 都能正常返回,拉完这个空状态就换成正常界面。
-    await load()
+    if (path === repoPath.value) await load()
   } catch (e: any) {
     // 409:这个目录(或它的某个上级)已经是仓库了 —— 说明屏幕上这个空状态是过期的,
     // 报错没意义,重新加载一次就能看到仓库。
     if (e instanceof ApiError && e.status === GIT_ALREADY_REPO) {
       message.info('这个目录已经在一个 Git 仓库里了')
-      await load()
+      if (path === repoPath.value) await load()
       return
     }
     if (e instanceof ApiError && e.status === 403) {
@@ -281,39 +286,60 @@ async function doInit() {
 
 // ---- 克隆远程仓库(git clone)----
 // 和"初始化"并列的另一个入口:不是所有人都从零开始,更多时候是想把一个已有的远端仓库拉下来。
-// 克隆进当前工作区(原地),和 init 一样作用在 repoPath 上 —— 落地后这个目录本身就是仓库,
-// 重跑 load() 空状态就换成正常界面。代价是这个目录必须为空(git clone 到 . 的硬性要求),
-// 弹窗里把这一点说清楚。
+// 克隆目标固定为当前选中的工作区根目录,不读取文件页的 lastDir,不拼仓库名子目录。
+// 打开弹窗时锁定工作区和完整路径,提交前再确认选择没有变化。
+// 目录必须为空(git clone 到 . 的硬性要求),否则拒绝而不是另选子目录或覆盖已有文件。
 const cloneModal = ref(false)
 const cloneUrl = ref('')
+const cloneTarget = ref<{ id: string; path: string } | null>(null)
 const cloning = ref(false)
-const cloneValid = computed(() => cloneUrl.value.trim().length > 0)
+const cloneValid = computed(() => !!cloneTarget.value && cloneUrl.value.trim().length > 0)
 
 function askClone() {
+  if (cloning.value || initing.value) return
+  const ws = store.current
+  if (!ws) {
+    message.warning('请先在工作区页选择要克隆到的工作区')
+    return
+  }
+  cloneTarget.value = { id: ws.id, path: ws.path }
   cloneUrl.value = ''
   cloneModal.value = true
 }
 
 function cancelClone() {
+  if (cloning.value) return
   cloneModal.value = false
+  cloneTarget.value = null
 }
 
 async function doClone() {
-  if (!cloneValid.value) return
+  if (cloning.value || initing.value || !cloneValid.value) return
+  const target = cloneTarget.value!
+  const path = target.path
+  if (target.id !== store.currentId || path !== store.currentPath) {
+    message.warning('工作区已切换,请重新打开克隆窗口确认目标目录')
+    cancelClone()
+    return
+  }
   cloning.value = true
   try {
-    const r = await api.gitClone(repoPath.value, cloneUrl.value.trim())
+    const r = await api.gitClone(path, cloneUrl.value.trim())
     cloneModal.value = false
-    message.success(`已克隆,当前分支 ${r.branch || '未知'}`)
+    message.success(`已克隆到「${path}」,当前分支 ${r.branch || '未知'}`)
     // 同 doInit:重新走一遍 load,克隆出来的仓库立刻按正常界面显示。
-    await load()
+    if (path === repoPath.value) await load()
   } catch (e: any) {
     // 409:这个目录(或它的某个上级)已经是仓库了 —— 屏幕上这个空状态是过期的,
     // 报错没意义,重新加载一次就能看到仓库。
     if (e instanceof ApiError && e.status === GIT_ALREADY_REPO) {
       cloneModal.value = false
       message.info('这个目录已经在一个 Git 仓库里了')
-      await load()
+      if (path === repoPath.value) await load()
+      return
+    }
+    if (e instanceof ApiError && e.status === 400 && e.message.trim() === 'directory not empty') {
+      message.error(`工作区根目录「${path}」必须为空;不会改为克隆到子目录或覆盖已有文件`)
       return
     }
     if (e instanceof ApiError && e.status === 403) {
@@ -323,6 +349,7 @@ async function doClone() {
     message.error(e?.message || '克隆失败')
   } finally {
     cloning.value = false
+    if (!cloneModal.value) cloneTarget.value = null
   }
 }
 
@@ -821,11 +848,13 @@ watch(() => store.currentPath, (p) => {
       <n-empty v-if="!repo?.repo" description="当前工作区不是 Git 仓库" class="git-empty">
         <template #extra>
           <div class="git-empty-actions">
-            <n-button v-if="repo && !loading" size="small" type="primary" :loading="initing" @click="askInit">
+            <n-button v-if="repo && !loading" size="small" type="primary" :loading="initing"
+              :disabled="initing || cloning" @click="askInit">
               <template #icon><n-icon :component="GitBranchOutline" /></template>
               初始化 Git 仓库
             </n-button>
-            <n-button v-if="repo && !loading" size="small" :loading="cloning" @click="askClone">
+            <n-button v-if="repo && !loading" size="small" :loading="cloning"
+              :disabled="initing || cloning" @click="askClone">
               <template #icon><n-icon :component="CloudDownloadOutline" /></template>
               克隆远程仓库
             </n-button>
@@ -1047,13 +1076,16 @@ watch(() => store.currentPath, (p) => {
     <!-- 克隆远程仓库:克隆进当前工作区(原地),所以文案要把"落到哪个目录、什么条件"
          说清楚。私有仓库要账号密码时走既有 askClient,克隆途中会自动弹认证框。 -->
     <n-modal v-model:show="cloneModal" preset="card" title="克隆远程仓库" :mask-closable="false"
+      :closable="!cloning" :close-on-esc="!cloning"
       style="width: 92%; max-width: 460px">
       <div class="git-hint">
-        将克隆进当前工作区「{{ repo?.short || repoPath }}」。该目录必须为空。
+        将直接克隆到当前选中的工作区根目录「{{ cloneTarget?.path }}」。
+        不会新建仓库名子目录;该目录必须为空,不会覆盖已有文件。
       </div>
       <n-form label-placement="top" :show-feedback="false">
         <n-form-item label="仓库地址">
           <n-input v-model:value="cloneUrl" placeholder="https://github.com/user/repo.git"
+            :disabled="cloning"
             :input-props="{ inputmode: 'url', autocapitalize: 'off', spellcheck: false }"
             @keydown.enter="doClone" />
         </n-form-item>

@@ -47,7 +47,7 @@ async function requestText(path: string): Promise<string> {
 export const api = {
   login: (password: string) => request<{ ok: boolean }>('POST', '/api/login', { password }),
   logout: () => request<{ ok: boolean }>('POST', '/api/logout'),
-  me: () => request<{ readonly: boolean; root: string }>('GET', '/api/me'),
+  me: () => request<{ readonly: boolean; root: string; home: string; homeAvailable: boolean }>('GET', '/api/me'),
   health: () => request<{ status: string; now: string }>('GET', '/api/health'),
   workspaces: () => request<Workspace[]>('GET', '/api/workspaces'),
   // create=true 表示"目录不存在就一并建出来"。缺省不带,让后端先回 428,
@@ -254,6 +254,9 @@ export const api = {
     request<{ ok: boolean }>('POST', `/api/agent/sessions/${id}/answer`, { reqId, answers: answers ?? null }),
   // tool_result 图片块:落盘文件经这个端点取(Cookie 认同,<img src> 直连)。
   agentFileUrl: (id: string, name: string) => `/api/agent/sessions/${id}/files/${encodeURIComponent(name)}`,
+  // Agent 生成文件/查看的本地图片:相对路径基于会话工作区,服务端检查目录边界。
+  agentArtifactUrl: (id: string, path: string, inline = false) =>
+    `/api/agent/sessions/${encodeURIComponent(id)}/artifact?path=${encodeURIComponent(path)}${inline ? '&inline=1' : ''}`,
   // 结束进程树;会话记录保留(历史可看、可续聊)。
   agentKill: (id: string) => request<{ ok: boolean }>('DELETE', `/api/agent/sessions/${id}`),
   // 彻底删除:进程(如在跑)、记录、消息、附件目录一起走。

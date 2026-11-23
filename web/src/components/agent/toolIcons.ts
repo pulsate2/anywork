@@ -93,6 +93,7 @@ export const ToolStatusIcon: FunctionalComponent<{ state: string }> = (props) =>
 // edit/replace_match/grep/ls…),两套命名不撞,分别匹配;pi 没列进来就全落
 // 扳手了(用户实测:pi 的读写类工具一水儿扳手)。
 export function toolCategoryIcon(tool: string): FunctionalComponent {
+  if (/(?:^|[._:/])view_?image$/i.test(tool)) return EyeIcon
   // claude / codex(原样大小写)
   if (['Read', 'NotebookRead', 'Grep', 'view_image'].includes(tool)) return EyeIcon
   if (['Glob', 'LS'].includes(tool)) return SearchIcon

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"lightremote/internal/executil"
 )
 
 // claudeDriver:spawn `claude` 的 stream-json 模式,stdio 双向 JSON 行流。
@@ -50,8 +52,8 @@ type claudeDriver struct {
 	// 认领或 tool_result 到达后出队(handleCanUseTool 在独立 goroutine 里
 	// 读写,跟读循环一起走 d.mu)。
 	sideUses []sidechainUse
-	external  string // claude session_id(system/init 里返回)
-	model     string // 当前模型(system/init 里返回)
+	external string // claude session_id(system/init 里返回)
+	model    string // 当前模型(system/init 里返回)
 	// filesDir 会话附件目录:tool_result 的 image 块落这里(空 = 不落盘)。
 	filesDir string
 	// cwd 工作目录:转录 tailer 要按它拼 ~/.claude/projects/<slug>/ 路径。
@@ -171,6 +173,9 @@ func (d *claudeDriver) Start(opts StartOpts) error {
 	cmd.Env = claudeEnv(opts.Env, opts.Effort)
 	// 独立进程组:kill 时整棵进程树一起收(claude 起的 bash/node 不留孤儿)。
 	setProcessGroup(cmd)
+	if err := executil.Prepare(cmd); err != nil {
+		return fmt.Errorf("准备 claude 失败: %w", err)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

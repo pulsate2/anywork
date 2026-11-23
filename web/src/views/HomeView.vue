@@ -1,18 +1,18 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, NEmpty, NTag, NSpin, NModal, NInput, useDialog, useMessage } from 'naive-ui'
 import { AddOutline, FolderOpenOutline, TrashOutline, CheckmarkCircle, CreateOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import { api, type Workspace } from '@/api/client'
-import { useWorkspaceStore } from '@/stores/workspace'
+import { useWorkspaceStore, HOME_WORKSPACE_ID } from '@/stores/workspace'
 import WorkspaceCreateModal from '@/components/WorkspaceCreateModal.vue'
 
 const message = useMessage()
 const dialog = useDialog()
 const router = useRouter()
 const store = useWorkspaceStore()
-const workspaces = ref<Workspace[]>([])
+const workspaces = computed(() => store.displayList)
 const loading = ref(true)
 const showCreate = ref(false)
 
@@ -20,7 +20,6 @@ async function load() {
   loading.value = true
   try {
     await store.load()
-    workspaces.value = store.list
   } catch (e) {
     message.error('加载工作区失败')
   } finally {
@@ -35,13 +34,15 @@ function onCreated() {
 
 // 选中即切换:文件/终端/Git 都跟着这个工作区走。
 function pick(ws: Workspace) {
+  if (ws.id === HOME_WORKSPACE_ID && !store.homeAvailable) return
   store.select(ws.id)
   message.success(`已切换到「${ws.name}」`)
 }
 
 function openFiles(ws: Workspace) {
+  if (ws.id === HOME_WORKSPACE_ID && !store.homeAvailable) return
   store.select(ws.id)
-  router.push({ name: 'files' })
+  router.push({ name: 'files', query: { dir: ws.path } })
 }
 
 // ---- 改名 ----
@@ -124,9 +125,10 @@ onMounted(load)
           v-for="ws in workspaces"
           :key="ws.id"
           class="ws-card"
-          :class="{ active: ws.id === store.currentId }"
+          :class="{ active: ws.id === store.currentId, unavailable: ws.id === HOME_WORKSPACE_ID && !store.homeAvailable }"
           role="button"
-          tabindex="0"
+          :aria-disabled="ws.id === HOME_WORKSPACE_ID && !store.homeAvailable"
+          :tabindex="ws.id === HOME_WORKSPACE_ID && !store.homeAvailable ? -1 : 0"
           @click="pick(ws)"
           @keydown.enter="pick(ws)"
         >
@@ -140,13 +142,14 @@ onMounted(load)
               </n-tag>
               <n-tag v-if="ws.favorite" size="small" :bordered="false" type="warning">收藏</n-tag>
             </div>
-            <div class="ws-path" :title="ws.path">{{ ws.path }}</div>
+            <div class="ws-path" :title="ws.path">{{ ws.path || '服务端 Home 目录不可用' }}</div>
+            <div v-if="ws.id === HOME_WORKSPACE_ID && !store.homeAvailable" class="ws-home-note">Home 不存在或位于允许的根目录之外</div>
           </div>
-          <n-button class="ws-act" quaternary size="small" @click.stop="openFiles(ws)">打开</n-button>
-          <n-button class="ws-icon-btn" quaternary circle aria-label="重命名工作区" @click.stop="openRename(ws)">
+          <n-button class="ws-act" quaternary size="small" :disabled="ws.id === HOME_WORKSPACE_ID && !store.homeAvailable" @click.stop="openFiles(ws)">{{ ws.id === HOME_WORKSPACE_ID ? '浏览文件' : '打开' }}</n-button>
+          <n-button v-if="ws.id !== HOME_WORKSPACE_ID" class="ws-icon-btn" quaternary circle aria-label="重命名工作区" @click.stop="openRename(ws)">
             <template #icon><n-icon :component="CreateOutline" /></template>
           </n-button>
-          <n-button class="ws-icon-btn" quaternary circle type="error" aria-label="删除工作区" @click.stop="remove(ws)">
+          <n-button v-if="ws.id !== HOME_WORKSPACE_ID" class="ws-icon-btn" quaternary circle type="error" aria-label="删除工作区" @click.stop="remove(ws)">
             <template #icon><n-icon :component="TrashOutline" /></template>
           </n-button>
         </div>
@@ -193,6 +196,8 @@ onMounted(load)
   cursor: pointer;
 }
 .ws-card.active { border-color: var(--lr-accent); box-shadow: 0 0 0 1px var(--lr-accent) inset; }
+.ws-card.unavailable { cursor: default; opacity: 0.65; }
+.ws-home-note { color: var(--lr-fg-muted); font-size: 12px; margin-top: 4px; }
 .ws-icon {
   flex: none;
   width: 38px;

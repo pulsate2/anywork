@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"lightremote/internal/executil"
 )
 
 // git 需要凭据时执行 GIT_ASKPASS <prompt>(prompt 作为 argv[1]),从它的 stdout
@@ -73,7 +75,7 @@ func (b *CredentialBroker) newCredServer() (*credServer, []string, error) {
 		return nil, nil, err
 	}
 	token := randomToken()
-	exe, err := os.Executable()
+	exe, err := executil.Executable()
 	if err != nil {
 		ln.Close()
 		return nil, nil, err

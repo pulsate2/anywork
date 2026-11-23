@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"lightremote/internal/executil"
 )
 
 // piGateJS 审批 gate 扩展正文(见 pi_gate.mjs);Start 时落盘并以 -e 注入,
@@ -213,6 +215,9 @@ func (d *piDriver) Start(opts StartOpts) error {
 		cmd.Env = append(cmd.Env, opts.Env...)
 	}
 	setProcessGroup(cmd)
+	if err := executil.Prepare(cmd); err != nil {
+		return fmt.Errorf("准备 pi --mode rpc 失败: %w", err)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

@@ -6,11 +6,12 @@
 // 审批请求内嵌在行下方,子 agent 过程(steps)一行触发、点开 StepsModal。
 import { computed, ref } from 'vue'
 import { NModal } from 'naive-ui'
-import { api, type AgentPermissionReq, type AgentToolCall } from '@/api/client'
+import type { AgentPermissionReq, AgentToolCall } from '@/api/client'
 import DiffView from './DiffView.vue'
 import ApprovalCard from './ApprovalCard.vue'
 import StepsModal from './StepsModal.vue'
 import { ToolStatusIcon, hasToolCategory, toolCategoryIcon } from './toolIcons'
+import { agentToolImageUrls } from '@/utils/agentResources'
 
 const props = defineProps<{
   call: AgentToolCall
@@ -64,11 +65,7 @@ function stepBrief(c: AgentToolCall): string {
 }
 
 // tool_result 里 image 块的缩略图地址(有会话 id 且带图才有)。
-const imageUrls = computed<string[]>(() =>
-  props.sessionId && props.call.images?.length
-    ? props.call.images.map((n) => api.agentFileUrl(props.sessionId!, n))
-    : [],
-)
+const imageUrls = computed(() => agentToolImageUrls(props.call, props.sessionId))
 const lightbox = ref<string | null>(null)
 // n-modal 要 v-model:show;lightbox 值本身只是 url。
 const lightboxOpen = computed({

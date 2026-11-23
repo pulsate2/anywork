@@ -11,8 +11,8 @@ import {
 import { useRoute, useRouter } from 'vue-router'
 import { TerminalOutline, AddOutline, PlayOutline, CopyOutline, ClipboardOutline, StarOutline, ExpandOutline, ContractOutline, KeypadOutline } from '@vicons/ionicons5'
 import { TermClient, type TermSummary } from '@/api/term'
-import { api, type Workspace, type TermLimitSupport } from '@/api/client'
-import { useWorkspaceStore } from '@/stores/workspace'
+import { api, type TermLimitSupport } from '@/api/client'
+import { useWorkspaceStore, HOME_WORKSPACE_ID } from '@/stores/workspace'
 import { useCommandStore } from '@/stores/commands'
 import { copyText, selectAllIn } from '@/utils/clipboard'
 import { durToPickerMs, pickerMsToDur } from '@/utils/duration'
@@ -46,7 +46,6 @@ const activeId = ref<string | null>(null)
 const showSessionList = ref(false)
 const showNewModal = ref(false)
 const showCmdModal = ref(false)
-const workspaces = ref<Workspace[]>([])
 const selectedWs = ref<string | null>(null)
 const execShell = ref('')
 
@@ -702,7 +701,7 @@ function openSessions() {
 }
 
 function pickWorkspaceAndCreate() {
-  selectedWs.value = store.currentId
+  selectedWs.value = store.currentId ?? (store.homeAvailable ? HOME_WORKSPACE_ID : null)
   showNewModal.value = true
   ensureLimitSupport()
 }
@@ -725,7 +724,11 @@ function createSession() {
     return
   }
   // 没有工作区也要能开终端:退回 root 目录。
-  const ws = workspaces.value.find((w) => w.id === selectedWs.value)
+  if (selectedWs.value === HOME_WORKSPACE_ID && !store.homeAvailable) {
+    message.warning('Home 目录不在允许的根目录内或不可用')
+    return
+  }
+  const ws = store.displayList.find((w) => w.id === selectedWs.value)
   const dir = ws?.path ?? store.root
   if (ws) store.select(ws.id)
   // 新建了就不再接回原会话。
@@ -1106,10 +1109,9 @@ function selectAllDump() {
 async function loadWorkspaces() {
   try {
     await store.ensure()
-    workspaces.value = store.list
-    selectedWs.value = store.currentId
+    selectedWs.value = store.currentId ?? (store.homeAvailable ? HOME_WORKSPACE_ID : null)
   } catch {
-    workspaces.value = []
+    selectedWs.value = null
   }
 }
 
@@ -1315,7 +1317,7 @@ watch(fitSignal, () => applyTheme())
         <n-form-item label="工作区目录">
           <n-select
             v-model:value="selectedWs"
-            :options="workspaces.map(w => ({ label: `${w.name} (${w.path})`, value: w.id }))"
+            :options="store.directoryOptions"
             :placeholder="`不选则用根目录 ${store.root}`"
             clearable
           />
