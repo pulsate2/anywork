@@ -41,11 +41,25 @@ jobs:
 
       # Android 必须启用 CGO,让 net 使用 bionic/getaddrinfo 的系统 DNS。
       # 普通 Linux 的 resolv.conf/localhost DNS 不适用于 Termux。
+      # 显式安装并把 sdkmanager 加入 PATH,不依赖 runner 预装 SDK 的路径。
+      - name: 初始化 Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: 准备 Android NDK
         run: |
           set -euo pipefail
           sdkmanager 'ndk;27.2.12479018'
-          echo "TERMUX_CC=${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$sdk_root" ]; then
+            echo '::error::Android SDK 未初始化'
+            exit 1
+          fi
+          cc="$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          if [ ! -x "$cc" ]; then
+            echo "::error::Android NDK 编译器不存在或不可执行: $cc"
+            exit 1
+          fi
+          printf 'TERMUX_CC=%s\n' "$cc" >> "$GITHUB_ENV"
 
       - name: 交叉编译并打包
         run: |
