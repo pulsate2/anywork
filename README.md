@@ -28,6 +28,26 @@ LIGHTREMOTE_PASSWORD=secret go build -o lightremote ./cmd/server
 ./lightremote --port 8080
 ```
 
+### Termux(Android ARM64)
+
+GitHub Release 提供 `lightremote-<版本>-termux-arm64.tar.gz`,适用于 `uname -m` 输出为 `aarch64` 的 Termux。请使用这个包,而不是 `linux-arm64` 包。
+
+在 Termux 中下载并将安装包放到 `$HOME` 后:
+
+```bash
+pkg install bash git
+cd "$HOME"
+VERSION=v1.0.0 # 改成下载的版本号
+tar -xzf "lightremote-${VERSION}-termux-arm64.tar.gz"
+cd "lightremote-${VERSION}-termux-arm64"
+chmod +x lightremote
+SHELL="$PREFIX/bin/bash" LIGHTREMOTE_PASSWORD='请换成强密码' \
+  ./lightremote --root "$HOME" --port 8080
+# 浏览器打开 http://127.0.0.1:8080
+```
+
+二进制已内嵌前端,运行时不需要 Go 或 Node。请在 Termux 私有目录(如 `$HOME`)运行,不要直接从共享存储(`/sdcard`)执行。目前仅提供 ARM64 版本;非 root Android 的系统监控和终端资源限制受系统权限约束。
+
 ### Docker
 
 ```bash

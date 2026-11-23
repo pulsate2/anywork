@@ -45,7 +45,8 @@ jobs:
           mkdir -p stage out
           pack() {
             local goos=$1 goarch=$2 ext=${3:-}
-            local name="lightremote-${TAG}-${goos}-${goarch}"
+            local platform=${4:-$goos}
+            local name="lightremote-${TAG}-${platform}-${goarch}"
             mkdir -p "stage/${name}"
             GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 \
               go build -trimpath -ldflags='-s -w' -o "stage/${name}/lightremote${ext}" ./cmd/server
@@ -58,6 +59,8 @@ jobs:
           }
           pack linux amd64
           pack linux arm64
+          # Termux 使用 Android 目标(不是普通 Linux);arm64 支持无 CGO 的 PIE 二进制。
+          pack android arm64 '' termux
           pack darwin amd64
           pack darwin arm64
           pack windows amd64 .exe
